@@ -1,0 +1,337 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Agentic Edge — Themes (investment universe).
+
+  GitHub-renderable SVG with SMIL animations (no JavaScript, no external CSS).
+  Drop into README via:  ![](docs/diagrams/themes.svg)
+
+  Visuals:
+   - Header with status pill + "New theme" button
+   - 6 theme cards in a 3x2 grid, each with thesis, ticker chips, conviction bar
+   - Currently-running theme has a glowing border that cycles
+   - Ticker chips on each card fade in with a stagger
+   - Conviction bars fill on a 4s loop
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 900" preserveAspectRatio="xMidYMid meet" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-label="Agentic Edge — themes page: investment universe with six thematic baskets including AI infrastructure, advanced memory, grid and power, small modular reactors, optical networking, and specialty substrates">
+  <defs>
+    <linearGradient id="th-rack" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0%" stop-color="#11141b"/>
+      <stop offset="100%" stop-color="#0b0d12"/>
+    </linearGradient>
+    <linearGradient id="th-brand" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#7c5cff"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="th-card-active" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#7c5cff" stop-opacity="0.6"/>
+      <stop offset="100%" stop-color="#38bdf8" stop-opacity="0.6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Page background -->
+  <rect width="1400" height="900" fill="#0b0d12"/>
+
+  <!-- ================= HEADER ================= -->
+  <g transform="translate(40, 32)">
+    <text font-size="11" font-weight="600" fill="#6c7388" letter-spacing="1.4">INVESTMENT UNIVERSE</text>
+    <text y="28" font-size="26" font-weight="600" fill="#e7eaf2">Themes</text>
+    <text y="50" font-size="12" fill="#98a0b3">Each theme is a thesis, a watch list, and the chokepoint these companies are positioned to win.</text>
+    <text y="68" font-size="12" fill="#98a0b3">The agent team scores every symbol against this picture.</text>
+
+    <!-- Last-run pill -->
+    <g transform="translate(1080, 8)">
+      <rect width="160" height="28" rx="14" fill="#11141b" stroke="#232a3a"/>
+      <circle cx="16" cy="14" r="3.5" fill="#34d399">
+        <animate attributeName="opacity" values="1;0.35;1" dur="1.6s" repeatCount="indefinite"/>
+      </circle>
+      <text x="28" y="18" font-size="11" fill="#cbd5e1">Last run · 09:00 ET</text>
+    </g>
+
+    <!-- New theme button -->
+    <g transform="translate(1250, 8)">
+      <rect width="100" height="28" rx="6" fill="url(#th-brand)"/>
+      <text x="14" y="18" font-size="12" font-weight="600" fill="#0b0d12">+ New theme</text>
+    </g>
+  </g>
+
+  <!-- ================= THEME CARDS (3 x 2) =================
+       Card geometry: 420 wide x 300 tall, gap 30
+       Row 1 y=120, Row 2 y=450
+  -->
+
+  <!-- ---- CARD 1: AI INFRASTRUCTURE (currently running) ---- -->
+  <g transform="translate(40, 120)">
+    <!-- Animated glowing border (running theme) -->
+    <rect width="420" height="300" rx="14" fill="url(#th-rack)" stroke="url(#th-card-active)" stroke-width="2">
+      <animate attributeName="stroke-opacity" values="1;0.5;1" dur="2.4s" repeatCount="indefinite"/>
+    </rect>
+    <!-- Status chip: running -->
+    <g transform="translate(20, 20)">
+      <rect width="86" height="22" rx="11" fill="#7c5cff" fill-opacity="0.18" stroke="#7c5cff" stroke-opacity="0.4"/>
+      <circle cx="14" cy="11" r="3" fill="#7c5cff">
+        <animate attributeName="opacity" values="1;0.4;1" dur="1s" repeatCount="indefinite"/>
+      </circle>
+      <text x="24" y="15" font-size="10" font-weight="600" fill="#c4b5fd">RUNNING…</text>
+    </g>
+    <text x="20" y="78" font-size="18" font-weight="600" fill="#e7eaf2">AI Infrastructure</text>
+    <text x="20" y="100" font-size="11" fill="#98a0b3">The compute, networking, and substrate layer powering the build-out.</text>
+    <text x="20" y="116" font-size="11" fill="#98a0b3">Bottleneck: leading-edge accelerators + high-bandwidth interconnect.</text>
+
+    <!-- Ticker chips with staggered fade-in -->
+    <g transform="translate(20, 138)" font-family="ui-monospace,monospace">
+      <g><rect width="62" height="22" rx="11" fill="#1a1f2b"/><text x="10" y="15" font-size="11" fill="#7dd3fc">NVDA</text>
+        <animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="0.0s" fill="freeze"/>
+      </g>
+      <g transform="translate(70, 0)"><rect width="62" height="22" rx="11" fill="#1a1f2b"/><text x="10" y="15" font-size="11" fill="#7dd3fc">AVGO</text>
+        <animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="0.15s" fill="freeze"/>
+      </g>
+      <g transform="translate(140, 0)"><rect width="62" height="22" rx="11" fill="#1a1f2b"/><text x="10" y="15" font-size="11" fill="#7dd3fc">MRVL</text>
+        <animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="0.3s" fill="freeze"/>
+      </g>
+      <g transform="translate(210, 0)"><rect width="62" height="22" rx="11" fill="#1a1f2b"/><text x="10" y="15" font-size="11" fill="#7dd3fc">ALAB</text>
+        <animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="0.45s" fill="freeze"/>
+      </g>
+      <g transform="translate(280, 0)"><rect width="62" height="22" rx="11" fill="#1a1f2b"/><text x="10" y="15" font-size="11" fill="#7dd3fc">CRDO</text>
+        <animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="0.6s" fill="freeze"/>
+      </g>
+      <g transform="translate(0, 30)"><rect width="62" height="22" rx="11" fill="#1a1f2b"/><text x="10" y="15" font-size="11" fill="#7dd3fc">ANET</text>
+        <animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="0.75s" fill="freeze"/>
+      </g>
+      <g transform="translate(70, 30)"><rect width="62" height="22" rx="11" fill="#1a1f2b"/><text x="10" y="15" font-size="11" fill="#7dd3fc">LITE</text>
+        <animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="0.9s" fill="freeze"/>
+      </g>
+      <g transform="translate(140, 30)"><rect width="62" height="22" rx="11" fill="#1a1f2b"/><text x="10" y="15" font-size="11" fill="#7dd3fc">COHR</text>
+        <animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="1.05s" fill="freeze"/>
+      </g>
+    </g>
+
+    <!-- Conviction bar -->
+    <g transform="translate(20, 222)">
+      <text font-size="10" fill="#6c7388" letter-spacing="1.2">CONVICTION · 8.4 / 10</text>
+      <rect y="14" width="380" height="6" rx="3" fill="#1a1f2b"/>
+      <rect y="14" width="0" height="6" rx="3" fill="url(#th-brand)">
+        <animate attributeName="width" from="0" to="319" dur="2.8s" begin="0.2s" fill="freeze"/>
+      </rect>
+    </g>
+    <line x1="20" y1="248" x2="400" y2="248" stroke="#1a1f2b"/>
+    <text x="20" y="270" font-size="10" fill="#6c7388">8 tickers · last scored 09:00 ET · 6 buys, 2 holds</text>
+    <text x="20" y="286" font-size="10" fill="#6c7388">Top: NVDA · AVGO · MRVL</text>
+  </g>
+
+  <!-- ---- CARD 2: ADVANCED MEMORY ---- -->
+  <g transform="translate(490, 120)">
+    <rect width="420" height="300" rx="14" fill="url(#th-rack)" stroke="#232a3a"/>
+    <g transform="translate(20, 20)">
+      <rect width="60" height="22" rx="11" fill="#1a1f2b" stroke="#232a3a"/>
+      <text x="12" y="15" font-size="10" font-weight="600" fill="#34d399">ACTIVE</text>
+    </g>
+    <text x="20" y="78" font-size="18" font-weight="600" fill="#e7eaf2">Advanced Memory</text>
+    <text x="20" y="100" font-size="11" fill="#98a0b3">HBM and DRAM cycles riding the AI training and inference wave.</text>
+    <text x="20" y="116" font-size="11" fill="#98a0b3">Bottleneck: HBM3e capacity, advanced packaging, and CHIPS-Act fab build.</text>
+
+    <g transform="translate(20, 138)" font-family="ui-monospace,monospace">
+      <g><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#6ee7b7">MU</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.0s" fill="freeze"/>
+      </g>
+      <g transform="translate(64, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#6ee7b7">WDC</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.15s" fill="freeze"/>
+      </g>
+      <g transform="translate(128, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#6ee7b7">SNDK</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.3s" fill="freeze"/>
+      </g>
+      <g transform="translate(192, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#6ee7b7">KLAC</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.45s" fill="freeze"/>
+      </g>
+      <g transform="translate(256, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#6ee7b7">AMAT</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.6s" fill="freeze"/>
+      </g>
+      <g transform="translate(320, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#6ee7b7">LRCX</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.75s" fill="freeze"/>
+      </g>
+    </g>
+
+    <g transform="translate(20, 222)">
+      <text font-size="10" fill="#6c7388" letter-spacing="1.2">CONVICTION · 8.7 / 10</text>
+      <rect y="14" width="380" height="6" rx="3" fill="#1a1f2b"/>
+      <rect y="14" width="0" height="6" rx="3" fill="url(#th-brand)">
+        <animate attributeName="width" from="0" to="331" dur="2.8s" begin="0.4s" fill="freeze"/>
+      </rect>
+    </g>
+    <line x1="20" y1="248" x2="400" y2="248" stroke="#1a1f2b"/>
+    <text x="20" y="270" font-size="10" fill="#6c7388">6 tickers · last scored 09:00 ET · 5 buys, 1 hold</text>
+    <text x="20" y="286" font-size="10" fill="#6c7388">Top: MU · WDC · KLAC</text>
+  </g>
+
+  <!-- ---- CARD 3: GRID &amp; POWER ---- -->
+  <g transform="translate(940, 120)">
+    <rect width="420" height="300" rx="14" fill="url(#th-rack)" stroke="#232a3a"/>
+    <g transform="translate(20, 20)">
+      <rect width="60" height="22" rx="11" fill="#1a1f2b" stroke="#232a3a"/>
+      <text x="12" y="15" font-size="10" font-weight="600" fill="#34d399">ACTIVE</text>
+    </g>
+    <text x="20" y="78" font-size="18" font-weight="600" fill="#e7eaf2">Grid &amp; Power</text>
+    <text x="20" y="100" font-size="11" fill="#98a0b3">Datacenter electricity demand and the grid kit that delivers it.</text>
+    <text x="20" y="116" font-size="11" fill="#98a0b3">Bottleneck: transformers, switchgear, cooling, baseload generation.</text>
+
+    <g transform="translate(20, 138)" font-family="ui-monospace,monospace">
+      <g><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#fcd34d">VRT</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.0s" fill="freeze"/>
+      </g>
+      <g transform="translate(64, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#fcd34d">ETN</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.15s" fill="freeze"/>
+      </g>
+      <g transform="translate(128, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#fcd34d">GEV</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.3s" fill="freeze"/>
+      </g>
+      <g transform="translate(192, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#fcd34d">PWR</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.45s" fill="freeze"/>
+      </g>
+      <g transform="translate(256, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#fcd34d">MOD</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.6s" fill="freeze"/>
+      </g>
+      <g transform="translate(320, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#fcd34d">CAT</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.75s" fill="freeze"/>
+      </g>
+    </g>
+
+    <g transform="translate(20, 222)">
+      <text font-size="10" fill="#6c7388" letter-spacing="1.2">CONVICTION · 7.6 / 10</text>
+      <rect y="14" width="380" height="6" rx="3" fill="#1a1f2b"/>
+      <rect y="14" width="0" height="6" rx="3" fill="url(#th-brand)">
+        <animate attributeName="width" from="0" to="289" dur="2.8s" begin="0.6s" fill="freeze"/>
+      </rect>
+    </g>
+    <line x1="20" y1="248" x2="400" y2="248" stroke="#1a1f2b"/>
+    <text x="20" y="270" font-size="10" fill="#6c7388">6 tickers · last scored 09:00 ET · 4 buys, 2 holds</text>
+    <text x="20" y="286" font-size="10" fill="#6c7388">Top: VRT · ETN · GEV</text>
+  </g>
+
+  <!-- ---- CARD 4: SMALL MODULAR REACTORS ---- -->
+  <g transform="translate(40, 450)">
+    <rect width="420" height="300" rx="14" fill="url(#th-rack)" stroke="#232a3a"/>
+    <g transform="translate(20, 20)">
+      <rect width="60" height="22" rx="11" fill="#1a1f2b" stroke="#232a3a"/>
+      <text x="12" y="15" font-size="10" font-weight="600" fill="#34d399">ACTIVE</text>
+    </g>
+    <text x="20" y="78" font-size="18" font-weight="600" fill="#e7eaf2">Small Modular Reactors</text>
+    <text x="20" y="100" font-size="11" fill="#98a0b3">Nuclear revival as the only baseload that scales with hyperscaler demand.</text>
+    <text x="20" y="116" font-size="11" fill="#98a0b3">Bottleneck: regulatory clock, fuel-cycle vendors, EPC discipline.</text>
+
+    <g transform="translate(20, 138)" font-family="ui-monospace,monospace">
+      <g><rect width="62" height="22" rx="11" fill="#1a1f2b"/><text x="10" y="15" font-size="11" fill="#fbbf24">BWXT</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.0s" fill="freeze"/>
+      </g>
+      <g transform="translate(70, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#fbbf24">NRG</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.15s" fill="freeze"/>
+      </g>
+      <g transform="translate(134, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#fbbf24">CCJ</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.3s" fill="freeze"/>
+      </g>
+      <g transform="translate(198, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#fbbf24">VST</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.45s" fill="freeze"/>
+      </g>
+      <g transform="translate(262, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#fbbf24">CEG</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.6s" fill="freeze"/>
+      </g>
+    </g>
+
+    <g transform="translate(20, 222)">
+      <text font-size="10" fill="#6c7388" letter-spacing="1.2">CONVICTION · 7.2 / 10</text>
+      <rect y="14" width="380" height="6" rx="3" fill="#1a1f2b"/>
+      <rect y="14" width="0" height="6" rx="3" fill="url(#th-brand)">
+        <animate attributeName="width" from="0" to="274" dur="2.8s" begin="0.8s" fill="freeze"/>
+      </rect>
+    </g>
+    <line x1="20" y1="248" x2="400" y2="248" stroke="#1a1f2b"/>
+    <text x="20" y="270" font-size="10" fill="#6c7388">5 tickers · last scored 09:00 ET · 3 buys, 2 holds</text>
+    <text x="20" y="286" font-size="10" fill="#6c7388">Top: BWXT · CEG · CCJ</text>
+  </g>
+
+  <!-- ---- CARD 5: OPTICAL NETWORKING ---- -->
+  <g transform="translate(490, 450)">
+    <rect width="420" height="300" rx="14" fill="url(#th-rack)" stroke="#232a3a"/>
+    <g transform="translate(20, 20)">
+      <rect width="60" height="22" rx="11" fill="#1a1f2b" stroke="#232a3a"/>
+      <text x="12" y="15" font-size="10" font-weight="600" fill="#34d399">ACTIVE</text>
+    </g>
+    <text x="20" y="78" font-size="18" font-weight="600" fill="#e7eaf2">Optical Networking</text>
+    <text x="20" y="100" font-size="11" fill="#98a0b3">800G / 1.6T transceivers and the substrate / DSP layer behind them.</text>
+    <text x="20" y="116" font-size="11" fill="#98a0b3">Bottleneck: silicon photonics, indium phosphide capacity, packaging.</text>
+
+    <g transform="translate(20, 138)" font-family="ui-monospace,monospace">
+      <g><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#7dd3fc">LITE</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.0s" fill="freeze"/>
+      </g>
+      <g transform="translate(64, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#7dd3fc">FN</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.15s" fill="freeze"/>
+      </g>
+      <g transform="translate(128, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#7dd3fc">COHR</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.3s" fill="freeze"/>
+      </g>
+      <g transform="translate(192, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#7dd3fc">CIEN</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.45s" fill="freeze"/>
+      </g>
+      <g transform="translate(256, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#7dd3fc">AAOI</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.6s" fill="freeze"/>
+      </g>
+      <g transform="translate(320, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#7dd3fc">CRDO</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.75s" fill="freeze"/>
+      </g>
+    </g>
+
+    <g transform="translate(20, 222)">
+      <text font-size="10" fill="#6c7388" letter-spacing="1.2">CONVICTION · 8.1 / 10</text>
+      <rect y="14" width="380" height="6" rx="3" fill="#1a1f2b"/>
+      <rect y="14" width="0" height="6" rx="3" fill="url(#th-brand)">
+        <animate attributeName="width" from="0" to="308" dur="2.8s" begin="1.0s" fill="freeze"/>
+      </rect>
+    </g>
+    <line x1="20" y1="248" x2="400" y2="248" stroke="#1a1f2b"/>
+    <text x="20" y="270" font-size="10" fill="#6c7388">6 tickers · last scored 09:00 ET · 5 buys, 1 hold</text>
+    <text x="20" y="286" font-size="10" fill="#6c7388">Top: LITE · COHR · CRDO</text>
+  </g>
+
+  <!-- ---- CARD 6: SPECIALTY SUBSTRATES ---- -->
+  <g transform="translate(940, 450)">
+    <rect width="420" height="300" rx="14" fill="url(#th-rack)" stroke="#232a3a"/>
+    <g transform="translate(20, 20)">
+      <rect width="60" height="22" rx="11" fill="#1a1f2b" stroke="#232a3a"/>
+      <text x="12" y="15" font-size="10" font-weight="600" fill="#fbbf24">REVIEW</text>
+    </g>
+    <text x="20" y="78" font-size="18" font-weight="600" fill="#e7eaf2">Specialty Substrates</text>
+    <text x="20" y="100" font-size="11" fill="#98a0b3">InP, GaAs, GaN substrates, rare earths, and high-purity copper —</text>
+    <text x="20" y="116" font-size="11" fill="#98a0b3">the upstream choke for everything else in the AI cycle.</text>
+
+    <g transform="translate(20, 138)" font-family="ui-monospace,monospace">
+      <g><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#c4b5fd">AXTI</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.0s" fill="freeze"/>
+      </g>
+      <g transform="translate(64, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#c4b5fd">COHR</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.15s" fill="freeze"/>
+      </g>
+      <g transform="translate(128, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#c4b5fd">ASML</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.3s" fill="freeze"/>
+      </g>
+      <g transform="translate(192, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#c4b5fd">TECK</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.45s" fill="freeze"/>
+      </g>
+      <g transform="translate(256, 0)"><rect width="56" height="22" rx="11" fill="#1a1f2b"/><text x="11" y="15" font-size="11" fill="#c4b5fd">MP</text>
+        <animate attributeName="opacity" from="0.4" to="1" dur="0.5s" begin="0.6s" fill="freeze"/>
+      </g>
+    </g>
+
+    <g transform="translate(20, 222)">
+      <text font-size="10" fill="#6c7388" letter-spacing="1.2">CONVICTION · 6.4 / 10</text>
+      <rect y="14" width="380" height="6" rx="3" fill="#1a1f2b"/>
+      <rect y="14" width="0" height="6" rx="3" fill="url(#th-brand)">
+        <animate attributeName="width" from="0" to="243" dur="2.8s" begin="1.2s" fill="freeze"/>
+      </rect>
+    </g>
+    <line x1="20" y1="248" x2="400" y2="248" stroke="#1a1f2b"/>
+    <text x="20" y="270" font-size="10" fill="#6c7388">5 tickers · last scored 09:00 ET · 2 buys, 3 holds</text>
+    <text x="20" y="286" font-size="10" fill="#6c7388">Top: ASML · TECK · MP</text>
+  </g>
+
+  <!-- Bottom hint -->
+  <text x="700" y="800" text-anchor="middle" font-size="11" fill="#6c7388">+ 9 more themes · click any card in the live app to drill into the per-ticker scorecard</text>
+</svg>

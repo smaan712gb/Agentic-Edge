@@ -1,0 +1,283 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Agentic Edge — Performance dashboard.
+
+  GitHub-renderable SVG with SMIL animations (no JavaScript, no external CSS).
+  Drop into README via:  ![](docs/diagrams/performance.svg)
+
+  Visuals:
+   - Live status pill with pulsing dot
+   - Four KPI cards (Today, Account Value, Unrealized, Buying Power) with
+     subtle value-flicker animations
+   - 90-day equity curve that draws itself in on a 6s loop and a soft
+     gradient fill that fades up under it
+   - Open positions table with row-highlight cycle on the top winners
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 900" preserveAspectRatio="xMidYMid meet" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-label="Agentic Edge — performance dashboard: today's gain/loss, account value, unrealized P&L, buying power, 90-day equity curve, and open positions">
+  <defs>
+    <linearGradient id="pf-rack" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0%" stop-color="#11141b"/>
+      <stop offset="100%" stop-color="#0b0d12"/>
+    </linearGradient>
+    <linearGradient id="pf-equity-fill" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0%" stop-color="#34d399" stop-opacity="0.45"/>
+      <stop offset="100%" stop-color="#34d399" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="pf-brand" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#7c5cff"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <clipPath id="pf-equity-clip">
+      <rect x="0" y="0" width="0" height="280">
+        <animate attributeName="width" from="0" to="1280" dur="6s" begin="0s" fill="freeze" repeatCount="indefinite"/>
+      </rect>
+    </clipPath>
+    <clipPath id="pf-positions-clip">
+      <rect x="0" y="0" width="1280" height="280" rx="8"/>
+    </clipPath>
+  </defs>
+
+  <!-- Page background -->
+  <rect width="1400" height="900" fill="#0b0d12"/>
+
+  <!-- ================= HEADER ================= -->
+  <g transform="translate(40, 32)">
+    <text font-size="11" font-weight="600" fill="#6c7388" letter-spacing="1.4">PAPER ACCOUNT</text>
+    <text y="28" font-size="26" font-weight="600" fill="#e7eaf2">Performance</text>
+    <text y="50" font-size="12" fill="#98a0b3">How the picks recommended by the agent team have performed in the paper account.</text>
+
+    <!-- Live pill -->
+    <g transform="translate(1240, 8)">
+      <rect width="80" height="24" rx="12" fill="#11141b" stroke="#232a3a"/>
+      <circle cx="14" cy="12" r="3.5" fill="#34d399">
+        <animate attributeName="opacity" values="1;0.35;1" dur="1.4s" repeatCount="indefinite"/>
+      </circle>
+      <text x="24" y="16" font-size="11" fill="#cbd5e1">Live · 12s</text>
+    </g>
+  </g>
+
+  <!-- ================= KPI CARDS ================= -->
+  <g transform="translate(40, 100)">
+
+    <!-- Today -->
+    <g transform="translate(0, 0)">
+      <rect width="320" height="118" rx="12" fill="url(#pf-rack)" stroke="#232a3a"/>
+      <text x="20" y="26" font-size="10" font-weight="600" fill="#6c7388" letter-spacing="1.4">TODAY</text>
+      <text x="20" y="62" font-size="28" font-weight="600" fill="#34d399">+$56,372
+        <animate attributeName="opacity" values="1;0.85;1" dur="3.2s" repeatCount="indefinite"/>
+      </text>
+      <text x="20" y="84" font-size="13" fill="#34d399">▲ +3.98%</text>
+      <!-- Mini sparkline -->
+      <g transform="translate(170, 30)">
+        <polyline points="0,60 12,55 24,52 36,58 48,46 60,42 72,36 84,38 96,28 108,30 120,18 132,12 140,8"
+                  fill="none" stroke="#34d399" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" opacity="0.85"/>
+        <circle cx="140" cy="8" r="3" fill="#34d399">
+          <animate attributeName="r" values="3;5;3" dur="1.6s" repeatCount="indefinite"/>
+          <animate attributeName="opacity" values="1;0.6;1" dur="1.6s" repeatCount="indefinite"/>
+        </circle>
+      </g>
+      <line x1="20" y1="100" x2="300" y2="100" stroke="#1a1f2b"/>
+      <text x="20" y="113" font-size="10" fill="#6c7388">vs. yesterday's close · ET</text>
+    </g>
+
+    <!-- Account Value -->
+    <g transform="translate(340, 0)">
+      <rect width="320" height="118" rx="12" fill="url(#pf-rack)" stroke="#232a3a"/>
+      <text x="20" y="26" font-size="10" font-weight="600" fill="#6c7388" letter-spacing="1.4">ACCOUNT VALUE</text>
+      <text x="20" y="62" font-size="28" font-weight="600" fill="#e7eaf2">$1,473,692</text>
+      <text x="20" y="84" font-size="13" fill="#98a0b3">paper equity</text>
+      <line x1="20" y1="100" x2="300" y2="100" stroke="#1a1f2b"/>
+      <text x="20" y="113" font-size="10" fill="#6c7388">snapshot 14:32:01 ET</text>
+    </g>
+
+    <!-- Unrealized -->
+    <g transform="translate(680, 0)">
+      <rect width="320" height="118" rx="12" fill="url(#pf-rack)" stroke="#232a3a"/>
+      <text x="20" y="26" font-size="10" font-weight="600" fill="#6c7388" letter-spacing="1.4">UNREALIZED P&amp;L</text>
+      <text x="20" y="62" font-size="28" font-weight="600" fill="#34d399">+$183,032</text>
+      <text x="20" y="84" font-size="13" fill="#98a0b3">across 29 positions</text>
+      <line x1="20" y1="100" x2="300" y2="100" stroke="#1a1f2b"/>
+      <text x="20" y="113" font-size="10" fill="#6c7388">includes today's open P&amp;L</text>
+    </g>
+
+    <!-- Buying Power -->
+    <g transform="translate(1020, 0)">
+      <rect width="320" height="118" rx="12" fill="url(#pf-rack)" stroke="#232a3a"/>
+      <text x="20" y="26" font-size="10" font-weight="600" fill="#6c7388" letter-spacing="1.4">BUYING POWER</text>
+      <text x="20" y="62" font-size="28" font-weight="600" fill="#e7eaf2">$3,967,890</text>
+      <text x="20" y="84" font-size="13" fill="#98a0b3">cash + margin available</text>
+      <line x1="20" y1="100" x2="300" y2="100" stroke="#1a1f2b"/>
+      <text x="20" y="113" font-size="10" fill="#6c7388">paper margin · IBKR</text>
+    </g>
+  </g>
+
+  <!-- ================= EQUITY CURVE ================= -->
+  <g transform="translate(40, 240)">
+    <rect width="1320" height="280" rx="12" fill="url(#pf-rack)" stroke="#232a3a"/>
+    <text x="20" y="26" font-size="10" font-weight="600" fill="#6c7388" letter-spacing="1.4">DAILY EQUITY</text>
+    <text x="20" y="48" font-size="16" font-weight="600" fill="#e7eaf2">90-day account value</text>
+    <text x="20" y="66" font-size="11" fill="#98a0b3">starting equity $1,200,000 · current $1,473,692</text>
+
+    <!-- Y-axis labels -->
+    <g font-size="10" fill="#6c7388" font-family="ui-monospace,monospace">
+      <text x="1300" y="100" text-anchor="end">$1.50M</text>
+      <text x="1300" y="148" text-anchor="end">$1.40M</text>
+      <text x="1300" y="196" text-anchor="end">$1.30M</text>
+      <text x="1300" y="244" text-anchor="end">$1.20M</text>
+    </g>
+
+    <!-- Gridlines -->
+    <g stroke="#1a1f2b" stroke-dasharray="2 4">
+      <line x1="20" y1="100" x2="1260" y2="100"/>
+      <line x1="20" y1="148" x2="1260" y2="148"/>
+      <line x1="20" y1="196" x2="1260" y2="196"/>
+      <line x1="20" y1="244" x2="1260" y2="244"/>
+    </g>
+
+    <!-- Equity area (drawn under clip so it reveals left-to-right) -->
+    <g transform="translate(20, 0)" clip-path="url(#pf-equity-clip)">
+      <!-- Filled area under curve -->
+      <path d="M 0 244
+               L 40 232 L 80 240 L 120 220 L 160 226 L 200 210 L 240 200 L 280 218 L 320 198 L 360 188
+               L 400 180 L 440 196 L 480 168 L 520 156 L 560 162 L 600 144 L 640 134 L 680 148 L 720 124
+               L 760 116 L 800 108 L 840 122 L 880 100 L 920 92 L 960 86 L 1000 100 L 1040 78 L 1080 88
+               L 1120 70 L 1160 64 L 1200 78 L 1240 60 L 1260 56
+               L 1260 244 L 0 244 Z"
+            fill="url(#pf-equity-fill)"/>
+      <!-- Equity line itself -->
+      <path d="M 0 244
+               L 40 232 L 80 240 L 120 220 L 160 226 L 200 210 L 240 200 L 280 218 L 320 198 L 360 188
+               L 400 180 L 440 196 L 480 168 L 520 156 L 560 162 L 600 144 L 640 134 L 680 148 L 720 124
+               L 760 116 L 800 108 L 840 122 L 880 100 L 920 92 L 960 86 L 1000 100 L 1040 78 L 1080 88
+               L 1120 70 L 1160 64 L 1200 78 L 1240 60 L 1260 56"
+            fill="none" stroke="#34d399" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+
+    <!-- Live tip dot at the right edge (always visible) -->
+    <circle cx="1280" cy="56" r="4" fill="#34d399">
+      <animate attributeName="r" values="4;7;4" dur="2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="1;0.55;1" dur="2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="1280" cy="56" r="3" fill="#0b0d12"/>
+
+    <!-- X-axis labels -->
+    <g font-size="10" fill="#6c7388">
+      <text x="20" y="266">Feb 8</text>
+      <text x="320" y="266">Feb 28</text>
+      <text x="620" y="266">Mar 21</text>
+      <text x="920" y="266">Apr 11</text>
+      <text x="1220" y="266">May 8</text>
+    </g>
+  </g>
+
+  <!-- ================= OPEN POSITIONS ================= -->
+  <g transform="translate(40, 540)">
+    <rect width="1320" height="320" rx="12" fill="url(#pf-rack)" stroke="#232a3a"/>
+    <text x="20" y="26" font-size="10" font-weight="600" fill="#6c7388" letter-spacing="1.4">OPEN POSITIONS · 29</text>
+    <text x="20" y="48" font-size="16" font-weight="600" fill="#e7eaf2">Live from IBKR paper</text>
+
+    <!-- Header row -->
+    <g transform="translate(20, 70)" font-size="10" fill="#6c7388" letter-spacing="1.2">
+      <text x="0">SYMBOL</text>
+      <text x="200">QTY</text>
+      <text x="320">AVG</text>
+      <text x="450">LAST</text>
+      <text x="600">UNREALIZED P&amp;L</text>
+      <text x="900">% OF EQUITY</text>
+      <text x="1080">STRATEGY</text>
+    </g>
+    <line x1="20" y1="78" x2="1300" y2="78" stroke="#1a1f2b"/>
+
+    <!-- Rows: a few top winners with subtle row-pulse to convey "live" -->
+    <g transform="translate(20, 96)" font-family="ui-monospace,monospace" font-size="12">
+      <!-- MU -->
+      <g>
+        <rect x="-8" y="-12" width="1296" height="22" rx="4" fill="#34d399" fill-opacity="0">
+          <animate attributeName="fill-opacity" values="0;0.06;0" dur="3s" repeatCount="indefinite"/>
+        </rect>
+        <text fill="#e7eaf2" font-weight="600">MU</text>
+        <text x="200" fill="#cbd5e1">217</text>
+        <text x="320" fill="#cbd5e1">$496.20</text>
+        <text x="450" fill="#cbd5e1">$726.45</text>
+        <text x="600" fill="#34d399">+$49,963.65</text>
+        <text x="900" fill="#cbd5e1">10.7%</text>
+        <text x="1080" fill="#98a0b3">long equity</text>
+      </g>
+      <!-- AMD -->
+      <g transform="translate(0, 28)">
+        <rect x="-8" y="-12" width="1296" height="22" rx="4" fill="#34d399" fill-opacity="0">
+          <animate attributeName="fill-opacity" values="0;0.06;0" dur="3s" begin="0.4s" repeatCount="indefinite"/>
+        </rect>
+        <text fill="#e7eaf2" font-weight="600">AMD</text>
+        <text x="200" fill="#cbd5e1">335</text>
+        <text x="320" fill="#cbd5e1">$320.98</text>
+        <text x="450" fill="#cbd5e1">$442.47</text>
+        <text x="600" fill="#34d399">+$40,700.24</text>
+        <text x="900" fill="#cbd5e1">10.1%</text>
+        <text x="1080" fill="#98a0b3">long equity</text>
+      </g>
+      <!-- LRCX -->
+      <g transform="translate(0, 56)">
+        <text fill="#e7eaf2" font-weight="600">LRCX</text>
+        <text x="200" fill="#cbd5e1">438</text>
+        <text x="320" fill="#cbd5e1">$246.00</text>
+        <text x="450" fill="#cbd5e1">$292.40</text>
+        <text x="600" fill="#34d399">+$20,324.40</text>
+        <text x="900" fill="#cbd5e1">8.7%</text>
+        <text x="1080" fill="#98a0b3">long equity</text>
+      </g>
+      <!-- INTC -->
+      <g transform="translate(0, 84)">
+        <text fill="#e7eaf2" font-weight="600">INTC</text>
+        <text x="200" fill="#cbd5e1">610</text>
+        <text x="320" fill="#cbd5e1">$83.96</text>
+        <text x="450" fill="#cbd5e1">$117.68</text>
+        <text x="600" fill="#34d399">+$20,567.04</text>
+        <text x="900" fill="#cbd5e1">4.9%</text>
+        <text x="1080" fill="#98a0b3">long equity</text>
+      </g>
+      <!-- AMAT -->
+      <g transform="translate(0, 112)">
+        <text fill="#e7eaf2" font-weight="600">AMAT</text>
+        <text x="200" fill="#cbd5e1">282</text>
+        <text x="320" fill="#cbd5e1">$381.73</text>
+        <text x="450" fill="#cbd5e1">$433.43</text>
+        <text x="600" fill="#34d399">+$14,579.06</text>
+        <text x="900" fill="#cbd5e1">8.3%</text>
+        <text x="1080" fill="#98a0b3">long equity</text>
+      </g>
+      <!-- GOOGL -->
+      <g transform="translate(0, 140)">
+        <text fill="#e7eaf2" font-weight="600">GOOGL</text>
+        <text x="200" fill="#cbd5e1">305</text>
+        <text x="320" fill="#cbd5e1">$352.82</text>
+        <text x="450" fill="#cbd5e1">$399.27</text>
+        <text x="600" fill="#34d399">+$14,166.22</text>
+        <text x="900" fill="#cbd5e1">8.3%</text>
+        <text x="1080" fill="#7c5cff">PMCC long-leg</text>
+      </g>
+      <!-- AVGO -->
+      <g transform="translate(0, 168)">
+        <text fill="#e7eaf2" font-weight="600">AVGO</text>
+        <text x="200" fill="#cbd5e1">268</text>
+        <text x="320" fill="#cbd5e1">$401.98</text>
+        <text x="450" fill="#cbd5e1">$427.75</text>
+        <text x="600" fill="#34d399">+$6,906.11</text>
+        <text x="900" fill="#cbd5e1">7.8%</text>
+        <text x="1080" fill="#98a0b3">long equity</text>
+      </g>
+      <!-- CAT -->
+      <g transform="translate(0, 196)">
+        <text fill="#e7eaf2" font-weight="600">CAT</text>
+        <text x="200" fill="#cbd5e1">69</text>
+        <text x="320" fill="#cbd5e1">$835.45</text>
+        <text x="450" fill="#cbd5e1">$899.82</text>
+        <text x="600" fill="#34d399">+$4,441.56</text>
+        <text x="900" fill="#cbd5e1">4.2%</text>
+        <text x="1080" fill="#98a0b3">long equity</text>
+      </g>
+    </g>
+
+    <text x="1280" y="312" text-anchor="end" font-size="10" fill="#6c7388">+ 21 more rows · scroll to see all</text>
+  </g>
+</svg>

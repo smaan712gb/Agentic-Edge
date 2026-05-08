@@ -53,11 +53,25 @@ The interface is a Next.js 15 app with a live agent-network visualisation on the
 - **Performance.** Today's gain/loss, account equity curve, and current positions when an IBKR paper account is connected.
 - **Kill switch.** One click in the sidebar halts every automation loop. The state is stored in the database so a restart can't accidentally re-arm trading.
 
+### Home — the digital trading floor
+
 ![Agentic Edge — the digital trading floor](docs/diagrams/digital-trading-floor.svg)
 
 > **Try the click-through version** — every digital employee is inspectable, and the "Run a theme" button walks the full sequence: **[live demo](https://smaan712gb.github.io/Agentic-Edge/workflow-diagram.html)**.
 
-The illustration above is generated from the same component that ships with the app — see `web/components/workflow-diagram.tsx` for the React version and `web/public/workflow-diagram.html` for the standalone HTML. Real screenshots will land in `docs/screenshots/` (see the [screenshot guide](docs/screenshots/README.md) for the filenames the README picks up automatically).
+### Performance — paper account, live
+
+![Performance dashboard with KPI cards, 90-day equity curve, and open positions](docs/diagrams/performance.svg)
+
+KPI cards at the top, the 90-day equity curve drawing itself in below, and the open-positions table beneath. Once IBKR Gateway is connected, every value is the live read from the paper account.
+
+### Themes — your investment universe
+
+![Themes page showing six thematic baskets with conviction scores](docs/diagrams/themes.svg)
+
+Each card is a thesis the agent team scores against. Add a theme, seed it with tickers and a one-line rationale, and the next scheduled run picks it up automatically.
+
+The illustrations above are generated from the same components that ship with the app — see `web/components/` for the React versions. Real screenshots will land in `docs/screenshots/` (see the [screenshot guide](docs/screenshots/README.md) for the filenames the README picks up automatically).
 
 ---
 
