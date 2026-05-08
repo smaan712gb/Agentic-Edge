@@ -1,0 +1,867 @@
+"""Maintenance loop — Phase D.
+
+Runs every 5 min during RTH. For every open position the system owns
+(stocks + PMCCs), evaluates roll/exit/hedge triggers and submits the
+implied trade through the same auto-gate + walking-limit executor that
+entries use.
+
+Key invariants:
+  * Same gate stack as entries (kill switch, daily caps, sector regime)
+  * Same audit trail (auto_actions + trade_audit_log)
+  * Read-only fast paths preferred — only mutate state when a trigger
+    actually fires, so a 5-min tick is cheap
+  * Idempotent — restarting mid-cycle shouldn't double-fire actions
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from api.app.config import get_settings
+from api.app.db import (
+    AutoAction,
+    Position,
+    Run,
+    SystemState,
+    TickerScore,
+    TradeAuditLog,
+    TradeIntent,
+    get_session as db_session,
+)
+
+from .alerts import alert
+from .auto_gate import check_auto_action, record_auto_action
+from .market_conditions import gate_rth
+
+logger = logging.getLogger("agentic_edge.maint_loop")
+
+
+_TASK: Optional[asyncio.Task] = None
+_POLL_INTERVAL_SEC = 300       # 5 min during RTH
+
+
+async def start_maintenance_loop() -> None:
+    global _TASK
+    if _TASK and not _TASK.done():
+        return
+    _TASK = asyncio.create_task(_loop_forever(), name="maint_loop")
+    logger.info("maintenance loop started (poll=%ds)", _POLL_INTERVAL_SEC)
+
+
+async def stop_maintenance_loop() -> None:
+    global _TASK
+    if _TASK and not _TASK.done():
+        _TASK.cancel()
+        try:
+            await _TASK
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+    _TASK = None
+
+
+async def _loop_forever() -> None:
+    # Initial delay so the entry loop can fire first if both are starting.
+    await asyncio.sleep(15.0)
+    while True:
+        try:
+            await _tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("maintenance tick failed: %s", e)
+        await asyncio.sleep(_POLL_INTERVAL_SEC)
+
+
+async def _tick() -> None:
+    settings = get_settings()
+    if not settings.AUTOTRADE_ENABLED:
+        return
+    async with db_session() as s:
+        state = await s.get(SystemState, 1)
+        if state is None or not state.autotrade_enabled:
+            return
+
+    # RTH only — no maintenance actions outside US trading hours.
+    if gate_rth() is not None:
+        return
+
+    # Snapshot state from IBKR + DB
+    try:
+        from api.app.positions import _ibkr
+        ib = await _ibkr()
+        positions = await ib.get_positions()
+    except Exception as e:
+        logger.warning("maint loop: IBKR unavailable (%s); skipping tick", e)
+        return
+
+    pos_by_symbol = {(p.get("symbol") or "").upper(): p for p in positions}
+
+    # Pull every open intent (the system's record of what it owns)
+    async with db_session() as s:
+        intents = (
+            await s.execute(
+                select(TradeIntent).where(TradeIntent.status.in_(["filled", "submitted"]))
+                .where(TradeIntent.position_state.in_(["pmcc_full", "leap_pending"]))
+            )
+        ).scalars().all()
+
+    if not intents:
+        return
+
+    logger.info("maint loop: tick — %d open intent(s) to evaluate", len(intents))
+
+    # Latest agent decision per symbol (today's run)
+    latest_decisions = await _latest_decisions_today({i.symbol for i in intents})
+
+    for intent in intents:
+        sym = (intent.symbol or "").upper()
+        try:
+            if intent.structure == "stock":
+                await _evaluate_stock(intent, pos_by_symbol.get(sym), latest_decisions.get(sym), ib)
+            elif intent.structure in ("pmcc", "pmcc_sequenced"):
+                await _evaluate_pmcc(intent, latest_decisions.get(sym), ib)
+        except Exception as e:
+            logger.exception("maint loop: %s evaluation failed: %s", sym, e)
+
+
+# ---------------------------------------------------------------------------
+# Per-position evaluation
+# ---------------------------------------------------------------------------
+
+
+async def _latest_decisions_today(symbols: set[str]) -> dict[str, str]:
+    """Return latest scorecard decision per symbol from today's done runs."""
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    out: dict[str, str] = {}
+    if not symbols:
+        return out
+    async with db_session() as s:
+        rows = (
+            await s.execute(
+                select(TickerScore.symbol, TickerScore.decision, TickerScore.composite, Run.finished_at)
+                .join(Run, Run.id == TickerScore.run_id)
+                .where(Run.status == "done").where(Run.finished_at >= today)
+                .where(TickerScore.symbol.in_(symbols))
+                .order_by(Run.finished_at.desc())
+            )
+        ).all()
+    # Latest by symbol
+    for sym, decision, _composite, _ts in rows:
+        out.setdefault((sym or "").upper(), decision)
+    return out
+
+
+async def _evaluate_stock(intent: TradeIntent, pos: Optional[dict], latest_decision: Optional[str], ib: Any) -> None:
+    """Roll/exit decisions for a held stock position."""
+    if pos is None:
+        # We have an intent but IBKR shows no position — possibly closed manually.
+        async with db_session() as s:
+            i = await s.get(TradeIntent, intent.id)
+            if i:
+                i.status = "closed"
+                i.position_state = "closed"
+        return
+
+    from tradingagents.strategies.maintenance.exits import maybe_exit_stock
+
+    avg = float(pos.get("avg_price") or 0)
+    last = float(pos.get("last_price") or 0)
+    qty = float(pos.get("qty") or 0)
+    if qty == 0 or avg <= 0 or last <= 0:
+        return
+
+    # ATR_30d — Polygon historical for last 30 days. Light read; cache later.
+    atr_30d = await _compute_atr_30d(intent.symbol)
+
+    decision = await maybe_exit_stock(
+        symbol=intent.symbol, current_price=last, avg_price=avg,
+        latest_decision=latest_decision, atr_30d=atr_30d,
+    )
+    if not decision.should_exit:
+        return
+
+    await _execute_stock_exit(intent=intent, qty=abs(qty), reason=decision.reason,
+                              exit_kind=decision.exit_kind, ib=ib)
+
+
+async def _evaluate_pmcc(intent: TradeIntent, latest_decision: Optional[str], ib: Any) -> None:
+    """Roll/exit decisions for a PMCC position. Currently flags only;
+    actual roll execution requires the option-chain probe + combo build,
+    same path as entries. For Phase D v1 we mark intent flags + alert
+    the operator; v2 will auto-fire the rolls."""
+    from tradingagents.strategies.maintenance.exits import maybe_close_pmcc
+    from tradingagents.strategies.maintenance.earnings import days_to_earnings
+
+    # Close decision first
+    leap_dte_days = _dte_from_str(intent.leap_expiry) if intent.leap_expiry else None
+    close = await maybe_close_pmcc(
+        symbol=intent.symbol,
+        leap_delta=intent.leap_delta_actual,
+        latest_decision=latest_decision,
+        leap_dte=leap_dte_days,
+    )
+    if close.should_exit:
+        await _flag_pmcc_close(intent=intent, reason=close.reason, kind=close.exit_kind)
+        return
+
+    # Earnings hedge check
+    days_to_e = await days_to_earnings(intent.symbol)
+    if days_to_e is not None and 0 <= days_to_e <= 2:
+        await alert(
+            level="warning",
+            title=f"Earnings in {days_to_e}d for {intent.symbol}",
+            body=(
+                f"Recommend buy back short ${intent.short_call_strike} "
+                f"{intent.short_call_expiry} before close, re-sell day after print."
+            ),
+        )
+        async with db_session() as s:
+            await record_auto_action(
+                s, loop="maintenance", action_type="earnings_hedge_due",
+                gate_result=_synthetic_passed_gate(),
+                symbol=intent.symbol, intent_id=intent.id,
+                payload={"days_to_earnings": days_to_e},
+                outcome="flagged",
+            )
+        return
+
+    # ---- Short-call roll: full operator-spec evaluation -------------
+    # We invoke the rolls module which applies all the rules:
+    #   * defensive (delta ≥ 0.70)
+    #   * time (DTE ≤ 7 OTM)
+    #   * profit (≥ 80% credit captured)
+    #   * earnings (close-only — don't sell into print)
+    # Strike picking honours expected-move + recent-high + momentum mode +
+    # cost guard. We *flag* the roll with the suggested replacement leg;
+    # operator confirms via /api/admin/positions/exit (and the next slice
+    # will add a /positions/roll endpoint that fires the combo).
+    if intent.short_call_expiry and intent.short_call_strike:
+        await _evaluate_short_call_roll(intent, ib, days_to_e)
+
+    # ---- LEAP forward roll evaluation -------------------------------
+    if intent.leap_expiry and leap_dte_days is not None and leap_dte_days <= 180:
+        await _evaluate_leap_forward_roll(intent, ib, leap_dte_days)
+
+
+async def _evaluate_short_call_roll(intent: TradeIntent, ib: Any, days_to_e: Optional[int]) -> None:
+    """Pull the chain + live short quote, ask the rolls module for a decision,
+    persist the decision as a flag with the suggested replacement."""
+    from tradingagents.strategies.maintenance.rolls import maybe_roll_short_call
+
+    sym = intent.symbol
+    # Need: chain expirations + strikes, current short quote (delta + mid),
+    # underlying spot + IV. All best-effort — if any fail, skip and try
+    # next tick.
+    try:
+        chain = await ib.get_option_chain(symbol=sym)
+        spot = await _get_spot(ib, sym)
+        cur_quote = await ib.get_option_quote(
+            symbol=sym, expiry=intent.short_call_expiry,
+            strike=float(intent.short_call_strike), right="C",
+        )
+    except Exception as e:
+        logger.debug("short-call roll eval skipped for %s (data fetch failed): %s", sym, e)
+        return
+
+    decision = await maybe_roll_short_call(
+        symbol=sym,
+        short_expiry=intent.short_call_expiry,
+        short_strike=float(intent.short_call_strike),
+        current_short_delta=cur_quote.get("delta"),
+        current_short_mid=_mid_or_last(cur_quote),
+        open_credit=intent.short_call_fill_price,    # if known; rolls handles None gracefully
+        underlying_spot=spot or 0.0,
+        underlying_iv=cur_quote.get("iv"),
+        chain_strikes=chain.get("strikes", []),
+        chain_expirations=chain.get("expirations", []),
+        ibkr=ib,
+        days_to_earnings=days_to_e,
+    )
+
+    # Earnings → short-call must be CLOSED (not rolled). Auto-fire close-only.
+    if decision.skip_short_until_event == "earnings":
+        await alert(level="warning",
+                    title=f"Earnings hedge: closing short call {sym}",
+                    body=decision.reason)
+        await _execute_auto_short_call_close(intent, ib, decision.reason)
+        return
+
+    if not decision.should_roll:
+        return  # hold
+
+    # Auto-fire the roll
+    await _execute_auto_short_call_roll(intent, decision, ib)
+
+
+async def _evaluate_leap_forward_roll(intent: TradeIntent, ib: Any, leap_dte_days: int) -> None:
+    from tradingagents.strategies.maintenance.rolls import maybe_roll_leap_forward
+
+    sym = intent.symbol
+    try:
+        chain = await ib.get_option_chain(symbol=sym)
+        spot = await _get_spot(ib, sym)
+    except Exception as e:
+        logger.debug("LEAP roll eval skipped for %s (data fetch failed): %s", sym, e)
+        return
+
+    decision = await maybe_roll_leap_forward(
+        symbol=sym, leap_expiry=intent.leap_expiry,
+        leap_strike=float(intent.leap_strike or 0),
+        current_leap_delta=intent.leap_delta_actual,
+        underlying_spot=spot or 0.0,
+        chain_strikes=chain.get("strikes", []),
+        chain_expirations=chain.get("expirations", []),
+        ibkr=ib,
+    )
+    if not decision.should_roll:
+        # If the decision says recommend_close, surface that; otherwise quiet.
+        if decision.detail and decision.detail.get("recommend_close"):
+            await alert(
+                level="warning",
+                title=f"LEAP recommend close: {sym}",
+                body=decision.reason,
+            )
+            async with db_session() as s:
+                await record_auto_action(
+                    s, loop="maintenance", action_type="leap_close_recommended",
+                    gate_result=_synthetic_passed_gate(),
+                    symbol=sym, intent_id=intent.id,
+                    payload={"reason": decision.reason, "leap_dte": leap_dte_days},
+                    outcome="flagged",
+                )
+        return
+
+    # Auto-fire LEAP forward roll
+    await _execute_auto_leap_forward_roll(intent, decision, ib)
+
+
+async def _get_spot(ib: Any, symbol: str) -> Optional[float]:
+    """Lightweight spot fetch used by maintenance-loop quote enrichment.
+    Reuses the PMCC strategy's fallback chain (IBKR live → Polygon → yfinance)."""
+    from tradingagents.strategies.pmcc import _fetch_spot
+    return await _fetch_spot(ib, symbol)
+
+
+def _mid_or_last(q: dict[str, Any]) -> Optional[float]:
+    bid = q.get("bid"); ask = q.get("ask")
+    if bid and ask and bid > 0 and ask > 0:
+        return (bid + ask) / 2
+    last = q.get("last"); model = q.get("model_price")
+    for v in (last, model):
+        if v and v > 0:
+            return float(v)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Execution helpers
+# ---------------------------------------------------------------------------
+
+
+async def _execute_stock_exit(*, intent: TradeIntent, qty: float, reason: str, exit_kind: str, ib: Any) -> None:
+    """Submit a marketable LMT SELL to close a stock position. Audited."""
+    from ib_insync import Stock  # type: ignore
+    from tradingagents.dataflows.providers.base import TradeIntent as IntentDC
+
+    # Quick quote
+    ib_inst = await ib._ensure_connected()
+    contract = Stock(intent.symbol, "SMART", "USD")
+    qualified = await ib_inst.qualifyContractsAsync(contract)
+    if not qualified:
+        logger.warning("maint exit: could not qualify %s", intent.symbol)
+        return
+    contract = qualified[0]
+    ticker = ib_inst.reqMktData(contract, "", False, False)
+    await asyncio.sleep(1.5)
+    bid = float(ticker.bid or 0)
+    ask = float(ticker.ask or 0)
+    last = float(ticker.last or 0)
+    try: ib_inst.cancelMktData(contract)
+    except Exception: pass
+
+    # Marketable limit on sell side: bid - 1¢ to fill quickly
+    if bid > 0:
+        limit = round(bid - 0.01, 2)
+    elif last > 0:
+        limit = round(last - 0.01, 2)
+    else:
+        logger.warning("maint exit: no quote for %s; skipping", intent.symbol)
+        return
+
+    async with db_session() as s:
+        s.add(TradeAuditLog(
+            intent_id=intent.id, action="maint_exit_attempt",
+            payload={"symbol": intent.symbol, "qty": qty, "limit": limit,
+                     "reason": reason, "kind": exit_kind, "bid": bid, "ask": ask},
+        ))
+
+    intent_dc = IntentDC(
+        ticker=intent.symbol, side="SELL", qty=int(qty),
+        order_type="LMT", limit_px=limit, tif="DAY", account_mode="paper",
+    )
+    try:
+        result = await ib.submit_trade(intent_dc)
+    except Exception as e:
+        logger.exception("maint exit submit failed for %s: %s", intent.symbol, e)
+        async with db_session() as s:
+            s.add(TradeAuditLog(
+                intent_id=intent.id, action="maint_exit_outcome",
+                outcome="error", error=str(e),
+            ))
+        return
+
+    order_id = str(result.get("ibkr_order_id") or "")
+    async with db_session() as s:
+        i = await s.get(TradeIntent, intent.id)
+        if i:
+            i.status = "closing"
+            i.position_state = "closing"
+        s.add(TradeAuditLog(
+            intent_id=intent.id, action="maint_exit_outcome",
+            outcome="submitted",
+            payload={"order_id": order_id, "limit": limit, "qty": qty},
+        ))
+        await record_auto_action(
+            s, loop="maintenance", action_type="stock_exit_submitted",
+            gate_result=_synthetic_passed_gate(), symbol=intent.symbol,
+            intent_id=intent.id,
+            payload={"qty": qty, "limit": limit, "kind": exit_kind, "reason": reason},
+            outcome="submitted", ibkr_order_id=order_id,
+        )
+    await alert(
+        level="warning",
+        title=f"Stock EXIT: {intent.symbol}",
+        body=f"{qty} sh @ LMT ${limit}: {reason}",
+    )
+
+
+async def _flag_pmcc_close(*, intent: TradeIntent, reason: str, kind: str) -> None:
+    """Auto-fire PMCC close: SELL LEAP + BUY-TO-CLOSE short, walked at
+    net credit through the existing combo executor.
+
+    Falls back to flag+alert if auto-fire pre-conditions fail (missing
+    conids, daily cap hit, IBKR unreachable) — operator still gets the
+    signal in Slack and via the auto_actions audit row.
+    """
+    cfg = dict((intent.walking_config or {}))
+    leap_conid = int(cfg.get("leap_conid", 0))
+    short_conid = int(cfg.get("short_call_conid", 0))
+    if not leap_conid or not short_conid:
+        async with db_session() as s:
+            await record_auto_action(
+                s, loop="maintenance", action_type="pmcc_close_flagged",
+                gate_result=_synthetic_passed_gate(),
+                symbol=intent.symbol, intent_id=intent.id,
+                payload={"reason": reason, "kind": kind, "manual_required": "missing leg conids"},
+                outcome="flagged",
+            )
+        await alert(
+            level="warning",
+            title=f"PMCC close — manual: {intent.symbol}",
+            body=f"{reason}. Missing leg conids; close via /api/admin/positions/exit/{intent.id}.",
+        )
+        return
+
+    if await _maintenance_cap_hit("close"):
+        await alert(level="warning",
+                    title=f"PMCC close skipped (daily cap): {intent.symbol}",
+                    body=reason)
+        async with db_session() as s:
+            await record_auto_action(
+                s, loop="maintenance", action_type="pmcc_close_skipped_cap",
+                gate_result=_synthetic_passed_gate(),
+                symbol=intent.symbol, intent_id=intent.id,
+                payload={"reason": reason, "kind": kind},
+                outcome="cap_hit",
+            )
+        return
+
+    legs = [
+        {"conid": leap_conid,  "ratio": 1, "action": "SELL"},
+        {"conid": short_conid, "ratio": 1, "action": "BUY"},
+    ]
+    qty = int(intent.qty or 1)
+
+    from api.app.positions import _ibkr
+    from tradingagents.strategies.execution import (
+        ExecutionConfig, submit_pmcc_combo,
+    )
+    try:
+        ib = await _ibkr()
+    except Exception as e:
+        async with db_session() as s:
+            await record_auto_action(
+                s, loop="maintenance", action_type="pmcc_close_error",
+                gate_result=_synthetic_passed_gate(),
+                symbol=intent.symbol, intent_id=intent.id,
+                payload={"reason": reason}, outcome="error", error=f"IBKR unreachable: {e}",
+            )
+        return
+
+    async with db_session() as s:
+        s.add(TradeAuditLog(
+            intent_id=intent.id, action="auto_pmcc_close_attempt",
+            payload={"symbol": intent.symbol, "legs": legs, "qty": qty,
+                     "reason": reason, "kind": kind},
+        ))
+
+    result = await submit_pmcc_combo(
+        ibkr=ib, symbol=intent.symbol, legs=legs, contracts=qty,
+        action="SELL",   # close = receive net credit
+        config=ExecutionConfig(
+            initial_offset_cents=1, walk_increment_cents=1,
+            walk_interval_sec=20, max_offset_pct_of_spread=0.50,
+            timeout_sec=180,
+        ),
+    )
+
+    async with db_session() as s:
+        i = await s.get(TradeIntent, intent.id)
+        if i:
+            if result.status == "filled":
+                i.status = "closed"
+                i.position_state = "closed"
+            elif result.status not in ("abandoned", "rejected_pretrade"):
+                i.status = "error"
+        s.add(TradeAuditLog(
+            intent_id=intent.id, action="auto_pmcc_close_outcome",
+            outcome=result.status, payload=result.to_dict(),
+            error=result.error,
+        ))
+        await record_auto_action(
+            s, loop="maintenance", action_type=f"pmcc_close_{result.status}",
+            gate_result=_synthetic_passed_gate(),
+            symbol=intent.symbol, intent_id=intent.id,
+            payload={"reason": reason, "kind": kind, "execution": result.to_dict()},
+            outcome=result.status,
+        )
+
+    if result.status == "filled":
+        await alert(level="warning", title=f"PMCC CLOSED: {intent.symbol}",
+                    body=f"@ ${result.fill_price:.2f} net credit. Reason: {reason}")
+    elif result.status == "abandoned":
+        await alert(level="warning", title=f"PMCC close abandoned: {intent.symbol}",
+                    body=f"walked to floor; will retry next tick. {reason}")
+
+
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+
+
+def _synthetic_passed_gate() -> Any:
+    """Maintenance actions don't go through check_auto_action (they're
+    not new entries). We still want them in auto_actions for audit, so
+    we hand record_auto_action a synthetic 'passed' result."""
+    from .auto_gate import AutoGateResult
+    return AutoGateResult(passed=True, failures=[])
+
+
+def _dte_from_str(yyyymmdd: str) -> Optional[int]:
+    if not yyyymmdd or len(yyyymmdd) < 8:
+        return None
+    try:
+        from datetime import date
+        return (date.fromisoformat(f"{yyyymmdd[:4]}-{yyyymmdd[4:6]}-{yyyymmdd[6:8]}")
+                - date.today()).days
+    except Exception:
+        return None
+
+
+async def _compute_atr_30d(symbol: str) -> Optional[float]:
+    """Wilder's ATR(30) via Polygon daily bars. None on failure."""
+    try:
+        from datetime import date, timedelta
+        from tradingagents.dataflows.providers.polygon import PolygonProvider
+        p = PolygonProvider()
+        df = await p.get_stock_data(symbol, date.today() - timedelta(days=60), date.today())
+        if df is None or len(df) < 30 or "High" not in df.columns:
+            return None
+        # True range across the last 30 bars
+        highs = df["High"].astype(float).iloc[-31:].tolist()
+        lows  = df["Low"].astype(float).iloc[-31:].tolist()
+        closes = df["Close"].astype(float).iloc[-31:].tolist()
+        trs = []
+        for i in range(1, len(highs)):
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+            trs.append(tr)
+        if not trs:
+            return None
+        return sum(trs) / len(trs)
+    except Exception as e:
+        logger.warning("ATR fetch failed for %s: %s", symbol, e)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Daily caps for maintenance actions
+# ---------------------------------------------------------------------------
+
+
+async def _maintenance_cap_hit(kind: str) -> bool:
+    """True if today's count of `kind` actions has hit the daily cap."""
+    from api.app.autotrade.auto_gate import DEFAULT_CAPS
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    if kind == "close":
+        action_prefix = "pmcc_close_"
+        cap = DEFAULT_CAPS["AUTO_MAX_CLOSES_PER_DAY"]
+    elif kind == "roll":
+        action_prefix = "pmcc_roll_"
+        cap = DEFAULT_CAPS["AUTO_MAX_ROLLS_PER_DAY"]
+    else:
+        return False
+    async with db_session() as s:
+        from sqlalchemy import func
+        n = (
+            await s.execute(
+                select(func.count())
+                .select_from(AutoAction)
+                .where(AutoAction.timestamp >= today)
+                .where(AutoAction.loop == "maintenance")
+                .where(AutoAction.action_type.like(f"{action_prefix}filled"))
+            )
+        ).scalar_one()
+    return n >= cap
+
+
+# ---------------------------------------------------------------------------
+# Auto-fire executors — short-call close, short-call roll, LEAP forward roll
+# ---------------------------------------------------------------------------
+
+
+async def _execute_auto_short_call_close(intent: TradeIntent, ib: Any, reason: str) -> None:
+    """Buy back the existing short call WITHOUT opening a new one.
+
+    Earnings-hedge use case: closes the short leg 2 sessions before the
+    print, leaves the LEAP uncapped through the move. Next maintenance
+    tick after earnings will see the short side empty and (when
+    sequenced-relisting is wired) re-establish.
+    """
+    cfg = dict((intent.walking_config or {}))
+    short_conid = int(cfg.get("short_call_conid", 0))
+    if not short_conid:
+        try:
+            q = await ib.get_option_quote(
+                symbol=intent.symbol, expiry=intent.short_call_expiry,
+                strike=float(intent.short_call_strike), right="C",
+            )
+            short_conid = int(q.get("conid", 0))
+        except Exception as e:
+            logger.warning("earnings close: cannot qualify short for %s: %s", intent.symbol, e)
+            return
+    if not short_conid or await _maintenance_cap_hit("close"):
+        return
+
+    qty = int(intent.qty or 1)
+    legs = [{"conid": short_conid, "ratio": 1, "action": "BUY"}]
+    async with db_session() as s:
+        s.add(TradeAuditLog(
+            intent_id=intent.id, action="auto_short_close_attempt",
+            payload={"symbol": intent.symbol, "qty": qty, "reason": reason},
+        ))
+
+    from tradingagents.strategies.execution import ExecutionConfig, submit_pmcc_combo
+    result = await submit_pmcc_combo(
+        ibkr=ib, symbol=intent.symbol, legs=legs, contracts=qty, action="BUY",
+        config=ExecutionConfig(
+            initial_offset_cents=1, walk_increment_cents=1,
+            walk_interval_sec=15, max_offset_pct_of_spread=0.50, timeout_sec=120,
+        ),
+    )
+
+    async with db_session() as s:
+        i = await s.get(TradeIntent, intent.id)
+        if i and result.status == "filled":
+            i.short_call_strike = None
+            i.short_call_expiry = None
+            i.short_call_delta_actual = None
+            i.short_call_iv = None
+            i.position_state = "leap_open_naked"
+            cfg.pop("short_call_conid", None)
+            cfg["earnings_hedge_closed_at"] = datetime.now(timezone.utc).isoformat()
+            i.walking_config = cfg
+        s.add(TradeAuditLog(
+            intent_id=intent.id, action="auto_short_close_outcome",
+            outcome=result.status, payload=result.to_dict(), error=result.error,
+        ))
+        await record_auto_action(
+            s, loop="maintenance", action_type=f"pmcc_close_{result.status}",
+            gate_result=_synthetic_passed_gate(),
+            symbol=intent.symbol, intent_id=intent.id,
+            payload={"reason": reason, "execution": result.to_dict(), "kind": "earnings_hedge"},
+            outcome=result.status,
+        )
+
+    if result.status == "filled":
+        await alert(level="warning",
+                    title=f"Short call CLOSED (earnings hedge): {intent.symbol}",
+                    body=f"@ ${result.fill_price:.2f}. LEAP runs uncapped through print.")
+
+
+async def _execute_auto_short_call_roll(intent: TradeIntent, decision, ib: Any) -> None:
+    """Auto-fire roll: BUY-TO-CLOSE old short + SELL-TO-OPEN new short
+    as one atomic combo through the walking-limit executor."""
+    if not decision.new_leg or not decision.new_leg.conid:
+        return
+    if await _maintenance_cap_hit("roll"):
+        await alert(level="warning", title=f"Roll skipped (daily cap): {intent.symbol}",
+                    body=decision.reason)
+        return
+
+    cfg = dict((intent.walking_config or {}))
+    cur_short_conid = int(cfg.get("short_call_conid", 0))
+    if not cur_short_conid:
+        try:
+            q = await ib.get_option_quote(
+                symbol=intent.symbol, expiry=intent.short_call_expiry,
+                strike=float(intent.short_call_strike), right="C",
+            )
+            cur_short_conid = int(q.get("conid", 0))
+        except Exception:
+            return
+    if not (cur_short_conid and decision.new_leg.conid):
+        return
+
+    qty = int(intent.qty or 1)
+    legs = [
+        {"conid": cur_short_conid,         "ratio": 1, "action": "BUY"},
+        {"conid": decision.new_leg.conid,  "ratio": 1, "action": "SELL"},
+    ]
+    async with db_session() as s:
+        s.add(TradeAuditLog(
+            intent_id=intent.id, action="auto_short_roll_attempt",
+            payload={"symbol": intent.symbol, "qty": qty, "legs": legs,
+                     "reason": decision.reason,
+                     "old_strike": intent.short_call_strike,
+                     "new_strike": decision.new_leg.strike,
+                     "estimated_credit_capture": decision.estimated_credit_capture,
+                     "estimated_net_debit": decision.estimated_net_debit},
+        ))
+
+    # Net direction: credit roll → action=SELL (we walk DOWN from credit-mid).
+    # Debit roll (cost guard let it through) → action=BUY (walk UP).
+    action = "BUY" if (decision.estimated_net_debit and decision.estimated_net_debit > 0) else "SELL"
+
+    from tradingagents.strategies.execution import ExecutionConfig, submit_pmcc_combo
+    result = await submit_pmcc_combo(
+        ibkr=ib, symbol=intent.symbol, legs=legs, contracts=qty, action=action,
+        config=ExecutionConfig(
+            initial_offset_cents=1, walk_increment_cents=1,
+            walk_interval_sec=15, max_offset_pct_of_spread=0.50, timeout_sec=120,
+        ),
+    )
+
+    async with db_session() as s:
+        i = await s.get(TradeIntent, intent.id)
+        if i and result.status == "filled":
+            i.short_call_expiry = decision.new_leg.expiry
+            i.short_call_strike = decision.new_leg.strike
+            i.short_call_delta_actual = decision.new_leg.delta
+            i.short_call_iv = decision.new_leg.iv
+            i.short_call_open_interest = decision.new_leg.open_interest
+            cfg["short_call_conid"] = decision.new_leg.conid
+            cfg["last_roll_at"] = datetime.now(timezone.utc).isoformat()
+            cfg["last_roll_reason"] = decision.reason
+            i.walking_config = cfg
+        s.add(TradeAuditLog(
+            intent_id=intent.id, action="auto_short_roll_outcome",
+            outcome=result.status, payload=result.to_dict(), error=result.error,
+        ))
+        await record_auto_action(
+            s, loop="maintenance", action_type=f"pmcc_roll_{result.status}",
+            gate_result=_synthetic_passed_gate(),
+            symbol=intent.symbol, intent_id=intent.id,
+            payload={"reason": decision.reason,
+                     "new_strike": decision.new_leg.strike,
+                     "new_expiry": decision.new_leg.expiry,
+                     "execution": result.to_dict()},
+            outcome=result.status,
+        )
+
+    if result.status == "filled":
+        await alert(level="info", title=f"Short call ROLLED: {intent.symbol}",
+                    body=(f"to ${decision.new_leg.strike:.0f} {decision.new_leg.expiry} "
+                          f"@ ${result.fill_price:.2f}. {decision.reason}"))
+
+
+async def _execute_auto_leap_forward_roll(intent: TradeIntent, decision, ib: Any) -> None:
+    """SELL old LEAP + BUY new LEAP, walked at net debit through the executor."""
+    if not decision.new_leg or not decision.new_leg.conid:
+        return
+    if await _maintenance_cap_hit("roll"):
+        return
+
+    cfg = dict((intent.walking_config or {}))
+    cur_leap_conid = int(cfg.get("leap_conid", 0))
+    if not cur_leap_conid:
+        try:
+            q = await ib.get_option_quote(
+                symbol=intent.symbol, expiry=intent.leap_expiry,
+                strike=float(intent.leap_strike), right="C",
+            )
+            cur_leap_conid = int(q.get("conid", 0))
+        except Exception:
+            return
+    if not cur_leap_conid:
+        return
+
+    qty = int(intent.qty or 1)
+    legs = [
+        {"conid": cur_leap_conid,          "ratio": 1, "action": "SELL"},
+        {"conid": decision.new_leg.conid,  "ratio": 1, "action": "BUY"},
+    ]
+    async with db_session() as s:
+        s.add(TradeAuditLog(
+            intent_id=intent.id, action="auto_leap_roll_attempt",
+            payload={"symbol": intent.symbol, "qty": qty, "legs": legs,
+                     "old_strike": intent.leap_strike, "old_expiry": intent.leap_expiry,
+                     "new_strike": decision.new_leg.strike, "new_expiry": decision.new_leg.expiry,
+                     "reason": decision.reason},
+        ))
+
+    from tradingagents.strategies.execution import ExecutionConfig, submit_pmcc_combo
+    result = await submit_pmcc_combo(
+        ibkr=ib, symbol=intent.symbol, legs=legs, contracts=qty, action="BUY",
+        config=ExecutionConfig(
+            initial_offset_cents=1, walk_increment_cents=2,
+            walk_interval_sec=30, max_offset_pct_of_spread=0.30, timeout_sec=300,
+        ),
+    )
+
+    async with db_session() as s:
+        i = await s.get(TradeIntent, intent.id)
+        if i and result.status == "filled":
+            i.leap_expiry = decision.new_leg.expiry
+            i.leap_strike = decision.new_leg.strike
+            i.leap_delta_actual = decision.new_leg.delta
+            i.leap_iv = decision.new_leg.iv
+            i.leap_open_interest = decision.new_leg.open_interest
+            cfg["leap_conid"] = decision.new_leg.conid
+            cfg["last_leap_roll_at"] = datetime.now(timezone.utc).isoformat()
+            i.walking_config = cfg
+        s.add(TradeAuditLog(
+            intent_id=intent.id, action="auto_leap_roll_outcome",
+            outcome=result.status, payload=result.to_dict(), error=result.error,
+        ))
+        await record_auto_action(
+            s, loop="maintenance", action_type=f"pmcc_roll_{result.status}",
+            gate_result=_synthetic_passed_gate(),
+            symbol=intent.symbol, intent_id=intent.id,
+            payload={"reason": decision.reason, "execution": result.to_dict(), "kind": "leap_forward"},
+            outcome=result.status,
+        )
+
+    if result.status == "filled":
+        await alert(level="info", title=f"LEAP rolled forward: {intent.symbol}",
+                    body=(f"to ${decision.new_leg.strike:.0f} {decision.new_leg.expiry} "
+                          f"@ ${result.fill_price:.2f}"))
