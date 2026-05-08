@@ -1,0 +1,102 @@
+name: Deploy interactive workflow demo to GitHub Pages
+
+# Publishes web/public/workflow-diagram.html (and the static SVG) to GitHub
+# Pages so the README's "Open the live demo" link works.
+#
+# After the first successful run, in the repo settings:
+#   Settings → Pages → Build and deployment → Source: GitHub Actions
+#
+# The demo is then served at:
+#   https://<user>.github.io/<repo>/workflow-diagram.html
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "web/public/workflow-diagram.html"
+      - "docs/diagrams/digital-trading-floor.svg"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble Pages site
+        run: |
+          mkdir -p _site
+          cp web/public/workflow-diagram.html _site/workflow-diagram.html
+          cp docs/diagrams/digital-trading-floor.svg _site/digital-trading-floor.svg
+
+          # A minimal index.html so / on Pages doesn't 404.
+          cat > _site/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width,initial-scale=1" />
+            <title>Agentic Edge · live demo</title>
+            <style>
+              :root { color-scheme: dark; }
+              body {
+                margin: 0; min-height: 100vh;
+                background: #0b0d12; color: #e7eaf2;
+                font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+                display: grid; place-items: center; padding: 32px;
+              }
+              .card {
+                max-width: 560px; padding: 32px 36px;
+                background: #11141b; border: 1px solid #232a3a; border-radius: 14px;
+              }
+              h1 { margin: 0 0 8px; font-size: 22px; letter-spacing: -0.01em; }
+              p  { margin: 0 0 18px; color: #98a0b3; line-height: 1.55; }
+              a.btn {
+                display: inline-block; padding: 10px 16px; border-radius: 10px;
+                background: linear-gradient(135deg, #7c5cff, #38bdf8); color: #0b0d12;
+                text-decoration: none; font-weight: 600; margin-right: 10px;
+              }
+              a.ghost {
+                display: inline-block; padding: 10px 16px; border-radius: 10px;
+                border: 1px solid #232a3a; color: #cbd5e1;
+                text-decoration: none; font-weight: 500;
+              }
+            </style>
+          </head>
+          <body>
+            <div class="card">
+              <h1>Agentic Edge — live demos</h1>
+              <p>The interactive workflow viewer mirrors the Home tab of the
+              app. Each digital employee can be inspected; the "Run a theme"
+              button walks the floor end-to-end.</p>
+              <a class="btn" href="./workflow-diagram.html">Open interactive workflow →</a>
+              <a class="ghost" href="./digital-trading-floor.svg">Static SVG version</a>
+            </div>
+          </body>
+          </html>
+          HTML
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

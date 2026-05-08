@@ -53,7 +53,11 @@ The interface is a Next.js 15 app with a live agent-network visualisation on the
 - **Performance.** Today's gain/loss, account equity curve, and current positions when an IBKR paper account is connected.
 - **Kill switch.** One click in the sidebar halts every automation loop. The state is stored in the database so a restart can't accidentally re-arm trading.
 
-> Screenshots and a hero GIF are coming. If you've cloned this and want to contribute one, drop it into `docs/screenshots/` and open a PR — the [screenshot guide](docs/screenshots/README.md) lists the exact filenames the README will pick up.
+![Agentic Edge — the digital trading floor](docs/diagrams/digital-trading-floor.svg)
+
+> **Try the click-through version** — every digital employee is inspectable, and the "Run a theme" button walks the full sequence: **[live demo](https://smaan712gb.github.io/Agentic-Edge/workflow-diagram.html)**.
+
+The illustration above is generated from the same component that ships with the app — see `web/components/workflow-diagram.tsx` for the React version and `web/public/workflow-diagram.html` for the standalone HTML. Real screenshots will land in `docs/screenshots/` (see the [screenshot guide](docs/screenshots/README.md) for the filenames the README picks up automatically).
 
 ---
 
