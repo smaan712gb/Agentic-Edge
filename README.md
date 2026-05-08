@@ -44,17 +44,16 @@ The system is meant to be *legible*. Open the runs page, click any agent, and re
 
 ## What it looks like
 
-<p align="center">
-  <img src="docs/screenshots/demo.gif" alt="Agentic Edge in action" width="800"/>
-</p>
+The interface is a Next.js 15 app with a live agent-network visualisation on the home page, theme management, run history, performance tracking, and a kill switch always one click away.
 
-| | |
-| --- | --- |
-| **Themes** — add an investment theme like *AI infrastructure*, *advanced memory*, *grid power*, *small modular reactors*, or *optical networking*. Each theme owns its universe of names. | <img src="docs/screenshots/themes.png" alt="Themes" width="400"/> |
-| **Run** — kick off a research run. Each agent's progress streams live with rationale and intermediate findings. | <img src="docs/screenshots/run.png" alt="Run" width="400"/> |
-| **Scorecard** — final ranked output with the bull/bear debate, options flow, regime read, and the trader's recommendation per name. | <img src="docs/screenshots/scorecard.png" alt="Scorecard" width="400"/> |
-| **Performance** — equity curve, today's gain/loss, and current positions when an IBKR paper account is connected. | <img src="docs/screenshots/performance.png" alt="Performance" width="400"/> |
-| **Kill switch** — one click halts every automation loop. | <img src="docs/screenshots/kill-switch.png" alt="Kill switch" width="400"/> |
+- **Home — the digital trading floor.** A live, animated agent-network diagram. Each node is a specialist agent; edges animate when work is flowing through them; the active theme and chokepoint summary sit at the top.
+- **Themes.** Add a theme — *AI infrastructure*, *advanced memory*, *grid power*, *small modular reactors*, *optical networking*, or your own — seed it with tickers and a thesis sentence. The universe is editable at any time.
+- **Runs.** Every research run is recorded with the agent timeline, intermediate findings, and the final scorecard. Click any agent in the workflow diagram to read what it concluded for each ticker and why.
+- **Scorecard.** Ranked output combining the bull/bear debate, options flow, regime read, and the trader's recommendation per name. Composite score and the supporting rationale travel together.
+- **Performance.** Today's gain/loss, account equity curve, and current positions when an IBKR paper account is connected.
+- **Kill switch.** One click in the sidebar halts every automation loop. The state is stored in the database so a restart can't accidentally re-arm trading.
+
+> Screenshots and a hero GIF are coming. If you've cloned this and want to contribute one, drop it into `docs/screenshots/` and open a PR — the [screenshot guide](docs/screenshots/README.md) lists the exact filenames the README will pick up.
 
 ---
 
