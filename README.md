@@ -75,13 +75,24 @@ Each card is a thesis the agent team scores against. Add a theme, seed it with t
 
 ![Scorecard with six scoring dimensions per ticker and the ranked theme leaderboard](docs/diagrams/scorecard.svg)
 
-A name only ranks if it sits inside an active chokepoint theme. The agents check three things in order:
+A name only ranks if it sits inside an active chokepoint theme. The agents check three gates in order before any scoring happens:
 
 1. **Is the theme still in contact?** Sector regime, ETF read, and macro flow have to confirm the chokepoint thesis hasn't broken.
 2. **Does the chokepoint still exist?** The structural bottleneck — HBM3e capacity, 800G/1.6T optical transceivers, grid transformers, CoWoS packaging, SMR fuel cycle — has to be intact.
 3. **Is this company a critical link?** The ticker has to own a non-substitutable piece of the supply chain.
 
-Names that pass all three get scored across six dimensions: chokepoint fit, technical setup, fundamentals, options flow, bull/bear conviction, and risk-panel verdict. The composite is the weighted sum, the leaderboard is the ranked output, and the reasoning behind every score is on the page.
+Names that pass all three gates are then scored across six fundamental quality dimensions:
+
+- **Profit Generation** — earnings power, gross margin trajectory.
+- **Revenue Growth** — top-line momentum and the durability of it.
+- **Capital Efficiency** — ROIC, working-capital discipline, capex justified by returns.
+- **Free Cash Flow Production** — cash conversion across the cycle.
+- **Balance Sheet Health** — net cash, debt coverage, liquidity buffer.
+- **Future Outlook** — forward demand, pricing power, structural inevitability.
+
+**The Future Outlook dimension carries extra weight by design.** A company with negative current income but a confirmed chokepoint position and strong revenue growth can still earn a Buy — the framework values structural inevitability over a clean income statement, which matters when a critical-supply-chain name is still in build-out mode.
+
+The composite is the weighted sum, the leaderboard is the ranked output, and the reasoning behind every score is on the page.
 
 The illustrations above are generated from the same components that ship with the app — see `web/components/` for the React versions. Real screenshots will land in `docs/screenshots/` (see the [screenshot guide](docs/screenshots/README.md) for the filenames the README picks up automatically).
 
