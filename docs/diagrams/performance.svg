@@ -13,7 +13,7 @@
      gradient fill that fades up under it
    - Open positions table with row-highlight cycle on the top winners
 -->
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 900" preserveAspectRatio="xMidYMid meet" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-label="Agentic Edge — performance dashboard: today's gain/loss, account value, unrealized P&L, buying power, 90-day equity curve, and open positions">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 900" preserveAspectRatio="xMidYMid meet" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-label="Agentic Edge — performance dashboard: today's gain/loss, account value, unrealized P&amp;L, buying power, 90-day equity curve, and open positions">
   <defs>
     <linearGradient id="pf-rack" x1="0" x2="0" y1="0" y2="1">
       <stop offset="0%" stop-color="#11141b"/>

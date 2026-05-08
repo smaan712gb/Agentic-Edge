@@ -59,7 +59,7 @@
        Row 1 y=120, Row 2 y=450
   -->
 
-  <!-- ---- CARD 1: AI INFRASTRUCTURE (currently running) ---- -->
+  <!-- ==== CARD 1: AI INFRASTRUCTURE (currently running) ==== -->
   <g transform="translate(40, 120)">
     <!-- Animated glowing border (running theme) -->
     <rect width="420" height="300" rx="14" fill="url(#th-rack)" stroke="url(#th-card-active)" stroke-width="2">
@@ -118,7 +118,7 @@
     <text x="20" y="286" font-size="10" fill="#6c7388">Top: NVDA · AVGO · MRVL</text>
   </g>
 
-  <!-- ---- CARD 2: ADVANCED MEMORY ---- -->
+  <!-- ==== CARD 2: ADVANCED MEMORY ==== -->
   <g transform="translate(490, 120)">
     <rect width="420" height="300" rx="14" fill="url(#th-rack)" stroke="#232a3a"/>
     <g transform="translate(20, 20)">
@@ -162,7 +162,7 @@
     <text x="20" y="286" font-size="10" fill="#6c7388">Top: MU · WDC · KLAC</text>
   </g>
 
-  <!-- ---- CARD 3: GRID &amp; POWER ---- -->
+  <!-- ==== CARD 3: GRID &amp; POWER ==== -->
   <g transform="translate(940, 120)">
     <rect width="420" height="300" rx="14" fill="url(#th-rack)" stroke="#232a3a"/>
     <g transform="translate(20, 20)">
@@ -206,7 +206,7 @@
     <text x="20" y="286" font-size="10" fill="#6c7388">Top: VRT · ETN · GEV</text>
   </g>
 
-  <!-- ---- CARD 4: SMALL MODULAR REACTORS ---- -->
+  <!-- ==== CARD 4: SMALL MODULAR REACTORS ==== -->
   <g transform="translate(40, 450)">
     <rect width="420" height="300" rx="14" fill="url(#th-rack)" stroke="#232a3a"/>
     <g transform="translate(20, 20)">
@@ -247,7 +247,7 @@
     <text x="20" y="286" font-size="10" fill="#6c7388">Top: BWXT · CEG · CCJ</text>
   </g>
 
-  <!-- ---- CARD 5: OPTICAL NETWORKING ---- -->
+  <!-- ==== CARD 5: OPTICAL NETWORKING ==== -->
   <g transform="translate(490, 450)">
     <rect width="420" height="300" rx="14" fill="url(#th-rack)" stroke="#232a3a"/>
     <g transform="translate(20, 20)">
@@ -291,7 +291,7 @@
     <text x="20" y="286" font-size="10" fill="#6c7388">Top: LITE · COHR · CRDO</text>
   </g>
 
-  <!-- ---- CARD 6: SPECIALTY SUBSTRATES ---- -->
+  <!-- ==== CARD 6: SPECIALTY SUBSTRATES ==== -->
   <g transform="translate(940, 450)">
     <rect width="420" height="300" rx="14" fill="url(#th-rack)" stroke="#232a3a"/>
     <g transform="translate(20, 20)">
