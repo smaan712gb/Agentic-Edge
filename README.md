@@ -75,13 +75,11 @@ Each card is a thesis the agent team scores against. Add a theme, seed it with t
 
 ![Scorecard with six scoring dimensions per ticker and the ranked theme leaderboard](docs/diagrams/scorecard.svg)
 
-A name only ranks if it sits inside an active chokepoint theme. The agents check three gates in order before any scoring happens:
+The system ranks names in three ordered passes — quality first, cycle weighting next, entry timing last.
 
-1. **Is the theme still in contact?** Sector regime, ETF read, and macro flow have to confirm the chokepoint thesis hasn't broken.
-2. **Does the chokepoint still exist?** The structural bottleneck — HBM3e capacity, 800G/1.6T optical transceivers, grid transformers, CoWoS packaging, SMR fuel cycle — has to be intact.
-3. **Is this company a critical link?** The ticker has to own a non-substitutable piece of the supply chain.
+**Pass 1 — Fundamental quality** (the floor; permanent, not theme-driven)
 
-Names that pass all three gates are then scored across six fundamental quality dimensions:
+Every candidate name is scored across six fundamental dimensions:
 
 - **Profit Generation** — earnings power, gross margin trajectory.
 - **Revenue Growth** — top-line momentum and the durability of it.
@@ -90,9 +88,17 @@ Names that pass all three gates are then scored across six fundamental quality d
 - **Balance Sheet Health** — net cash, debt coverage, liquidity buffer.
 - **Future Outlook** — forward demand, pricing power, structural inevitability.
 
-**The Future Outlook dimension carries extra weight by design.** A company with negative current income but a confirmed chokepoint position and strong revenue growth can still earn a Buy — the framework values structural inevitability over a clean income statement, which matters when a critical-supply-chain name is still in build-out mode.
+The Future Outlook dimension carries extra weight by design. A name with negative current income but a confirmed chokepoint position and strong revenue growth can still earn a Buy — structural inevitability beats a clean income statement when the supply-chain position can't be substituted.
 
-The composite is the weighted sum, the leaderboard is the ranked output, and the reasoning behind every score is on the page.
+**Pass 2 — Hot-cycle weighting** (which quality names lead *today*)
+
+A name's fundamental score gets weighted by which chokepoint themes are currently in contact. NVIDIA may score higher than Micron in absolute fundamental terms, but when memory is the binding leg of the AI cycle — HBM3e capacity is the constraint, hyperscalers are short of it, the price curve is up — Micron bubbles to the top of the leaderboard. Quality earns the right to be on the board; the hot cycle decides who's swinging the bat right now.
+
+**Pass 3 — Entry timing** (when, not whether)
+
+For names that clear pass 1 and pass 2, the agents look for ideal entry: unusual options flow (whale call sweeps, gamma walls, max-pain trail), GEX positioning, multi-timeframe trend, relative-strength leadership, and volume confirmation. Timing signals never override quality — they decide *when* to pull the trigger on a name the framework already wants.
+
+The composite is on the page, the leaderboard is the ranked output, and the reasoning behind every score travels with the rank.
 
 The illustrations above are generated from the same components that ship with the app — see `web/components/` for the React versions. Real screenshots will land in `docs/screenshots/` (see the [screenshot guide](docs/screenshots/README.md) for the filenames the README picks up automatically).
 
