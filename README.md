@@ -71,6 +71,18 @@ KPI cards at the top, the 90-day equity curve drawing itself in below, and the o
 
 Each card is a thesis the agent team scores against. Add a theme, seed it with tickers and a one-line rationale, and the next scheduled run picks it up automatically.
 
+### How the agents score
+
+![Scorecard with six scoring dimensions per ticker and the ranked theme leaderboard](docs/diagrams/scorecard.svg)
+
+A name only ranks if it sits inside an active chokepoint theme. The agents check three things in order:
+
+1. **Is the theme still in contact?** Sector regime, ETF read, and macro flow have to confirm the chokepoint thesis hasn't broken.
+2. **Does the chokepoint still exist?** The structural bottleneck — HBM3e capacity, 800G/1.6T optical transceivers, grid transformers, CoWoS packaging, SMR fuel cycle — has to be intact.
+3. **Is this company a critical link?** The ticker has to own a non-substitutable piece of the supply chain.
+
+Names that pass all three get scored across six dimensions: chokepoint fit, technical setup, fundamentals, options flow, bull/bear conviction, and risk-panel verdict. The composite is the weighted sum, the leaderboard is the ranked output, and the reasoning behind every score is on the page.
+
 The illustrations above are generated from the same components that ship with the app — see `web/components/` for the React versions. Real screenshots will land in `docs/screenshots/` (see the [screenshot guide](docs/screenshots/README.md) for the filenames the README picks up automatically).
 
 ---

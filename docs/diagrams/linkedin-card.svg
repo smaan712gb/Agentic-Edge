@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Agentic Edge — social-share hero card (1080x1080).
+
+  Designed to read clearly as a static frame for LinkedIn / Twitter posts.
+  LinkedIn does not accept SVG inline; convert to PNG before uploading:
+
+    Easiest path on Windows:
+      1. Open this file in Edge / Chrome.
+      2. Right-click the page, "Save as image" or use Print > Save as PDF.
+      3. Or use:  npx svgexport docs/diagrams/linkedin-card.svg linkedin-card.png 1080:1080
+
+  Static-friendly: the SMIL animations are subtle and the frame reads
+  cleanly without any motion.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 1080" preserveAspectRatio="xMidYMid meet" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-label="Agentic Edge social-share card: chokepoints not tickers, with the bottlenecks on the left, the ranked winners on the right, and the GitHub repo URL at the bottom">
+  <defs>
+    <linearGradient id="lc-bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#0b0d12"/>
+      <stop offset="100%" stop-color="#11141b"/>
+    </linearGradient>
+    <linearGradient id="lc-brand" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#7c5cff"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="lc-good" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#6ee7b7"/>
+    </linearGradient>
+    <linearGradient id="lc-glow" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0%" stop-color="#7c5cff" stop-opacity="0.18"/>
+      <stop offset="100%" stop-color="#7c5cff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Page background -->
+  <rect width="1080" height="1080" fill="url(#lc-bg)"/>
+
+  <!-- Top-left brand glow -->
+  <ellipse cx="200" cy="100" rx="380" ry="200" fill="url(#lc-glow)"/>
+
+  <!-- ================= BRAND ================= -->
+  <g transform="translate(64, 80)">
+    <rect width="44" height="44" rx="10" fill="url(#lc-brand)"/>
+    <text x="22" y="29" text-anchor="middle" font-size="22" font-weight="700" fill="#0b0d12">A</text>
+    <text x="60" y="22" font-size="20" font-weight="600" fill="#e7eaf2">Agentic Edge</text>
+    <text x="60" y="40" font-size="12" fill="#98a0b3">Open-source agentic research · MIT licensed</text>
+  </g>
+
+  <!-- ================= HEADLINE ================= -->
+  <g transform="translate(64, 200)">
+    <text font-size="86" font-weight="700" fill="#e7eaf2" letter-spacing="-2">Chokepoints,</text>
+    <text y="92" font-size="86" font-weight="700" fill="#e7eaf2" letter-spacing="-2">not tickers.</text>
+    <text y="142" font-size="20" fill="#98a0b3">A multi-agent research platform for the AI super-cycle.</text>
+    <text y="172" font-size="20" fill="#98a0b3">Theme in. Ranked scorecard out. Reasoning attached.</text>
+  </g>
+
+  <!-- ================= TWO-PANEL VISUAL ================= -->
+
+  <!-- LEFT: The bottleneck -->
+  <g transform="translate(64, 480)">
+    <rect width="450" height="380" rx="16" fill="#11141b" stroke="#232a3a"/>
+    <text x="24" y="36" font-size="11" font-weight="600" fill="#6c7388" letter-spacing="1.4">THE BOTTLENECK</text>
+    <text x="24" y="64" font-size="22" font-weight="600" fill="#e7eaf2">Inputs that can't</text>
+    <text x="24" y="90" font-size="22" font-weight="600" fill="#e7eaf2">be substituted at scale.</text>
+
+    <!-- Chokepoint pills -->
+    <g transform="translate(24, 116)" font-family="ui-monospace,monospace">
+      <g>
+        <rect width="402" height="36" rx="8" fill="#0b0d12" stroke="#232a3a"/>
+        <circle cx="20" cy="18" r="4" fill="#7c5cff">
+          <animate attributeName="opacity" values="1;0.4;1" dur="1.6s" repeatCount="indefinite"/>
+        </circle>
+        <text x="36" y="23" font-size="14" fill="#c4b5fd">HBM3e capacity</text>
+        <text x="392" y="23" text-anchor="end" font-size="11" fill="#6c7388">memory</text>
+      </g>
+      <g transform="translate(0, 44)">
+        <rect width="402" height="36" rx="8" fill="#0b0d12" stroke="#232a3a"/>
+        <circle cx="20" cy="18" r="4" fill="#38bdf8">
+          <animate attributeName="opacity" values="1;0.4;1" dur="1.6s" begin="0.2s" repeatCount="indefinite"/>
+        </circle>
+        <text x="36" y="23" font-size="14" fill="#7dd3fc">800G / 1.6T optical transceivers</text>
+        <text x="392" y="23" text-anchor="end" font-size="11" fill="#6c7388">network</text>
+      </g>
+      <g transform="translate(0, 88)">
+        <rect width="402" height="36" rx="8" fill="#0b0d12" stroke="#232a3a"/>
+        <circle cx="20" cy="18" r="4" fill="#fbbf24">
+          <animate attributeName="opacity" values="1;0.4;1" dur="1.6s" begin="0.4s" repeatCount="indefinite"/>
+        </circle>
+        <text x="36" y="23" font-size="14" fill="#fcd34d">Grid transformers + cooling</text>
+        <text x="392" y="23" text-anchor="end" font-size="11" fill="#6c7388">power</text>
+      </g>
+      <g transform="translate(0, 132)">
+        <rect width="402" height="36" rx="8" fill="#0b0d12" stroke="#232a3a"/>
+        <circle cx="20" cy="18" r="4" fill="#34d399">
+          <animate attributeName="opacity" values="1;0.4;1" dur="1.6s" begin="0.6s" repeatCount="indefinite"/>
+        </circle>
+        <text x="36" y="23" font-size="14" fill="#6ee7b7">CoWoS advanced packaging</text>
+        <text x="392" y="23" text-anchor="end" font-size="11" fill="#6c7388">substrate</text>
+      </g>
+      <g transform="translate(0, 176)">
+        <rect width="402" height="36" rx="8" fill="#0b0d12" stroke="#232a3a"/>
+        <circle cx="20" cy="18" r="4" fill="#f87171">
+          <animate attributeName="opacity" values="1;0.4;1" dur="1.6s" begin="0.8s" repeatCount="indefinite"/>
+        </circle>
+        <text x="36" y="23" font-size="14" fill="#fca5a5">SMR fuel cycle + EPC</text>
+        <text x="392" y="23" text-anchor="end" font-size="11" fill="#6c7388">nuclear</text>
+      </g>
+      <g transform="translate(0, 220)">
+        <rect width="402" height="36" rx="8" fill="#0b0d12" stroke="#232a3a"/>
+        <circle cx="20" cy="18" r="4" fill="#c4b5fd">
+          <animate attributeName="opacity" values="1;0.4;1" dur="1.6s" begin="1.0s" repeatCount="indefinite"/>
+        </circle>
+        <text x="36" y="23" font-size="14" fill="#c4b5fd">InP / GaAs substrates</text>
+        <text x="392" y="23" text-anchor="end" font-size="11" fill="#6c7388">photonics</text>
+      </g>
+    </g>
+  </g>
+
+  <!-- RIGHT: The winners -->
+  <g transform="translate(566, 480)">
+    <rect width="450" height="380" rx="16" fill="#11141b" stroke="#232a3a"/>
+    <text x="24" y="36" font-size="11" font-weight="600" fill="#6c7388" letter-spacing="1.4">THE WINNERS</text>
+    <text x="24" y="64" font-size="22" font-weight="600" fill="#e7eaf2">The names that</text>
+    <text x="24" y="90" font-size="22" font-weight="600" fill="#e7eaf2">have to win — ranked.</text>
+
+    <!-- Leaderboard -->
+    <g transform="translate(24, 124)" font-family="ui-monospace,monospace">
+      <!-- 1. MU -->
+      <g>
+        <text font-size="13" fill="#6c7388">1</text>
+        <text x="24" font-size="16" font-weight="600" fill="#e7eaf2">MU</text>
+        <rect x="120" y="-12" width="240" height="14" rx="7" fill="#0b0d12" stroke="#232a3a"/>
+        <rect x="120" y="-12" width="0" height="14" rx="7" fill="url(#lc-good)">
+          <animate attributeName="width" from="0" to="208" dur="1.4s" begin="0.0s" fill="freeze"/>
+        </rect>
+        <text x="376" font-size="14" fill="#34d399">8.7</text>
+      </g>
+      <!-- 2. NVDA -->
+      <g transform="translate(0, 36)">
+        <text font-size="13" fill="#6c7388">2</text>
+        <text x="24" font-size="16" font-weight="600" fill="#e7eaf2">NVDA</text>
+        <rect x="120" y="-12" width="240" height="14" rx="7" fill="#0b0d12" stroke="#232a3a"/>
+        <rect x="120" y="-12" width="0" height="14" rx="7" fill="url(#lc-good)">
+          <animate attributeName="width" from="0" to="201" dur="1.4s" begin="0.15s" fill="freeze"/>
+        </rect>
+        <text x="376" font-size="14" fill="#34d399">8.4</text>
+      </g>
+      <!-- 3. AVGO -->
+      <g transform="translate(0, 72)">
+        <text font-size="13" fill="#6c7388">3</text>
+        <text x="24" font-size="16" font-weight="600" fill="#e7eaf2">AVGO</text>
+        <rect x="120" y="-12" width="240" height="14" rx="7" fill="#0b0d12" stroke="#232a3a"/>
+        <rect x="120" y="-12" width="0" height="14" rx="7" fill="url(#lc-good)">
+          <animate attributeName="width" from="0" to="197" dur="1.4s" begin="0.3s" fill="freeze"/>
+        </rect>
+        <text x="376" font-size="14" fill="#34d399">8.2</text>
+      </g>
+      <!-- 4. LITE -->
+      <g transform="translate(0, 108)">
+        <text font-size="13" fill="#6c7388">4</text>
+        <text x="24" font-size="16" font-weight="600" fill="#e7eaf2">LITE</text>
+        <rect x="120" y="-12" width="240" height="14" rx="7" fill="#0b0d12" stroke="#232a3a"/>
+        <rect x="120" y="-12" width="0" height="14" rx="7" fill="url(#lc-good)">
+          <animate attributeName="width" from="0" to="194" dur="1.4s" begin="0.45s" fill="freeze"/>
+        </rect>
+        <text x="376" font-size="14" fill="#34d399">8.1</text>
+      </g>
+      <!-- 5. VRT -->
+      <g transform="translate(0, 144)">
+        <text font-size="13" fill="#6c7388">5</text>
+        <text x="24" font-size="16" font-weight="600" fill="#e7eaf2">VRT</text>
+        <rect x="120" y="-12" width="240" height="14" rx="7" fill="#0b0d12" stroke="#232a3a"/>
+        <rect x="120" y="-12" width="0" height="14" rx="7" fill="url(#lc-good)">
+          <animate attributeName="width" from="0" to="190" dur="1.4s" begin="0.6s" fill="freeze"/>
+        </rect>
+        <text x="376" font-size="14" fill="#34d399">7.9</text>
+      </g>
+      <!-- 6. BWXT -->
+      <g transform="translate(0, 180)">
+        <text font-size="13" fill="#6c7388">6</text>
+        <text x="24" font-size="16" font-weight="600" fill="#e7eaf2">BWXT</text>
+        <rect x="120" y="-12" width="240" height="14" rx="7" fill="#0b0d12" stroke="#232a3a"/>
+        <rect x="120" y="-12" width="0" height="14" rx="7" fill="url(#lc-good)">
+          <animate attributeName="width" from="0" to="173" dur="1.4s" begin="0.75s" fill="freeze"/>
+        </rect>
+        <text x="376" font-size="14" fill="#34d399">7.2</text>
+      </g>
+    </g>
+
+    <text x="24" y="346" font-size="12" fill="#6c7388">+ 24 more in active themes · scorecard reveals the why</text>
+  </g>
+
+  <!-- ================= FOOTER ================= -->
+  <g transform="translate(64, 920)">
+    <text font-size="14" fill="#cbd5e1">
+      <tspan font-weight="600" fill="#e7eaf2">github.com/smaan712gb/Agentic-Edge</tspan>
+    </text>
+    <text y="28" font-size="13" fill="#98a0b3">FastAPI · Next.js 15 · LangGraph · DeepSeek · Interactive Brokers paper-only</text>
+    <text y="100" font-size="11" fill="#6c7388">Research and decision-support software · not investment advice · paper-only by design</text>
+  </g>
+
+  <!-- Subtle right-side accent line -->
+  <line x1="1020" y1="80" x2="1020" y2="1000" stroke="url(#lc-brand)" stroke-width="2" opacity="0.4"/>
+</svg>

@@ -1,0 +1,312 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Agentic Edge — How the agents score.
+
+  GitHub-renderable SVG with SMIL animations (no JavaScript, no external CSS).
+  Drop into README via:  ![](docs/diagrams/scorecard.svg)
+
+  Visuals:
+   - Left panel: per-ticker scorecard (MU as the example) showing the six
+     scoring dimensions with bars that fill on load
+   - Right panel: theme ranker leaderboard with bars that fill staggered
+   - Center divider explains the agents' scoring chain in plain English
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 900" preserveAspectRatio="xMidYMid meet" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-label="Agentic Edge — how the agents score: chokepoint fit, technical setup, fundamentals, options flow, bull/bear conviction, risk panel verdict, plus a ranked leaderboard">
+  <defs>
+    <linearGradient id="sc-rack" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0%" stop-color="#11141b"/>
+      <stop offset="100%" stop-color="#0b0d12"/>
+    </linearGradient>
+    <linearGradient id="sc-brand" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#7c5cff"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="sc-good" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#6ee7b7"/>
+    </linearGradient>
+    <linearGradient id="sc-mid" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#fbbf24"/>
+      <stop offset="100%" stop-color="#fcd34d"/>
+    </linearGradient>
+    <linearGradient id="sc-weak" x1="0" x2="1" y1="0" y2="0">
+      <stop offset="0%" stop-color="#f87171"/>
+      <stop offset="100%" stop-color="#fca5a5"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Page background -->
+  <rect width="1400" height="900" fill="#0b0d12"/>
+
+  <!-- ================= HEADER ================= -->
+  <g transform="translate(40, 32)">
+    <text font-size="11" font-weight="600" fill="#6c7388" letter-spacing="1.4">SCORECARD</text>
+    <text y="28" font-size="26" font-weight="600" fill="#e7eaf2">How the agents score</text>
+    <text y="50" font-size="12" fill="#98a0b3">Six dimensions per ticker. Composite is the weighted sum, surfaced on the leaderboard.</text>
+    <text y="68" font-size="12" fill="#98a0b3">A name only ranks if it sits inside an active chokepoint theme — names that aren't critical to the supply chain don't appear at all.</text>
+  </g>
+
+  <!-- ================= LEFT PANEL: per-ticker scorecard ================= -->
+  <g transform="translate(40, 130)">
+    <rect width="640" height="730" rx="14" fill="url(#sc-rack)" stroke="#232a3a"/>
+
+    <!-- Ticker header -->
+    <g transform="translate(24, 24)">
+      <rect width="120" height="44" rx="8" fill="#1a1f2b" stroke="#232a3a"/>
+      <text x="14" y="20" font-size="10" font-weight="600" fill="#6c7388" letter-spacing="1.2">EXAMPLE</text>
+      <text x="14" y="36" font-size="14" font-weight="600" fill="#6ee7b7">MU</text>
+      <text x="160" y="22" font-size="14" font-weight="600" fill="#e7eaf2">Micron Technology</text>
+      <text x="160" y="40" font-size="11" fill="#98a0b3">Theme: Advanced Memory · HBM3e capacity</text>
+    </g>
+
+    <!-- Composite + verdict -->
+    <g transform="translate(440, 24)">
+      <rect width="172" height="44" rx="8" fill="#0b0d12" stroke="#34d399"/>
+      <text x="14" y="20" font-size="10" font-weight="600" fill="#6c7388" letter-spacing="1.2">COMPOSITE</text>
+      <text x="14" y="38" font-size="16" font-weight="600" fill="#34d399">8.7 / 10  ·  BUY</text>
+    </g>
+
+    <!-- Section: scoring rows -->
+    <g transform="translate(24, 96)">
+      <text font-size="10" font-weight="600" fill="#6c7388" letter-spacing="1.2">SCORING DIMENSIONS</text>
+    </g>
+
+    <!-- Row 1: Chokepoint fit -->
+    <g transform="translate(24, 124)">
+      <text font-size="13" font-weight="500" fill="#e7eaf2">Chokepoint fit</text>
+      <text x="380" font-size="11" fill="#6c7388" font-family="ui-monospace,monospace">9.4</text>
+      <rect x="420" y="-12" width="170" height="14" rx="7" fill="#1a1f2b"/>
+      <rect x="420" y="-12" width="0" height="14" rx="7" fill="url(#sc-good)">
+        <animate attributeName="width" from="0" to="160" dur="1.4s" begin="0.0s" fill="freeze"/>
+      </rect>
+      <text x="599" y="-1" text-anchor="end" font-size="11" font-weight="600" fill="#0b0d12" font-family="ui-monospace,monospace">9.4
+        <animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="1.2s" fill="freeze"/>
+      </text>
+      <text y="14" font-size="10" fill="#98a0b3">Owns HBM3e supply — irreplaceable input for AI accelerators.</text>
+    </g>
+
+    <!-- Row 2: Technical setup -->
+    <g transform="translate(24, 178)">
+      <text font-size="13" font-weight="500" fill="#e7eaf2">Technical setup (MTF)</text>
+      <rect x="420" y="-12" width="170" height="14" rx="7" fill="#1a1f2b"/>
+      <rect x="420" y="-12" width="0" height="14" rx="7" fill="url(#sc-good)">
+        <animate attributeName="width" from="0" to="156" dur="1.4s" begin="0.15s" fill="freeze"/>
+      </rect>
+      <text x="599" y="-1" text-anchor="end" font-size="11" font-weight="600" fill="#0b0d12" font-family="ui-monospace,monospace">9.2
+        <animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="1.4s" fill="freeze"/>
+      </text>
+      <text y="14" font-size="10" fill="#98a0b3">Above 50/200 SMA on daily and weekly · 20-day RS leader.</text>
+    </g>
+
+    <!-- Row 3: Fundamentals -->
+    <g transform="translate(24, 232)">
+      <text font-size="13" font-weight="500" fill="#e7eaf2">Fundamentals</text>
+      <rect x="420" y="-12" width="170" height="14" rx="7" fill="#1a1f2b"/>
+      <rect x="420" y="-12" width="0" height="14" rx="7" fill="url(#sc-good)">
+        <animate attributeName="width" from="0" to="148" dur="1.4s" begin="0.3s" fill="freeze"/>
+      </rect>
+      <text x="599" y="-1" text-anchor="end" font-size="11" font-weight="600" fill="#0b0d12" font-family="ui-monospace,monospace">8.7
+        <animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="1.6s" fill="freeze"/>
+      </text>
+      <text y="14" font-size="10" fill="#98a0b3">Revenue +84% YoY · gross margin expanding · FCF turning positive.</text>
+    </g>
+
+    <!-- Row 4: Options flow -->
+    <g transform="translate(24, 286)">
+      <text font-size="13" font-weight="500" fill="#e7eaf2">Options flow</text>
+      <rect x="420" y="-12" width="170" height="14" rx="7" fill="#1a1f2b"/>
+      <rect x="420" y="-12" width="0" height="14" rx="7" fill="url(#sc-good)">
+        <animate attributeName="width" from="0" to="143" dur="1.4s" begin="0.45s" fill="freeze"/>
+      </rect>
+      <text x="599" y="-1" text-anchor="end" font-size="11" font-weight="600" fill="#0b0d12" font-family="ui-monospace,monospace">8.4
+        <animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="1.8s" fill="freeze"/>
+      </text>
+      <text y="14" font-size="10" fill="#98a0b3">Net call sweeps · GEX positive · max-pain trails spot · no put walls below.</text>
+    </g>
+
+    <!-- Row 5: Bull/Bear conviction -->
+    <g transform="translate(24, 340)">
+      <text font-size="13" font-weight="500" fill="#e7eaf2">Bull / Bear conviction</text>
+      <rect x="420" y="-12" width="170" height="14" rx="7" fill="#1a1f2b"/>
+      <rect x="420" y="-12" width="0" height="14" rx="7" fill="url(#sc-mid)">
+        <animate attributeName="width" from="0" to="131" dur="1.4s" begin="0.6s" fill="freeze"/>
+      </rect>
+      <text x="599" y="-1" text-anchor="end" font-size="11" font-weight="600" fill="#0b0d12" font-family="ui-monospace,monospace">7.7
+        <animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="2.0s" fill="freeze"/>
+      </text>
+      <text y="14" font-size="10" fill="#98a0b3">Bull thesis 4.1 / Bear thesis 2.4 · debate consensus = strong long.</text>
+    </g>
+
+    <!-- Row 6: Risk panel verdict -->
+    <g transform="translate(24, 394)">
+      <text font-size="13" font-weight="500" fill="#e7eaf2">Risk panel verdict</text>
+      <rect x="420" y="-12" width="170" height="14" rx="7" fill="#1a1f2b"/>
+      <rect x="420" y="-12" width="0" height="14" rx="7" fill="url(#sc-good)">
+        <animate attributeName="width" from="0" to="143" dur="1.4s" begin="0.75s" fill="freeze"/>
+      </rect>
+      <text x="599" y="-1" text-anchor="end" font-size="11" font-weight="600" fill="#0b0d12" font-family="ui-monospace,monospace">8.4
+        <animate attributeName="opacity" from="0" to="1" dur="0.4s" begin="2.2s" fill="freeze"/>
+      </text>
+      <text y="14" font-size="10" fill="#98a0b3">Aggressive: 9 · Conservative: 7 · Neutral: 9 · PM signs off.</text>
+    </g>
+
+    <!-- Decision summary -->
+    <g transform="translate(24, 460)">
+      <line x1="0" y1="0" x2="592" y2="0" stroke="#1a1f2b"/>
+      <text y="22" font-size="10" font-weight="600" fill="#6c7388" letter-spacing="1.2">DECISION CHAIN</text>
+      <g transform="translate(0, 36)" font-size="11" fill="#cbd5e1">
+        <text>1. Theme is still in contact (HBM cycle confirmed; analyst spend guides up).</text>
+        <text y="20">2. Chokepoint exists (HBM3e capacity is the gating constraint, not raw silicon).</text>
+        <text y="40">3. MU is a critical link (≈45% supply share at the leading edge).</text>
+        <text y="60">4. Fundamentals + technicals + flow agree — six dimensions consistent.</text>
+        <text y="80">5. Bull / Bear debate weighted bullish · risk panel green · PM go.</text>
+        <text y="100">6. Trader sizes to 7% NAV via PMCC if liquidity allows; else long equity.</text>
+      </g>
+    </g>
+
+    <!-- Bottom note -->
+    <g transform="translate(24, 686)" font-size="10" fill="#6c7388">
+      <text>Score weights are configurable. Defaults: chokepoint 25%, fundamentals 20%, technicals 15%,</text>
+      <text y="14">options flow 15%, debate 15%, risk 10%. Composite floor for "Buy" rating: 7.5.</text>
+    </g>
+  </g>
+
+  <!-- ================= RIGHT PANEL: theme ranker leaderboard ================= -->
+  <g transform="translate(720, 130)">
+    <rect width="640" height="730" rx="14" fill="url(#sc-rack)" stroke="#232a3a"/>
+    <text x="24" y="48" font-size="10" font-weight="600" fill="#6c7388" letter-spacing="1.2">THEME RANKER · BEST POSITIONED TO WIN</text>
+    <text x="24" y="76" font-size="16" font-weight="600" fill="#e7eaf2">Across active chokepoint themes · live composite</text>
+
+    <!-- Column header -->
+    <g transform="translate(24, 116)" font-size="10" fill="#6c7388" letter-spacing="1.2">
+      <text>RANK</text>
+      <text x="64">SYMBOL</text>
+      <text x="220">THEME</text>
+      <text x="544">SCORE</text>
+    </g>
+    <line x1="24" y1="124" x2="616" y2="124" stroke="#1a1f2b"/>
+
+    <!-- Rows -->
+    <g transform="translate(24, 152)" font-family="ui-monospace,monospace">
+      <!-- 1. MU -->
+      <g>
+        <text font-size="14" font-weight="600" fill="#34d399">1</text>
+        <text x="64" font-size="14" font-weight="600" fill="#e7eaf2">MU</text>
+        <text x="220" font-size="11" fill="#cbd5e1" font-family="-apple-system,sans-serif">Advanced Memory</text>
+        <rect x="380" y="-12" width="160" height="14" rx="7" fill="#1a1f2b"/>
+        <rect x="380" y="-12" width="0" height="14" rx="7" fill="url(#sc-good)">
+          <animate attributeName="width" from="0" to="139" dur="1.4s" begin="0.0s" fill="freeze"/>
+        </rect>
+        <text x="600" font-size="13" font-weight="600" fill="#34d399">8.7</text>
+      </g>
+      <!-- 2. NVDA -->
+      <g transform="translate(0, 36)">
+        <text font-size="14" font-weight="600" fill="#34d399">2</text>
+        <text x="64" font-size="14" font-weight="600" fill="#e7eaf2">NVDA</text>
+        <text x="220" font-size="11" fill="#cbd5e1" font-family="-apple-system,sans-serif">AI Infrastructure</text>
+        <rect x="380" y="-12" width="160" height="14" rx="7" fill="#1a1f2b"/>
+        <rect x="380" y="-12" width="0" height="14" rx="7" fill="url(#sc-good)">
+          <animate attributeName="width" from="0" to="134" dur="1.4s" begin="0.15s" fill="freeze"/>
+        </rect>
+        <text x="600" font-size="13" font-weight="600" fill="#34d399">8.4</text>
+      </g>
+      <!-- 3. AVGO -->
+      <g transform="translate(0, 72)">
+        <text font-size="14" font-weight="600" fill="#34d399">3</text>
+        <text x="64" font-size="14" font-weight="600" fill="#e7eaf2">AVGO</text>
+        <text x="220" font-size="11" fill="#cbd5e1" font-family="-apple-system,sans-serif">AI Infrastructure</text>
+        <rect x="380" y="-12" width="160" height="14" rx="7" fill="#1a1f2b"/>
+        <rect x="380" y="-12" width="0" height="14" rx="7" fill="url(#sc-good)">
+          <animate attributeName="width" from="0" to="131" dur="1.4s" begin="0.3s" fill="freeze"/>
+        </rect>
+        <text x="600" font-size="13" font-weight="600" fill="#34d399">8.2</text>
+      </g>
+      <!-- 4. LITE -->
+      <g transform="translate(0, 108)">
+        <text font-size="14" font-weight="600" fill="#34d399">4</text>
+        <text x="64" font-size="14" font-weight="600" fill="#e7eaf2">LITE</text>
+        <text x="220" font-size="11" fill="#cbd5e1" font-family="-apple-system,sans-serif">Optical Networking</text>
+        <rect x="380" y="-12" width="160" height="14" rx="7" fill="#1a1f2b"/>
+        <rect x="380" y="-12" width="0" height="14" rx="7" fill="url(#sc-good)">
+          <animate attributeName="width" from="0" to="130" dur="1.4s" begin="0.45s" fill="freeze"/>
+        </rect>
+        <text x="600" font-size="13" font-weight="600" fill="#34d399">8.1</text>
+      </g>
+      <!-- 5. VRT -->
+      <g transform="translate(0, 144)">
+        <text font-size="14" font-weight="600" fill="#34d399">5</text>
+        <text x="64" font-size="14" font-weight="600" fill="#e7eaf2">VRT</text>
+        <text x="220" font-size="11" fill="#cbd5e1" font-family="-apple-system,sans-serif">Grid &amp; Power</text>
+        <rect x="380" y="-12" width="160" height="14" rx="7" fill="#1a1f2b"/>
+        <rect x="380" y="-12" width="0" height="14" rx="7" fill="url(#sc-good)">
+          <animate attributeName="width" from="0" to="126" dur="1.4s" begin="0.6s" fill="freeze"/>
+        </rect>
+        <text x="600" font-size="13" font-weight="600" fill="#34d399">7.9</text>
+      </g>
+      <!-- 6. BWXT -->
+      <g transform="translate(0, 180)">
+        <text font-size="14" font-weight="600" fill="#fcd34d">6</text>
+        <text x="64" font-size="14" font-weight="600" fill="#e7eaf2">BWXT</text>
+        <text x="220" font-size="11" fill="#cbd5e1" font-family="-apple-system,sans-serif">Small Modular Reactors</text>
+        <rect x="380" y="-12" width="160" height="14" rx="7" fill="#1a1f2b"/>
+        <rect x="380" y="-12" width="0" height="14" rx="7" fill="url(#sc-mid)">
+          <animate attributeName="width" from="0" to="115" dur="1.4s" begin="0.75s" fill="freeze"/>
+        </rect>
+        <text x="600" font-size="13" font-weight="600" fill="#fcd34d">7.2</text>
+      </g>
+      <!-- 7. CRDO -->
+      <g transform="translate(0, 216)">
+        <text font-size="14" font-weight="600" fill="#fcd34d">7</text>
+        <text x="64" font-size="14" font-weight="600" fill="#e7eaf2">CRDO</text>
+        <text x="220" font-size="11" fill="#cbd5e1" font-family="-apple-system,sans-serif">Optical Networking</text>
+        <rect x="380" y="-12" width="160" height="14" rx="7" fill="#1a1f2b"/>
+        <rect x="380" y="-12" width="0" height="14" rx="7" fill="url(#sc-mid)">
+          <animate attributeName="width" from="0" to="112" dur="1.4s" begin="0.9s" fill="freeze"/>
+        </rect>
+        <text x="600" font-size="13" font-weight="600" fill="#fcd34d">7.0</text>
+      </g>
+      <!-- 8. ASML -->
+      <g transform="translate(0, 252)">
+        <text font-size="14" font-weight="600" fill="#fcd34d">8</text>
+        <text x="64" font-size="14" font-weight="600" fill="#e7eaf2">ASML</text>
+        <text x="220" font-size="11" fill="#cbd5e1" font-family="-apple-system,sans-serif">Specialty Substrates</text>
+        <rect x="380" y="-12" width="160" height="14" rx="7" fill="#1a1f2b"/>
+        <rect x="380" y="-12" width="0" height="14" rx="7" fill="url(#sc-mid)">
+          <animate attributeName="width" from="0" to="106" dur="1.4s" begin="1.05s" fill="freeze"/>
+        </rect>
+        <text x="600" font-size="13" font-weight="600" fill="#fcd34d">6.6</text>
+      </g>
+      <!-- divider + filtered out -->
+      <line x1="0" y1="288" x2="592" y2="288" stroke="#1a1f2b" stroke-dasharray="2 4"/>
+      <text x="0" y="312" font-size="10" fill="#6c7388" font-family="-apple-system,sans-serif">Below the conviction floor — held, not bought:</text>
+      <!-- 9. AMZN (example of a name that doesn't make it) -->
+      <g transform="translate(0, 336)">
+        <text font-size="14" font-weight="600" fill="#fca5a5">—</text>
+        <text x="64" font-size="14" font-weight="500" fill="#98a0b3">AMZN</text>
+        <text x="220" font-size="11" fill="#6c7388" font-family="-apple-system,sans-serif">No active chokepoint theme</text>
+        <rect x="380" y="-12" width="160" height="14" rx="7" fill="#1a1f2b"/>
+        <rect x="380" y="-12" width="0" height="14" rx="7" fill="url(#sc-weak)">
+          <animate attributeName="width" from="0" to="93" dur="1.4s" begin="1.2s" fill="freeze"/>
+        </rect>
+        <text x="600" font-size="13" font-weight="500" fill="#fca5a5">5.8</text>
+      </g>
+      <!-- 10. TSLA -->
+      <g transform="translate(0, 372)">
+        <text font-size="14" font-weight="600" fill="#fca5a5">—</text>
+        <text x="64" font-size="14" font-weight="500" fill="#98a0b3">TSLA</text>
+        <text x="220" font-size="11" fill="#6c7388" font-family="-apple-system,sans-serif">No active chokepoint theme</text>
+        <rect x="380" y="-12" width="160" height="14" rx="7" fill="#1a1f2b"/>
+        <rect x="380" y="-12" width="0" height="14" rx="7" fill="url(#sc-weak)">
+          <animate attributeName="width" from="0" to="78" dur="1.4s" begin="1.35s" fill="freeze"/>
+        </rect>
+        <text x="600" font-size="13" font-weight="500" fill="#fca5a5">4.9</text>
+      </g>
+    </g>
+
+    <!-- Footer note -->
+    <g transform="translate(24, 700)" font-size="10" fill="#6c7388">
+      <text>The system actively rejects names not anchored to an active chokepoint theme,</text>
+      <text y="14">no matter how popular. Theme membership is the entry ticket; the score sets the rank.</text>
+    </g>
+  </g>
+</svg>
