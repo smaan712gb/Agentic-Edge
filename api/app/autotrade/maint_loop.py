@@ -1291,36 +1291,59 @@ async def _watch_8k_filings(pos_by_symbol: dict[str, dict]) -> dict[str, str]:
     return breaks_by_sym
 
 
-async def _resolve_stuck_runs(timeout_min: int = 30) -> int:
-    """Mark any 'running' run stuck >= timeout_min as failed.
+async def _resolve_stuck_runs(idle_timeout_min: int = 15) -> int:
+    """Mark any 'running' run with no event progress for >idle_timeout_min as failed.
 
-    A clean run executor writes a 'started' / 'finished' event for each
-    agent and flips the run row to 'done' (or 'failed') when complete.
-    If the executor task hangs (DeepSeek timeout edge cases, asyncio
-    deadlock, network glitch mid-call), the run sits in 'running'
-    forever — which keeps it visible in the UI and prevents the
-    operator from re-triggering. This watchdog auto-fails such runs
-    so the system self-heals without manual cleanup.
+    Detects HUNG runs (DeepSeek timeout edge cases, asyncio deadlock,
+    provider stalls) by checking the latest run_event timestamp — not
+    started_at, which would falsely kill legitimately slow runs.
+
+    Logic:
+      * If the run has events, the most recent event must be < idle_timeout_min ago
+      * If the run has no events at all, started_at must be < idle_timeout_min ago
+        (allows fresh runs to spin up agents before declaring them stuck)
     """
-    from api.app.db import Run
-    cutoff = datetime.now(timezone.utc) - timedelta(minutes=timeout_min)
+    from api.app.db import Run, RunEvent
+    from sqlalchemy import func as sa_func
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=idle_timeout_min)
     count = 0
     async with db_session() as s:
+        # Subquery: latest event timestamp per run
+        latest_event = (
+            select(
+                RunEvent.run_id,
+                sa_func.max(RunEvent.timestamp).label("latest"),
+            )
+            .group_by(RunEvent.run_id)
+            .subquery()
+        )
         rows = (
             await s.execute(
-                select(Run)
+                select(Run, latest_event.c.latest)
+                .outerjoin(latest_event, latest_event.c.run_id == Run.id)
                 .where(Run.status == "running")
-                .where(Run.started_at < cutoff)
             )
-        ).scalars().all()
-        for r in rows:
-            r.status = "failed"
-            r.finished_at = datetime.now(timezone.utc)
-            r.error = (
-                f"watchdog: no progress for >{timeout_min} min — "
-                f"likely a hung LLM/provider call. Re-trigger from the UI."
-            )
-            count += 1
+        ).all()
+        for run, last_evt in rows:
+            # Use latest event time when present; otherwise fall back to
+            # started_at so fresh runs get a grace window before judgment.
+            ref_dt = last_evt or run.started_at
+            if ref_dt is None:
+                continue
+            # SQLAlchemy may return tz-naive datetime when reading from
+            # SQLite — coerce to UTC for safe comparison.
+            if ref_dt.tzinfo is None:
+                ref_dt = ref_dt.replace(tzinfo=timezone.utc)
+            if ref_dt < cutoff:
+                run.status = "failed"
+                run.finished_at = datetime.now(timezone.utc)
+                run.error = (
+                    f"watchdog: no progress for >{idle_timeout_min} min "
+                    f"(last activity: {ref_dt.isoformat()}). "
+                    f"Likely a hung LLM/provider call. Re-trigger from the UI."
+                )
+                count += 1
     if count:
         logger.warning("maint loop: watchdog auto-failed %d stuck run(s)", count)
     return count
