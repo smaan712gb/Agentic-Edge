@@ -135,6 +135,12 @@ async def _tick() -> None:
             outcome="ok",
         )
 
+    # 8-K filings watcher — sweeps the universe-wide stream once per tick,
+    # filters to symbols we care about (held + theme universes), writes
+    # filing_alert audit rows for new events. Severity classification
+    # feeds the thesis-break detector via _filing_breaks_by_symbol below.
+    filing_breaks_by_symbol = await _watch_8k_filings(pos_by_symbol)
+
     # Pull every open intent (the system's record of what it owns)
     async with db_session() as s:
         intents = (
@@ -167,7 +173,11 @@ async def _tick() -> None:
         sym = (intent.symbol or "").upper()
         try:
             if intent.structure == "stock":
-                await _evaluate_stock(intent, pos_by_symbol.get(sym), latest_decisions.get(sym), ib, macro)
+                await _evaluate_stock(
+                    intent, pos_by_symbol.get(sym), latest_decisions.get(sym),
+                    ib, macro,
+                    filing_thesis_break=filing_breaks_by_symbol.get(sym),
+                )
             elif intent.structure in ("pmcc", "pmcc_sequenced"):
                 await _evaluate_pmcc(intent, latest_decisions.get(sym), ib)
         except Exception as e:
@@ -286,7 +296,12 @@ async def _latest_decisions_today(symbols: set[str]) -> dict[str, str]:
     return out
 
 
-async def _evaluate_stock(intent: TradeIntent, pos: Optional[dict], latest_decision: Optional[str], ib: Any, macro: Optional[Any] = None) -> None:
+async def _evaluate_stock(
+    intent: TradeIntent, pos: Optional[dict],
+    latest_decision: Optional[str], ib: Any,
+    macro: Optional[Any] = None,
+    filing_thesis_break: Optional[str] = None,
+) -> None:
     """Trim/exit decisions for a held stock position.
 
     Order of evaluation per tick:
@@ -331,6 +346,13 @@ async def _evaluate_stock(intent: TradeIntent, pos: Optional[dict], latest_decis
     has_theme_home = best_theme is not None
     if not has_theme_home:
         theme_hot = True
+
+    # Fold the SEC-filing-derived break (if any) into the theme-derived one.
+    if filing_thesis_break:
+        thesis_break = (
+            f"{thesis_break}; filing: {filing_thesis_break}"
+            if thesis_break else f"filing: {filing_thesis_break}"
+        )
 
     # If thesis is broken, skip trim and force a full exit.
     if thesis_break:
@@ -967,6 +989,113 @@ async def _compute_daily_signals(symbol: str) -> dict[str, Optional[float]]:
     except Exception as e:
         logger.warning("daily signals fetch failed for %s: %s", symbol, e)
     return out
+
+
+async def _watch_8k_filings(pos_by_symbol: dict[str, dict]) -> dict[str, str]:
+    """Sweep recent 8-K filings, write alerts, return per-symbol
+    thesis-break strings for the high-severity ones.
+
+    Returns dict mapping symbol -> reason string when a guidance- or
+    after-hours-classified 8-K hit; the maint-loop's _evaluate_stock
+    folds this into its existing thesis-break check.
+    """
+    from tradingagents.strategies.maintenance.sec_filings_watch import (
+        FilingEvent, find_new_8k_events, thesis_break_signal_from_filings,
+    )
+    from api.app.db import ThemeSymbol
+
+    # Build the union of symbols we care about: anything we hold + every
+    # symbol in any theme universe (so news on candidates also lands).
+    held = {(s or "").upper() for s in pos_by_symbol.keys()}
+    async with db_session() as s:
+        theme_rows = (
+            await s.execute(select(ThemeSymbol.symbol).distinct())
+        ).all()
+    theme_syms = {(r[0] or "").upper() for r in theme_rows if r[0]}
+    of_interest = held | theme_syms
+    if not of_interest:
+        return {}
+
+    # Earnings calendar lookup so the severity classifier can tell an
+    # earnings-cycle 8-K from a guidance / off-cycle one.
+    earnings_by_symbol: dict[str, Any] = {}
+    try:
+        from tradingagents.strategies.maintenance.earnings import (
+            get_earnings_dates_for,
+        )
+        earnings_by_symbol = await get_earnings_dates_for(of_interest)
+    except Exception as e:
+        logger.debug("earnings calendar lookup failed for filings watcher: %s", e)
+
+    try:
+        from tradingagents.dataflows.providers.fmp import FmpProvider
+        fmp = FmpProvider()
+    except Exception as e:
+        logger.warning("filings watcher: FMP provider init failed: %s", e)
+        return {}
+
+    events: list[FilingEvent] = []
+    async with db_session() as s:
+        try:
+            events = await find_new_8k_events(
+                s, fmp_provider=fmp,
+                symbols_of_interest=of_interest,
+                earnings_dates_by_symbol=earnings_by_symbol,
+            )
+        except Exception as e:
+            logger.warning("filings watcher: sweep failed: %s", e)
+
+    if not events:
+        return {}
+
+    # Audit + alert per event
+    breaks_by_sym: dict[str, str] = {}
+    for ev in events:
+        async with db_session() as s:
+            await record_auto_action(
+                s, loop="maintenance",
+                action_type=f"filing_alert_{ev.severity}",
+                gate_result=_synthetic_passed_gate(),
+                symbol=ev.symbol,
+                payload={
+                    "form_type": ev.form_type,
+                    "filing_date": ev.filing_date,
+                    "accepted_date": ev.accepted_date,
+                    "has_financials": ev.has_financials,
+                    "severity": ev.severity,
+                    "rationale": ev.rationale,
+                    "link": ev.link,
+                    "final_link": ev.final_link,
+                    "is_held": ev.symbol in held,
+                },
+                outcome="flagged",
+            )
+
+        # Slack-style alert per filing — held positions get warning level,
+        # universe-only filings stay at info.
+        await alert(
+            level=("warning" if ev.symbol in held else "info"),
+            title=f"8-K {ev.severity}: {ev.symbol}"
+                  + (" (held)" if ev.symbol in held else " (theme universe)"),
+            body=f"{ev.rationale} · {ev.final_link or ev.link or ''}",
+        )
+
+    # Per-symbol thesis-break strings for the guidance/after-hours ones —
+    # only on held positions (theme universe filings inform research, not
+    # exit logic).
+    held_events = [e for e in events if e.symbol in held]
+    composed = thesis_break_signal_from_filings(held_events)
+    if composed:
+        # Spread the composite across the affected symbols so the per-stock
+        # evaluator picks up only its own filings.
+        for ev in held_events:
+            if ev.severity in ("guidance", "after_hours"):
+                breaks_by_sym[ev.symbol] = (
+                    breaks_by_sym.get(ev.symbol, "")
+                    + ("; " if ev.symbol in breaks_by_sym else "")
+                    + f"{ev.severity} 8-K: {ev.rationale}"
+                )
+    return breaks_by_sym
 
 
 def _is_auction_window() -> bool:
