@@ -283,11 +283,35 @@ async def _evaluate_stock(intent: TradeIntent, pos: Optional[dict], latest_decis
     from tradingagents.strategies.maintenance.profit_preservation import (
         evaluate_stock_trim,
     )
+    from tradingagents.strategies.maintenance.theme_health import (
+        is_theme_hot_for_symbol, get_thesis_break_signal,
+    )
 
     avg = float(pos.get("avg_price") or 0)
     last = float(pos.get("last_price") or 0)
     qty = float(pos.get("qty") or 0)
     if qty == 0 or avg <= 0 or last <= 0:
+        return
+
+    # ---- Theme health gates -----------------------------------------
+    # A symbol with no theme home (orphan adopt) gets theme_hot=True so it
+    # isn't aggressively trimmed before the rotation engine has a chance
+    # to find it a home — the absence of a theme is itself a flag, surfaced
+    # via the audit row.
+    async with db_session() as s:
+        theme_hot, best_theme = await is_theme_hot_for_symbol(s, intent.symbol)
+        thesis_break = await get_thesis_break_signal(s, intent.symbol)
+    has_theme_home = best_theme is not None
+    if not has_theme_home:
+        theme_hot = True
+
+    # If thesis is broken, skip trim and force a full exit.
+    if thesis_break:
+        await _execute_stock_exit(
+            intent=intent, qty=abs(qty),
+            reason=f"thesis broken: {thesis_break}", exit_kind="thesis_break",
+            ib=ib,
+        )
         return
 
     # ---- Profit-preservation trim ladder ----------------------------
@@ -298,7 +322,7 @@ async def _evaluate_stock(intent: TradeIntent, pos: Optional[dict], latest_decis
         pct_move_today=signals.get("pct_move_today"),
         volume_ratio_vs_20d=signals.get("volume_ratio"),
         rsi_14=signals.get("rsi_14"),
-        theme_hot=True,                            # Phase C will wire real value
+        theme_hot=theme_hot,
         already_trimmed_today=trim_today,
     )
     if trim.should_trim:
