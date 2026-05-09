@@ -119,8 +119,42 @@ async def _tick() -> None:
     if not candidates:
         return
 
+    # Macro regime read once per tick. Tightens NAV sizing in elevated /
+    # defensive regimes; blocks new entries entirely in panic.
+    sizing_factor = 1.0
+    macro_regime = "calm"
+    try:
+        from api.app.positions import _ibkr
+        from tradingagents.strategies.macro_regime import get_macro_regime
+        ib = await _ibkr()
+        macro = await get_macro_regime(ib)
+        sizing_factor = macro.sizing_factor
+        macro_regime = macro.regime
+        logger.info(
+            "auto-entry: macro=%s sizing_factor=%.2f (VIX=%s, SPX=%s)",
+            macro.regime, sizing_factor,
+            f"{macro.vix_last:.1f}" if macro.vix_last else "?",
+            f"{macro.spx_change_pct*100:+.2f}%" if macro.spx_change_pct else "?",
+        )
+    except Exception as e:
+        logger.debug("entry_loop macro fetch failed: %s — using sizing_factor=1.0", e)
+
+    if sizing_factor <= 0:
+        logger.warning("auto-entry: macro=%s blocks new entries (sizing_factor=0)", macro_regime)
+        async with db_session() as s:
+            from .auto_gate import record_auto_action
+            await record_auto_action(
+                s, loop="entry", action_type=f"entry_blocked_macro_{macro_regime}",
+                gate_result=None,
+                payload={"regime": macro_regime, "sizing_factor": 0.0},
+                outcome="blocked",
+            )
+        return
+
     for run_id, theme_id, symbol, composite in candidates:
-        ok = await _process_one(run_id, theme_id, symbol, composite)
+        ok = await _process_one(run_id, theme_id, symbol, composite,
+                                sizing_factor=sizing_factor,
+                                macro_regime=macro_regime)
         if not ok:
             # Most rejections are gate-driven (rate limit, regime, etc.).
             # Don't slam the rest of the queue if the cap is hit.
@@ -198,6 +232,7 @@ async def _find_unprocessed_buys() -> list[tuple[str, str, str, float]]:
 
 async def _process_one(
     run_id: str, theme_id: str, symbol: str, composite: float,
+    *, sizing_factor: float = 1.0, macro_regime: str = "calm",
 ) -> bool:
     """Run the gate, build the PMCC, submit it. Returns True if a trade was
     placed (or attempted), False if rejected upstream."""
@@ -257,6 +292,7 @@ async def _process_one(
             return await _try_stock_fallback(
                 run_id=run_id, theme_id=theme_id, symbol=symbol,
                 composite=composite, gate=gate, pmcc_reason=elig.reason, ib=ib,
+                sizing_factor=sizing_factor,
             )
         logger.info("auto-entry: %s ineligible — %s", symbol, elig.reason)
         async with db_session() as s:
@@ -273,13 +309,21 @@ async def _process_one(
         return False
     cand = elig.candidate
 
-    # NAV-aware sizing: target ~7% NAV per spread, capped at $250k absolute.
+    # NAV-aware sizing: target ~7% NAV per spread × macro sizing_factor,
+    # capped at $250k absolute.
     nav = await _fetch_nav(ib)
-    n_contracts = _size_pmcc_contracts(net_debit_per_spread=cand.net_debit, nav=nav)
+    n_contracts = _size_pmcc_contracts(
+        net_debit_per_spread=cand.net_debit, nav=nav,
+        sizing_factor=sizing_factor,
+    )
+    if n_contracts <= 0:
+        logger.info("auto-entry: %s sized to 0 contracts (macro=%s blocks)",
+                    symbol, macro_regime)
+        return False
     total_debit = round(cand.net_debit * n_contracts * 100, 2)
     logger.info(
-        "auto-entry: %s sized to %d contracts (NAV=$%.0f, debit/spread=$%.2f, total=$%.0f)",
-        symbol, n_contracts, nav, cand.net_debit, total_debit,
+        "auto-entry: %s sized to %d contracts (NAV=$%.0f × sf=%.2f, debit/spread=$%.2f, total=$%.0f, macro=%s)",
+        symbol, n_contracts, nav, sizing_factor, cand.net_debit, total_debit, macro_regime,
     )
 
     # Persist intent.
@@ -418,12 +462,24 @@ async def _fetch_nav(ib: Any) -> float:
     return 0.0
 
 
-def _size_pmcc_contracts(*, net_debit_per_spread: float, nav: float) -> int:
+def _size_pmcc_contracts(
+    *, net_debit_per_spread: float, nav: float,
+    sizing_factor: float = 1.0,
+) -> int:
     """Target contracts so net debit deployed ≈ PMCC_TARGET_PCT_NAV × NAV,
-    capped at PMCC_MAX_DOLLARS. Minimum 1 contract."""
+    capped at PMCC_MAX_DOLLARS. Minimum 1 contract.
+
+    ``sizing_factor`` (0.0–1.0) tightens the target per-spread when the
+    macro regime is elevated/defensive/panic. Passed through from the
+    macro_regime module — calm regime = 1.0 (no change), defensive 0.50,
+    panic 0.0 (no new entries). Zero short-circuits to 0 contracts so
+    entries are blocked entirely.
+    """
     if net_debit_per_spread <= 0 or nav <= 0:
         return 1
-    target = min(nav * PMCC_TARGET_PCT_NAV, PMCC_MAX_DOLLARS)
+    if sizing_factor <= 0:
+        return 0
+    target = min(nav * PMCC_TARGET_PCT_NAV, PMCC_MAX_DOLLARS) * sizing_factor
     n = int(target / (net_debit_per_spread * 100))
     return max(1, n)
 
@@ -431,6 +487,7 @@ def _size_pmcc_contracts(*, net_debit_per_spread: float, nav: float) -> int:
 async def _try_stock_fallback(
     *, run_id: str, theme_id: str, symbol: str, composite: float,
     gate, pmcc_reason: str, ib: Any,
+    sizing_factor: float = 1.0,
 ) -> bool:
     """Buy stock instead of PMCC when option liquidity isn't there.
 
@@ -493,7 +550,16 @@ async def _try_stock_fallback(
     limit = round((bid + 0.01) if bid > 0 else (last + 0.01), 2)
     if ask > 0 and limit > ask:
         limit = round(ask, 2)
-    target_dollars = nav * STOCK_FALLBACK_NAV_PCT
+    target_dollars = nav * STOCK_FALLBACK_NAV_PCT * sizing_factor
+    if target_dollars <= 0:
+        async with db_session() as s:
+            await record_auto_action(
+                s, loop="entry", action_type="open_stock_blocked_macro",
+                gate_result=gate, symbol=symbol,
+                payload={"run_id": run_id, "sizing_factor": sizing_factor},
+                outcome="blocked_macro",
+            )
+        return False
     qty = max(1, int(target_dollars / limit))
 
     # Persist intent
