@@ -165,11 +165,24 @@ class Settings(BaseSettings):
 
     @field_validator("IBKR_MODE")
     @classmethod
-    def _no_live(cls, v: str) -> str:
-        if v != "paper":
+    def _validate_mode(cls, v: str) -> str:
+        # Paper is the default and what we recommend until the framework
+        # has been validated against your strategy + capital. Live is
+        # allowed but logged loudly at startup so it can't go silent.
+        v = (v or "paper").lower()
+        if v not in ("paper", "live"):
             raise ValueError(
-                f"IBKR_MODE={v!r}: live trading is intentionally not "
-                f"supported. Set IBKR_MODE=paper."
+                f"IBKR_MODE={v!r}: must be 'paper' or 'live'."
+            )
+        if v == "live":
+            import logging
+            logger = logging.getLogger("agentic_edge.config")
+            logger.warning(
+                "=" * 64
+                + "\n IBKR_MODE=live — REAL-MONEY trading enabled."
+                + "\n Connect to Gateway on port 4001 (live) with a U-prefix"
+                + "\n account ID. Paper port is 4002, paper account starts D."
+                + "\n" + "=" * 64
             )
         return v
 

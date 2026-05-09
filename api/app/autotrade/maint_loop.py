@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -146,6 +146,12 @@ async def _tick() -> None:
     # short-circuits the inner fetch. Builds the historical IV
     # distribution that the percentile signal needs.
     await _capture_daily_iv_snapshots(ib)
+
+    # Insider universe sweep — pulls FMP's latest insider trades stream,
+    # filters to theme-universe symbols, fires insider_alert audit rows
+    # for fresh activity. Early-warning complement to the per-symbol
+    # get_insider_sell_pressure aggregator (which is 4-hour cached).
+    await _watch_insider_universe()
 
     # Pull every open intent (the system's record of what it owns)
     async with db_session() as s:
@@ -1274,6 +1280,125 @@ async def _watch_8k_filings(pos_by_symbol: dict[str, dict]) -> dict[str, str]:
                     + f"{ev.severity} 8-K: {ev.rationale}"
                 )
     return breaks_by_sym
+
+
+async def _watch_insider_universe() -> int:
+    """Sweep FMP's universe-wide insider trade stream, filter to
+    theme-universe symbols, audit fresh activity.
+
+    Dedup uses auto_actions: if an insider_alert row for this
+    (symbol, filingDate) tuple already exists, skip. That keeps the
+    watcher idempotent across maint ticks.
+
+    Returns the number of new alerts written. The aggregator
+    (FmpProvider.get_insider_sell_pressure) still produces the
+    momentum-exhaustion trip signal — this watcher is the early-
+    warning row that surfaces *which* insider filed *what* before
+    the 4-hour aggregator cache refreshes.
+    """
+    from api.app.db import AutoAction, ThemeSymbol
+    from tradingagents.dataflows.providers.fmp import (
+        FmpProvider, _is_insider_sale,
+    )
+
+    async with db_session() as s:
+        theme_rows = (
+            await s.execute(select(ThemeSymbol.symbol).distinct())
+        ).all()
+    universe = {(r[0] or "").upper() for r in theme_rows if r[0]}
+    if not universe:
+        return 0
+
+    try:
+        fmp = FmpProvider()
+    except Exception as e:
+        logger.debug("insider universe sweep: FMP init failed: %s", e)
+        return 0
+
+    rows: list[dict[str, Any]] = []
+    try:
+        rows = await fmp.get_recent_insider_trades(limit=100)
+    except Exception as e:
+        logger.debug("insider universe sweep failed: %s", e)
+        return 0
+
+    # Filter to theme-universe symbols + sales only (P-Purchase rows go
+    # through a different signal — buy-side accumulation, future work).
+    matches: list[dict[str, Any]] = []
+    for r in rows:
+        sym = str(r.get("symbol") or "").upper()
+        if sym not in universe:
+            continue
+        if not _is_insider_sale(r):
+            continue
+        owner = (r.get("typeOfOwner") or "").lower()
+        if not any(k in owner for k in ("officer", "director", "10")):
+            continue
+        matches.append(r)
+    if not matches:
+        return 0
+
+    # Dedup against existing insider_alert rows from the last 7 days
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    seven_days_ago = today - timedelta(days=7)
+    async with db_session() as s:
+        prior = (
+            await s.execute(
+                select(AutoAction.symbol, AutoAction.payload)
+                .where(AutoAction.action_type == "insider_alert")
+                .where(AutoAction.timestamp >= seven_days_ago)
+            )
+        ).all()
+    seen_keys: set[tuple[str, str]] = set()
+    for sym, payload in prior:
+        if isinstance(payload, dict):
+            seen_keys.add(
+                ((sym or "").upper(), str(payload.get("filing_date") or ""))
+            )
+
+    new_count = 0
+    for r in matches:
+        sym = str(r.get("symbol") or "").upper()
+        filing_date = str(r.get("filingDate") or r.get("transactionDate") or "")
+        if (sym, filing_date) in seen_keys:
+            continue
+        owner = r.get("typeOfOwner") or ""
+        reporter = r.get("reportingName") or "?"
+        try:
+            qty = float(r.get("securitiesTransacted") or 0)
+            price = float(r.get("price") or 0)
+            usd = qty * price
+        except (TypeError, ValueError):
+            usd = 0.0
+
+        async with db_session() as s:
+            await record_auto_action(
+                s, loop="maintenance", action_type="insider_alert",
+                gate_result=_synthetic_passed_gate(),
+                symbol=sym,
+                payload={
+                    "filing_date": filing_date,
+                    "transaction_date": str(r.get("transactionDate") or ""),
+                    "reporting_name": reporter,
+                    "owner_type": owner,
+                    "transaction_type": r.get("transactionType"),
+                    "shares": r.get("securitiesTransacted"),
+                    "price": r.get("price"),
+                    "value_usd": round(usd, 2),
+                    "filing_link": r.get("link"),
+                },
+                outcome="flagged",
+            )
+        await alert(
+            level="info",
+            title=f"Insider sale: {sym} ({owner})",
+            body=f"{reporter} sold {r.get('securitiesTransacted')} sh @ ${r.get('price')} ({filing_date})",
+        )
+        new_count += 1
+
+    if new_count:
+        logger.info("maint loop: %d new insider alerts (theme-universe filtered)", new_count)
+    return new_count
 
 
 async def _capture_daily_iv_snapshots(ib: Any) -> int:
