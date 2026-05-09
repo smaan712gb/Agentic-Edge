@@ -335,8 +335,93 @@ async def _evaluate_stock(intent: TradeIntent, pos: Optional[dict], latest_decis
                                       decision=trim, signals=signals, ib=ib)
             qty = qty - trim_qty if qty > 0 else qty + trim_qty   # remainder
 
-    # ---- Hard exit (full close) -------------------------------------
+    # ---- Momentum exhaustion + rotation candidates (Phase D) --------
+    from tradingagents.strategies.maintenance.momentum_exhaustion import (
+        evaluate_momentum_exhaustion,
+    )
+    from tradingagents.strategies.maintenance.rotation import (
+        find_rotation_candidate,
+    )
+    from tradingagents.strategies.maintenance.exit_pressure import (
+        compute_exit_pressure,
+    )
+
     atr_30d = await _compute_atr_30d(intent.symbol)
+    exhaustion = evaluate_momentum_exhaustion(
+        symbol=intent.symbol, current_price=last,
+        ma_20d=signals.get("ma_20d"),
+        rsi_14=signals.get("rsi_14"),
+        volume_ratio=signals.get("volume_ratio"),
+        open_today=signals.get("open_today"),
+        prior_close=signals.get("prior_close"),
+        atr_30d=atr_30d,
+    )
+
+    rotation_candidate = None
+    async with db_session() as s:
+        try:
+            rotation_candidate = await find_rotation_candidate(
+                s, held_symbol=intent.symbol,
+                held_score=(best_theme.composite if best_theme else None),
+            )
+        except Exception as e:
+            logger.warning("rotation lookup failed for %s: %s", intent.symbol, e)
+
+    pressure = compute_exit_pressure(
+        theme_composite=(best_theme.composite if best_theme else None),
+        theme_streak_days=(best_theme.streak_days_below_floor if best_theme else 0),
+        trim_band=trim.band,
+        exhaustion_score=exhaustion.score,
+        rotation_score_delta=(rotation_candidate.score_delta if rotation_candidate else None),
+    )
+
+    # Per-tick observability row — captures the full picture even when
+    # nothing fires this tick. Operators can filter on action_type
+    # 'position_pressure' on the runs page to see live exit-pressure scores.
+    async with db_session() as s:
+        await record_auto_action(
+            s, loop="maintenance", action_type=f"position_pressure_{pressure.band}",
+            gate_result=_synthetic_passed_gate(),
+            symbol=intent.symbol, intent_id=intent.id,
+            payload={
+                "score": pressure.score,
+                "band": pressure.band,
+                "rationale": pressure.rationale,
+                "sub_scores": pressure.sub_scores,
+                "trim_fired": trim.should_trim,
+                "trim_band": trim.band,
+                "exhaustion": {
+                    "score": exhaustion.score,
+                    "tripped": exhaustion.signals_tripped,
+                    "available": exhaustion.signals_available,
+                },
+                "rotation": (
+                    {"to": rotation_candidate.candidate_symbol,
+                     "delta": rotation_candidate.score_delta,
+                     "reason": rotation_candidate.reason}
+                    if rotation_candidate else None
+                ),
+                "theme": (
+                    {"composite": best_theme.composite,
+                     "streak": best_theme.streak_days_below_floor}
+                    if best_theme else None
+                ),
+            },
+            outcome=pressure.band,
+        )
+
+    # If rotation pressure is high and the held position isn't already
+    # being trimmed/exited, surface it as an alert. Auto-execution of
+    # rotation is intentionally out of scope — moving capital between
+    # names stays a human decision.
+    if rotation_candidate and pressure.band in ("trim_heavy", "aggressive"):
+        await alert(
+            level="warning",
+            title=f"Rotation candidate: {intent.symbol} -> {rotation_candidate.candidate_symbol}",
+            body=rotation_candidate.reason,
+        )
+
+    # ---- Hard exit (full close) -------------------------------------
     decision = await maybe_exit_stock(
         symbol=intent.symbol, current_price=last, avg_price=avg,
         latest_decision=latest_decision, atr_30d=atr_30d,
@@ -764,15 +849,19 @@ async def _compute_atr_30d(symbol: str) -> Optional[float]:
 
 
 async def _compute_daily_signals(symbol: str) -> dict[str, Optional[float]]:
-    """Today's percent move, volume ratio vs 20-day average, and RSI(14).
+    """Daily indicator bundle used by the trim ladder + momentum exhaustion.
 
-    Used by the profit-preservation trim ladder's "strong day" gate.
-    Returns dict with keys ``pct_move_today``, ``volume_ratio``, ``rsi_14``;
-    each value may be None when data is unavailable (treated as missing
-    signal by the caller).
+    Keys:
+      pct_move_today     today's close vs yesterday's close (decimal)
+      volume_ratio       today's volume / 20-day average (excl. today)
+      rsi_14             Wilder's RSI(14)
+      ma_20d             20-day simple moving average of close
+      open_today         today's open
+      prior_close        previous session's close
     """
     out: dict[str, Optional[float]] = {
         "pct_move_today": None, "volume_ratio": None, "rsi_14": None,
+        "ma_20d": None, "open_today": None, "prior_close": None,
     }
     try:
         from datetime import date, timedelta
@@ -784,19 +873,23 @@ async def _compute_daily_signals(symbol: str) -> dict[str, Optional[float]]:
         if df is None or len(df) < 20 or "Close" not in df.columns:
             return out
         closes = df["Close"].astype(float).tolist()
+        opens = df["Open"].astype(float).tolist() if "Open" in df.columns else []
         volumes = df["Volume"].astype(float).tolist() if "Volume" in df.columns else []
 
-        # Today's % move (vs prior close)
         if len(closes) >= 2:
             out["pct_move_today"] = (closes[-1] - closes[-2]) / closes[-2]
+            out["prior_close"] = closes[-2]
+        if opens:
+            out["open_today"] = opens[-1]
 
-        # Volume ratio: today / 20-day average (excl. today)
+        if len(closes) >= 20:
+            out["ma_20d"] = sum(closes[-20:]) / 20.0
+
         if len(volumes) >= 21 and volumes[-1] > 0:
             avg20 = sum(volumes[-21:-1]) / 20.0
             if avg20 > 0:
                 out["volume_ratio"] = volumes[-1] / avg20
 
-        # Wilder's RSI(14)
         if len(closes) >= 15:
             gains, losses = [], []
             for i in range(1, len(closes)):
