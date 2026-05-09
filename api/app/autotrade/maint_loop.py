@@ -260,7 +260,16 @@ async def _latest_decisions_today(symbols: set[str]) -> dict[str, str]:
 
 
 async def _evaluate_stock(intent: TradeIntent, pos: Optional[dict], latest_decision: Optional[str], ib: Any) -> None:
-    """Roll/exit decisions for a held stock position."""
+    """Trim/exit decisions for a held stock position.
+
+    Order of evaluation per tick:
+      1. Profit-preservation trim ladder (Phase B) — partial closes that
+         recover capital while letting winners run.
+      2. Hard exit triggers (Avoid signal, ATR breach) — full close.
+
+    Trim and exit can both fire in the same tick: trim first, then if the
+    exit logic still says go, the remainder closes.
+    """
     if pos is None:
         # We have an intent but IBKR shows no position — possibly closed manually.
         async with db_session() as s:
@@ -271,6 +280,9 @@ async def _evaluate_stock(intent: TradeIntent, pos: Optional[dict], latest_decis
         return
 
     from tradingagents.strategies.maintenance.exits import maybe_exit_stock
+    from tradingagents.strategies.maintenance.profit_preservation import (
+        evaluate_stock_trim,
+    )
 
     avg = float(pos.get("avg_price") or 0)
     last = float(pos.get("last_price") or 0)
@@ -278,15 +290,37 @@ async def _evaluate_stock(intent: TradeIntent, pos: Optional[dict], latest_decis
     if qty == 0 or avg <= 0 or last <= 0:
         return
 
-    # ATR_30d — Polygon historical for last 30 days. Light read; cache later.
-    atr_30d = await _compute_atr_30d(intent.symbol)
+    # ---- Profit-preservation trim ladder ----------------------------
+    signals = await _compute_daily_signals(intent.symbol)
+    trim_today = await _check_trimmed_today(intent.symbol, kind="stock")
+    trim = await evaluate_stock_trim(
+        symbol=intent.symbol, avg_price=avg, current_price=last,
+        pct_move_today=signals.get("pct_move_today"),
+        volume_ratio_vs_20d=signals.get("volume_ratio"),
+        rsi_14=signals.get("rsi_14"),
+        theme_hot=True,                            # Phase C will wire real value
+        already_trimmed_today=trim_today,
+    )
+    if trim.should_trim:
+        # Round down so we never trim more than asked. Always leave at least
+        # 1 share to keep the position alive — full closes go through the
+        # exit path with proper state transitions.
+        trim_qty = max(1, int(abs(qty) * trim.trim_pct))
+        if trim_qty < abs(qty):
+            await _execute_stock_trim(intent=intent, trim_qty=trim_qty,
+                                      decision=trim, signals=signals, ib=ib)
+            qty = qty - trim_qty if qty > 0 else qty + trim_qty   # remainder
 
+    # ---- Hard exit (full close) -------------------------------------
+    atr_30d = await _compute_atr_30d(intent.symbol)
     decision = await maybe_exit_stock(
         symbol=intent.symbol, current_price=last, avg_price=avg,
         latest_decision=latest_decision, atr_30d=atr_30d,
     )
     if not decision.should_exit:
         return
+    if abs(qty) <= 0:
+        return  # already trimmed to flat (shouldn't happen due to floor above)
 
     await _execute_stock_exit(intent=intent, qty=abs(qty), reason=decision.reason,
                               exit_kind=decision.exit_kind, ib=ib)
@@ -703,6 +737,172 @@ async def _compute_atr_30d(symbol: str) -> Optional[float]:
     except Exception as e:
         logger.warning("ATR fetch failed for %s: %s", symbol, e)
         return None
+
+
+async def _compute_daily_signals(symbol: str) -> dict[str, Optional[float]]:
+    """Today's percent move, volume ratio vs 20-day average, and RSI(14).
+
+    Used by the profit-preservation trim ladder's "strong day" gate.
+    Returns dict with keys ``pct_move_today``, ``volume_ratio``, ``rsi_14``;
+    each value may be None when data is unavailable (treated as missing
+    signal by the caller).
+    """
+    out: dict[str, Optional[float]] = {
+        "pct_move_today": None, "volume_ratio": None, "rsi_14": None,
+    }
+    try:
+        from datetime import date, timedelta
+        from tradingagents.dataflows.providers.polygon import PolygonProvider
+        p = PolygonProvider()
+        df = await p.get_stock_data(
+            symbol, date.today() - timedelta(days=60), date.today(),
+        )
+        if df is None or len(df) < 20 or "Close" not in df.columns:
+            return out
+        closes = df["Close"].astype(float).tolist()
+        volumes = df["Volume"].astype(float).tolist() if "Volume" in df.columns else []
+
+        # Today's % move (vs prior close)
+        if len(closes) >= 2:
+            out["pct_move_today"] = (closes[-1] - closes[-2]) / closes[-2]
+
+        # Volume ratio: today / 20-day average (excl. today)
+        if len(volumes) >= 21 and volumes[-1] > 0:
+            avg20 = sum(volumes[-21:-1]) / 20.0
+            if avg20 > 0:
+                out["volume_ratio"] = volumes[-1] / avg20
+
+        # Wilder's RSI(14)
+        if len(closes) >= 15:
+            gains, losses = [], []
+            for i in range(1, len(closes)):
+                ch = closes[i] - closes[i - 1]
+                gains.append(max(0.0, ch))
+                losses.append(max(0.0, -ch))
+            avg_gain = sum(gains[-14:]) / 14.0
+            avg_loss = sum(losses[-14:]) / 14.0
+            if avg_loss == 0:
+                out["rsi_14"] = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                out["rsi_14"] = 100.0 - (100.0 / (1.0 + rs))
+    except Exception as e:
+        logger.warning("daily signals fetch failed for %s: %s", symbol, e)
+    return out
+
+
+async def _check_trimmed_today(symbol: str, *, kind: str) -> bool:
+    """Return True if a trim was already submitted for ``symbol`` today.
+
+    ``kind`` is "stock" or "leap" — matches the action_type prefix written
+    by the trim primitives. Used by the trim evaluator to guarantee at most
+    one trim per position per session.
+    """
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    prefix = "stock_trim_" if kind == "stock" else "leap_trim_"
+    async with db_session() as s:
+        row = (
+            await s.execute(
+                select(AutoAction.id)
+                .where(AutoAction.symbol == symbol)
+                .where(AutoAction.action_type.like(f"{prefix}%"))
+                .where(AutoAction.timestamp >= today)
+                .limit(1)
+            )
+        ).first()
+    return row is not None
+
+
+async def _execute_stock_trim(
+    *, intent: TradeIntent, trim_qty: int, decision: Any,
+    signals: dict[str, Optional[float]], ib: Any,
+) -> None:
+    """Submit a partial-position SELL to take profits without closing.
+
+    Mirrors ``_execute_stock_exit`` but only sells ``trim_qty`` shares
+    and decrements ``intent.qty`` rather than transitioning to closed.
+    """
+    from ib_insync import Stock  # type: ignore
+    from tradingagents.dataflows.providers.base import TradeIntent as IntentDC
+
+    sym = intent.symbol
+    ib_inst = await ib._ensure_connected()
+    contract = Stock(sym, "SMART", "USD")
+    qualified = await ib_inst.qualifyContractsAsync(contract)
+    if not qualified:
+        logger.warning("trim: could not qualify %s", sym)
+        return
+    contract = qualified[0]
+    ticker = ib_inst.reqMktData(contract, "", False, False)
+    await asyncio.sleep(1.5)
+    bid = float(ticker.bid or 0)
+    ask = float(ticker.ask or 0)
+    last = float(ticker.last or 0)
+    try:
+        ib_inst.cancelMktData(contract)
+    except Exception:
+        pass
+
+    if bid > 0:
+        limit = round(bid - 0.01, 2)
+    elif last > 0:
+        limit = round(last - 0.01, 2)
+    else:
+        logger.warning("trim: no quote for %s; skipping", sym)
+        return
+
+    async with db_session() as s:
+        s.add(TradeAuditLog(
+            intent_id=intent.id, action="stock_trim_attempt",
+            payload={"symbol": sym, "trim_qty": trim_qty,
+                     "limit": limit, "band": decision.band,
+                     "trim_pct": decision.trim_pct, "reason": decision.reason,
+                     "signals": signals},
+        ))
+
+    intent_dc = IntentDC(
+        ticker=sym, side="SELL", qty=int(trim_qty),
+        order_type="LMT", limit_px=limit, tif="DAY", account_mode="paper",
+    )
+    try:
+        result = await ib.submit_trade(intent_dc)
+    except Exception as e:
+        logger.exception("trim submit failed for %s: %s", sym, e)
+        async with db_session() as s:
+            s.add(TradeAuditLog(
+                intent_id=intent.id, action="stock_trim_outcome",
+                outcome="error", error=str(e),
+            ))
+        return
+
+    order_id = str(result.get("ibkr_order_id") or "")
+    async with db_session() as s:
+        i = await s.get(TradeIntent, intent.id)
+        if i:
+            # Decrement qty by trim amount; intent stays "filled"/live.
+            i.qty = max(0, (i.qty or 0) - int(trim_qty))
+        s.add(TradeAuditLog(
+            intent_id=intent.id, action="stock_trim_outcome",
+            outcome="submitted",
+            payload={"order_id": order_id, "limit": limit,
+                     "trim_qty": trim_qty, "remaining_qty": i.qty if i else None},
+        ))
+        await record_auto_action(
+            s, loop="maintenance",
+            action_type=f"stock_trim_{decision.band}_submitted",
+            gate_result=_synthetic_passed_gate(), symbol=sym,
+            intent_id=intent.id,
+            payload={"trim_qty": trim_qty, "trim_pct": decision.trim_pct,
+                     "band": decision.band, "limit": limit,
+                     "reason": decision.reason, "signals": signals},
+            outcome="submitted", ibkr_order_id=order_id,
+        )
+
+    await alert(
+        level="info",
+        title=f"Stock TRIM ({decision.band}): {sym}",
+        body=f"-{trim_qty} sh @ LMT ${limit} · {decision.reason}",
+    )
 
 
 # ---------------------------------------------------------------------------
