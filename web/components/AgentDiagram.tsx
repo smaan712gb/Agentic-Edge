@@ -114,7 +114,10 @@ export function AgentDiagram({
       selected: selectedId === a.id,
     },
     draggable: false,
-    selectable: false,
+    // selectable=true is required for onNodeClick to fire reliably; the
+    // ring-2 selection style we own ourselves via data.selected, so
+    // ReactFlow's default selection visuals are still suppressed.
+    selectable: true,
   }));
 
   const rfEdges: Edge[] = edges
@@ -146,7 +149,8 @@ export function AgentDiagram({
         fitViewOptions={{ padding: 0.15 }}
         nodesDraggable={false}
         nodesConnectable={false}
-        elementsSelectable={false}
+        elementsSelectable
+        onNodeClick={(_, node) => onSelect(node.id)}
         panOnDrag
         zoomOnScroll={false}
         zoomOnPinch

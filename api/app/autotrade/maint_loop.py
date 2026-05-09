@@ -80,6 +80,15 @@ async def _loop_forever() -> None:
 
 async def _tick() -> None:
     settings = get_settings()
+
+    # Watchdog runs first — independent of AUTOTRADE_ENABLED. Cleans up
+    # zombie 'running' runs so the UI doesn't show false-positives and
+    # so the operator can re-trigger without manual intervention.
+    try:
+        await _resolve_stuck_runs(timeout_min=30)
+    except Exception as e:
+        logger.warning("maint loop: stuck-run watchdog failed: %s", e)
+
     if not settings.AUTOTRADE_ENABLED:
         return
     async with db_session() as s:
@@ -1280,6 +1289,41 @@ async def _watch_8k_filings(pos_by_symbol: dict[str, dict]) -> dict[str, str]:
                     + f"{ev.severity} 8-K: {ev.rationale}"
                 )
     return breaks_by_sym
+
+
+async def _resolve_stuck_runs(timeout_min: int = 30) -> int:
+    """Mark any 'running' run stuck >= timeout_min as failed.
+
+    A clean run executor writes a 'started' / 'finished' event for each
+    agent and flips the run row to 'done' (or 'failed') when complete.
+    If the executor task hangs (DeepSeek timeout edge cases, asyncio
+    deadlock, network glitch mid-call), the run sits in 'running'
+    forever — which keeps it visible in the UI and prevents the
+    operator from re-triggering. This watchdog auto-fails such runs
+    so the system self-heals without manual cleanup.
+    """
+    from api.app.db import Run
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=timeout_min)
+    count = 0
+    async with db_session() as s:
+        rows = (
+            await s.execute(
+                select(Run)
+                .where(Run.status == "running")
+                .where(Run.started_at < cutoff)
+            )
+        ).scalars().all()
+        for r in rows:
+            r.status = "failed"
+            r.finished_at = datetime.now(timezone.utc)
+            r.error = (
+                f"watchdog: no progress for >{timeout_min} min — "
+                f"likely a hung LLM/provider call. Re-trigger from the UI."
+            )
+            count += 1
+    if count:
+        logger.warning("maint loop: watchdog auto-failed %d stuck run(s)", count)
+    return count
 
 
 async def _watch_insider_universe() -> int:
