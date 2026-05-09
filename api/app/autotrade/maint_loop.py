@@ -200,6 +200,12 @@ async def _adopt_orphan_positions(ibkr_positions: list[dict]) -> int:
     have one. Without this, positions imported manually or held before the
     system was deployed are invisible to the maintenance loop's exit logic.
 
+    **Gated on theme membership.** Only positions whose symbol appears in
+    ``theme_symbols`` get adopted — random legacy holdings outside the
+    chokepoint theme universe are intentionally left alone. The framework's
+    job is to manage names tied to active themes; non-themed positions
+    are out of scope.
+
     Only stock positions are adopted automatically; option positions (PMCC
     legs) need leg-aware metadata that lives in the run's intent record,
     so we leave those for the operator to import via the admin endpoint.
@@ -210,6 +216,8 @@ async def _adopt_orphan_positions(ibkr_positions: list[dict]) -> int:
                   for p in ibkr_positions if p.get("symbol")}
     if not sym_to_pos:
         return 0
+
+    from api.app.db import ThemeSymbol
 
     async with db_session() as s:
         # Symbols that already have an OPEN intent (any open lifecycle state)
@@ -224,9 +232,22 @@ async def _adopt_orphan_positions(ibkr_positions: list[dict]) -> int:
         ).all()
         owned = {(r[0] or "").upper() for r in rows}
 
+        # Theme universe — only adopt positions in this set.
+        theme_rows = (
+            await s.execute(
+                select(ThemeSymbol.symbol)
+                .where(ThemeSymbol.symbol.in_(list(sym_to_pos.keys())))
+            )
+        ).all()
+        in_theme_universe = {(r[0] or "").upper() for r in theme_rows if r[0]}
+
         new_count = 0
+        skipped_non_theme = 0
         for sym, pos in sym_to_pos.items():
             if sym in owned:
+                continue
+            if sym not in in_theme_universe:
+                skipped_non_theme += 1
                 continue
             qty = float(pos.get("qty") or 0)
             if qty == 0:
@@ -261,10 +282,10 @@ async def _adopt_orphan_positions(ibkr_positions: list[dict]) -> int:
         if new_count:
             await s.flush()
 
-    if new_count:
+    if new_count or skipped_non_theme:
         logger.info(
-            "maint loop: adopted %d orphan IBKR position(s) as synthetic intents",
-            new_count,
+            "maint loop: adopted %d orphan position(s); skipped %d non-theme position(s)",
+            new_count, skipped_non_theme,
         )
     return new_count
 
@@ -485,25 +506,25 @@ async def _evaluate_stock(
     except Exception as e:
         logger.debug("13F flow fetch failed for %s: %s", intent.symbol, e)
 
-    # Earnings-call transcript — checks the latest completed quarter for
-    # thesis-break keywords. Cached 30 days; first hit per quarter is
-    # the only expensive call.
+    # Earnings-call transcript — DeepSeek-pro reads the latest completed
+    # quarter's call and extracts structured guidance/demand/margin signals.
+    # Falls back to a regex keyword scan if the LLM call fails or
+    # DEEPSEEK_API_KEY isn't set. Both FMP transcript fetch and LLM
+    # output are cached, so the per-tick cost is one cache hit per name.
     transcript_signal = None
     try:
         from tradingagents.strategies.maintenance.earnings_transcript import (
-            evaluate_transcript,
+            evaluate_transcript_smart,
         )
         from tradingagents.dataflows.providers.fmp import FmpProvider as _FMP2
-        y, q = _latest_completed_quarter() if "y" in dir() else (None, None)
-        if y is None:
-            from tradingagents.strategies.maintenance.institutional_flow import (
-                _latest_completed_quarter as _lcq,
-            )
-            y, q = _lcq()
+        from tradingagents.strategies.maintenance.institutional_flow import (
+            _latest_completed_quarter as _lcq,
+        )
+        y, q = _lcq()
         transcript_row = await _FMP2().get_earnings_transcript(
             intent.symbol, year=y, quarter=q,
         )
-        transcript_signal = evaluate_transcript(transcript_row)
+        transcript_signal = await evaluate_transcript_smart(transcript_row)
     except Exception as e:
         logger.debug("transcript fetch failed for %s: %s", intent.symbol, e)
 
