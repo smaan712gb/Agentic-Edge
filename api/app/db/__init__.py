@@ -8,6 +8,7 @@ from .base import Base, db_engine, db_session, get_session, init_db
 from .models import (
     AutoAction,
     EquitySnapshot,
+    IvSnapshot,
     Position,
     Run,
     RunEvent,
@@ -28,6 +29,7 @@ __all__ = [
     "init_db",
     "AutoAction",
     "EquitySnapshot",
+    "IvSnapshot",
     "Position",
     "Run",
     "RunEvent",

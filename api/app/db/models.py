@@ -242,6 +242,31 @@ class EquitySnapshot(Base):
     notional:    Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
 
+class IvSnapshot(Base):
+    """Daily front-month ATM call IV snapshot per symbol.
+
+    Drives the 8th momentum-exhaustion signal: short-term call IV at
+    extreme percentile. Captured by the daily IV scheduler job for
+    every theme-universe symbol. After 30+ days of capture the
+    percentile becomes statistically meaningful.
+    """
+
+    __tablename__ = "iv_snapshots"
+    __table_args__ = (
+        UniqueConstraint("symbol", "date", name="uq_iv_snapshots_symbol_date"),
+        Index("ix_iv_snapshots_symbol_date", "symbol", "date"),
+    )
+
+    id:               Mapped[int]    = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol:           Mapped[str]    = mapped_column(String(10), nullable=False)
+    date:             Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    atm_call_iv:      Mapped[float]  = mapped_column(Float, nullable=False)
+    dte_used:         Mapped[Optional[int]]   = mapped_column(Integer, nullable=True)
+    strike_used:      Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    spot_at_capture:  Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    captured_at:      Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
 # ---------------------------------------------------------------------------
 # Trade intents + audit
 # ---------------------------------------------------------------------------

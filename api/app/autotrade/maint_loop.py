@@ -141,6 +141,12 @@ async def _tick() -> None:
     # feeds the thesis-break detector via _filing_breaks_by_symbol below.
     filing_breaks_by_symbol = await _watch_8k_filings(pos_by_symbol)
 
+    # Daily IV snapshot capture — one row per (symbol, date) for every
+    # theme-universe symbol. Idempotent: a snapshot for today's date
+    # short-circuits the inner fetch. Builds the historical IV
+    # distribution that the percentile signal needs.
+    await _capture_daily_iv_snapshots(ib)
+
     # Pull every open intent (the system's record of what it owns)
     async with db_session() as s:
         intents = (
@@ -439,6 +445,7 @@ async def _evaluate_stock(
     # Insider + analyst pressure signals — FMP-cached, cheap per tick.
     insider_pressure = None
     analyst_pressure = None
+    closes_for_iv: Optional[list[float]] = None
     try:
         from tradingagents.dataflows.providers.fmp import FmpProvider
         from tradingagents.strategies.maintenance.analyst_grades import (
@@ -446,7 +453,8 @@ async def _evaluate_stock(
         )
         fmp = FmpProvider()
         insider_pressure = await fmp.get_insider_sell_pressure(intent.symbol)
-        # 60-day price change for the analyst upgrade-after-run signal
+        # 60-day price change for the analyst upgrade-after-run signal,
+        # plus daily closes that the IV signal needs for realized-vol math.
         pct_60d: Optional[float] = None
         try:
             from datetime import date, timedelta
@@ -455,8 +463,9 @@ async def _evaluate_stock(
             df60 = await pp.get_stock_data(
                 intent.symbol, date.today() - timedelta(days=90), date.today(),
             )
-            if df60 is not None and len(df60) >= 40 and "Close" not in (None,):
+            if df60 is not None and len(df60) >= 40 and "Close" in df60.columns:
                 closes = df60["Close"].astype(float).tolist()
+                closes_for_iv = closes
                 if len(closes) >= 60:
                     pct_60d = (closes[-1] - closes[-60]) / closes[-60]
                 else:
@@ -473,6 +482,46 @@ async def _evaluate_stock(
     except Exception as e:
         logger.debug("FMP signal init failed for %s: %s", intent.symbol, e)
 
+    # IV signal (8th exhaustion indicator). Daily snapshot is captured by
+    # _capture_iv_snapshot earlier in this tick; per-position eval reads
+    # today's IV + the underlying's realized vol from closes_for_iv.
+    iv_signal_obj = None
+    try:
+        from tradingagents.strategies.maintenance.iv_signal import (
+            evaluate_iv_signal,
+        )
+        # Today's IV from the freshly-captured snapshot (or live fetch if
+        # capture hasn't run yet today).
+        from api.app.db import IvSnapshot
+        from datetime import datetime as _dt, timezone as _tz
+        today_dt = _dt.now(_tz.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        iv_today_value: Optional[float] = None
+        async with db_session() as s:
+            row = (
+                await s.execute(
+                    select(IvSnapshot.atm_call_iv)
+                    .where(IvSnapshot.symbol == intent.symbol)
+                    .where(IvSnapshot.date == today_dt)
+                )
+            ).first()
+            if row:
+                iv_today_value = float(row[0])
+        # Fallback: pull live ATM IV if no snapshot for today yet.
+        if iv_today_value is None:
+            try:
+                live = await ib.get_atm_call_iv(symbol=intent.symbol)
+                if live.get("iv"):
+                    iv_today_value = float(live["iv"])
+            except Exception as e:
+                logger.debug("live ATM IV fetch failed for %s: %s", intent.symbol, e)
+        async with db_session() as s:
+            iv_signal_obj = await evaluate_iv_signal(
+                s, symbol=intent.symbol,
+                iv_today=iv_today_value, closes=closes_for_iv,
+            )
+    except Exception as e:
+        logger.debug("IV signal eval failed for %s: %s", intent.symbol, e)
+
     exhaustion = evaluate_momentum_exhaustion(
         symbol=intent.symbol, current_price=last,
         ma_20d=signals.get("ma_20d"),
@@ -485,6 +534,7 @@ async def _evaluate_stock(
         auction_price=auction_price,
         insider_pressure=insider_pressure,
         analyst_pressure=analyst_pressure,
+        iv_signal=iv_signal_obj,
     )
 
     # Institutional flow (13F) — quarterly, only refreshed when a new
@@ -1224,6 +1274,45 @@ async def _watch_8k_filings(pos_by_symbol: dict[str, dict]) -> dict[str, str]:
                     + f"{ev.severity} 8-K: {ev.rationale}"
                 )
     return breaks_by_sym
+
+
+async def _capture_daily_iv_snapshots(ib: Any) -> int:
+    """Capture front-month ATM call IV for every theme-universe symbol
+    that doesn't already have a snapshot today.
+
+    Runs once per maint tick — the inner fetch is gated by the
+    iv_signal.capture_iv_snapshot idempotency check, so subsequent
+    calls in the same day no-op cheaply (one DB query per symbol).
+
+    Returns the number of new rows written. Build-up over a few weeks
+    will populate the percentile distribution; until then the IV-vs-
+    realized fallback covers the signal.
+    """
+    from tradingagents.strategies.maintenance.iv_signal import (
+        capture_iv_snapshot,
+    )
+    from api.app.db import ThemeSymbol
+
+    async with db_session() as s:
+        rows = (
+            await s.execute(select(ThemeSymbol.symbol).distinct())
+        ).all()
+    syms = sorted({(r[0] or "").upper() for r in rows if r[0]})
+    if not syms:
+        return 0
+
+    new_count = 0
+    for sym in syms:
+        try:
+            async with db_session() as s:
+                wrote = await capture_iv_snapshot(s, symbol=sym, ibkr=ib)
+                if wrote:
+                    new_count += 1
+        except Exception as e:
+            logger.debug("IV capture skipped for %s: %s", sym, e)
+    if new_count:
+        logger.info("maint loop: captured %d new IV snapshot(s)", new_count)
+    return new_count
 
 
 def _is_auction_window() -> bool:
