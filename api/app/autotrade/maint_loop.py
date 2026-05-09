@@ -108,6 +108,33 @@ async def _tick() -> None:
     # monitored for exit triggers like everything else.
     orphans_adopted = await _adopt_orphan_positions(positions)
 
+    # Macro regime read once per tick — VIX + SPX overlay applied across
+    # all per-position evaluations downstream. Best-effort fetch; on
+    # failure we get a 'calm' default and the audit row records the
+    # degraded read so the operator can see it.
+    try:
+        from tradingagents.strategies.macro_regime import get_macro_regime
+        macro = await get_macro_regime(ib)
+    except Exception as e:
+        logger.warning("macro regime fetch failed: %s", e)
+        from tradingagents.strategies.macro_regime import MacroRegime
+        macro = MacroRegime(rationale=f"macro fetch failed: {e}")
+    async with db_session() as s:
+        await record_auto_action(
+            s, loop="maintenance", action_type=f"macro_regime_{macro.regime}",
+            gate_result=_synthetic_passed_gate(),
+            payload={
+                "regime": macro.regime,
+                "vix": macro.vix_last,
+                "spx_change_pct": macro.spx_change_pct,
+                "sizing_factor": macro.sizing_factor,
+                "leap_roll_deferred": macro.leap_roll_deferred,
+                "earnings_window_mult": macro.earnings_window_mult,
+                "rationale": macro.rationale,
+            },
+            outcome="ok",
+        )
+
     # Pull every open intent (the system's record of what it owns)
     async with db_session() as s:
         intents = (
@@ -140,7 +167,7 @@ async def _tick() -> None:
         sym = (intent.symbol or "").upper()
         try:
             if intent.structure == "stock":
-                await _evaluate_stock(intent, pos_by_symbol.get(sym), latest_decisions.get(sym), ib)
+                await _evaluate_stock(intent, pos_by_symbol.get(sym), latest_decisions.get(sym), ib, macro)
             elif intent.structure in ("pmcc", "pmcc_sequenced"):
                 await _evaluate_pmcc(intent, latest_decisions.get(sym), ib)
         except Exception as e:
@@ -259,7 +286,7 @@ async def _latest_decisions_today(symbols: set[str]) -> dict[str, str]:
     return out
 
 
-async def _evaluate_stock(intent: TradeIntent, pos: Optional[dict], latest_decision: Optional[str], ib: Any) -> None:
+async def _evaluate_stock(intent: TradeIntent, pos: Optional[dict], latest_decision: Optional[str], ib: Any, macro: Optional[Any] = None) -> None:
     """Trim/exit decisions for a held stock position.
 
     Order of evaluation per tick:
@@ -347,6 +374,25 @@ async def _evaluate_stock(intent: TradeIntent, pos: Optional[dict], latest_decis
     )
 
     atr_30d = await _compute_atr_30d(intent.symbol)
+
+    # Closing-auction imbalance — only available 15:50-16:00 ET. We only
+    # bother fetching it for *stretched* names (the imbalance signal is
+    # most meaningful when paired with technical exhaustion); skipping
+    # the fetch for non-stretched names keeps the per-tick cost low.
+    auction_imbalance = None
+    auction_price = None
+    ma20 = signals.get("ma_20d")
+    if ma20 and ma20 > 0:
+        stretched = (last - ma20) / ma20 > 0.20
+        if stretched and _is_auction_window():
+            try:
+                aq = await ib.get_auction_imbalance(symbol=intent.symbol)
+                auction_imbalance = aq.get("imbalance")
+                auction_price = aq.get("auction_price")
+            except Exception as e:
+                logger.debug("auction imbalance fetch failed for %s: %s",
+                             intent.symbol, e)
+
     exhaustion = evaluate_momentum_exhaustion(
         symbol=intent.symbol, current_price=last,
         ma_20d=signals.get("ma_20d"),
@@ -355,6 +401,8 @@ async def _evaluate_stock(intent: TradeIntent, pos: Optional[dict], latest_decis
         open_today=signals.get("open_today"),
         prior_close=signals.get("prior_close"),
         atr_30d=atr_30d,
+        auction_imbalance=auction_imbalance,
+        auction_price=auction_price,
     )
 
     rotation_candidate = None
@@ -906,6 +954,16 @@ async def _compute_daily_signals(symbol: str) -> dict[str, Optional[float]]:
     except Exception as e:
         logger.warning("daily signals fetch failed for %s: %s", symbol, e)
     return out
+
+
+def _is_auction_window() -> bool:
+    """True between 15:50 and 16:00 ET — when NYSE closing-auction
+    imbalance ticks are streamed. IBKR returns None outside this window."""
+    from zoneinfo import ZoneInfo
+    et = datetime.now(ZoneInfo("America/New_York"))
+    if et.weekday() >= 5:        # Sat/Sun
+        return False
+    return et.hour == 15 and et.minute >= 50 or (et.hour == 16 and et.minute == 0)
 
 
 async def _check_trimmed_today(symbol: str, *, kind: str) -> bool:
