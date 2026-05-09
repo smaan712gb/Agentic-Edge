@@ -415,17 +415,42 @@ async def _evaluate_stock(
                 logger.debug("auction imbalance fetch failed for %s: %s",
                              intent.symbol, e)
 
-    # Insider-selling acceleration signal — FMP Form 4 aggregator,
-    # 4-hour cache so the per-tick cost is one cache hit per name.
+    # Insider + analyst pressure signals — FMP-cached, cheap per tick.
     insider_pressure = None
+    analyst_pressure = None
     try:
         from tradingagents.dataflows.providers.fmp import FmpProvider
-        insider_pressure = await FmpProvider().get_insider_sell_pressure(
-            intent.symbol,
+        from tradingagents.strategies.maintenance.analyst_grades import (
+            evaluate_analyst_pressure,
         )
+        fmp = FmpProvider()
+        insider_pressure = await fmp.get_insider_sell_pressure(intent.symbol)
+        # 60-day price change for the analyst upgrade-after-run signal
+        pct_60d: Optional[float] = None
+        try:
+            from datetime import date, timedelta
+            from tradingagents.dataflows.providers.polygon import PolygonProvider
+            pp = PolygonProvider()
+            df60 = await pp.get_stock_data(
+                intent.symbol, date.today() - timedelta(days=90), date.today(),
+            )
+            if df60 is not None and len(df60) >= 40 and "Close" not in (None,):
+                closes = df60["Close"].astype(float).tolist()
+                if len(closes) >= 60:
+                    pct_60d = (closes[-1] - closes[-60]) / closes[-60]
+                else:
+                    pct_60d = (closes[-1] - closes[0]) / closes[0]
+        except Exception as e:
+            logger.debug("60d price fetch failed for %s: %s", intent.symbol, e)
+        try:
+            grades = await fmp.get_analyst_grade_changes(intent.symbol)
+            analyst_pressure = await evaluate_analyst_pressure(
+                symbol=intent.symbol, grade_changes=grades, pct_60d=pct_60d,
+            )
+        except Exception as e:
+            logger.debug("analyst grades fetch failed for %s: %s", intent.symbol, e)
     except Exception as e:
-        logger.debug("insider sell-pressure fetch failed for %s: %s",
-                     intent.symbol, e)
+        logger.debug("FMP signal init failed for %s: %s", intent.symbol, e)
 
     exhaustion = evaluate_momentum_exhaustion(
         symbol=intent.symbol, current_price=last,
@@ -438,7 +463,63 @@ async def _evaluate_stock(
         auction_imbalance=auction_imbalance,
         auction_price=auction_price,
         insider_pressure=insider_pressure,
+        analyst_pressure=analyst_pressure,
     )
+
+    # Institutional flow (13F) — quarterly, only refreshed when a new
+    # quarter is filed. We fetch the latest *completed* quarter once
+    # per tick; FMP cache (4h) makes this near-free.
+    inst_flow = None
+    try:
+        from tradingagents.strategies.maintenance.institutional_flow import (
+            _latest_completed_quarter, evaluate_institutional_flow,
+        )
+        from tradingagents.dataflows.providers.fmp import FmpProvider as _FMP
+        y, q = _latest_completed_quarter()
+        summary = await _FMP().get_institutional_position_summary(
+            intent.symbol, year=y, quarter=q,
+        )
+        inst_flow = evaluate_institutional_flow(
+            symbol=intent.symbol, summary=summary,
+        )
+    except Exception as e:
+        logger.debug("13F flow fetch failed for %s: %s", intent.symbol, e)
+
+    # Earnings-call transcript — checks the latest completed quarter for
+    # thesis-break keywords. Cached 30 days; first hit per quarter is
+    # the only expensive call.
+    transcript_signal = None
+    try:
+        from tradingagents.strategies.maintenance.earnings_transcript import (
+            evaluate_transcript,
+        )
+        from tradingagents.dataflows.providers.fmp import FmpProvider as _FMP2
+        y, q = _latest_completed_quarter() if "y" in dir() else (None, None)
+        if y is None:
+            from tradingagents.strategies.maintenance.institutional_flow import (
+                _latest_completed_quarter as _lcq,
+            )
+            y, q = _lcq()
+        transcript_row = await _FMP2().get_earnings_transcript(
+            intent.symbol, year=y, quarter=q,
+        )
+        transcript_signal = evaluate_transcript(transcript_row)
+    except Exception as e:
+        logger.debug("transcript fetch failed for %s: %s", intent.symbol, e)
+
+    # If transcript signal trips a thesis break, fire full exit. The
+    # early-exit gate above only checks theme + filing breaks; transcript
+    # data lives with the FMP fetches and we can't move that block (the
+    # 60-day price feeds the analyst signal too). So this is a second
+    # exit point downstream of the trim — by the time we reach here,
+    # any partial trim has already happened, and the remainder closes.
+    if transcript_signal and transcript_signal.thesis_break:
+        await _execute_stock_exit(
+            intent=intent, qty=abs(qty),
+            reason=f"thesis broken: transcript: {transcript_signal.rationale}",
+            exit_kind="thesis_break", ib=ib,
+        )
+        return
 
     rotation_candidate = None
     async with db_session() as s:
@@ -488,6 +569,32 @@ async def _evaluate_stock(
                     {"composite": best_theme.composite,
                      "streak": best_theme.streak_days_below_floor}
                     if best_theme else None
+                ),
+                "institutional_flow": (
+                    {"label": inst_flow.flow_label,
+                     "ownership_pct": inst_flow.ownership_pct,
+                     "ownership_pct_change": inst_flow.ownership_pct_change,
+                     "investors_change": inst_flow.investors_change,
+                     "crowded": inst_flow.crowded,
+                     "rationale": inst_flow.rationale}
+                    if inst_flow else None
+                ),
+                "analyst_pressure": (
+                    {"upgrades_30d": analyst_pressure.upgrades_30d,
+                     "downgrades_30d": analyst_pressure.downgrades_30d,
+                     "upgrade_after_run": analyst_pressure.upgrade_after_run,
+                     "downgrade_acceleration": analyst_pressure.downgrade_acceleration,
+                     "pct_60d": analyst_pressure.pct_60d,
+                     "rationale": analyst_pressure.rationale}
+                    if analyst_pressure else None
+                ),
+                "transcript": (
+                    {"period": transcript_signal.period,
+                     "severity": transcript_signal.severity_score,
+                     "thesis_break": transcript_signal.thesis_break,
+                     "matches": transcript_signal.matches[:5],
+                     "rationale": transcript_signal.rationale}
+                    if transcript_signal and transcript_signal.has_transcript else None
                 ),
             },
             outcome=pressure.band,
