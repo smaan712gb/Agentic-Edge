@@ -473,10 +473,10 @@ async def _evaluate_stock(
         pct_60d: Optional[float] = None
         try:
             from datetime import date, timedelta
-            from tradingagents.dataflows.providers.polygon import PolygonProvider
-            pp = PolygonProvider()
-            df60 = await pp.get_stock_data(
+            from tradingagents.dataflows.fallback import get_stock_data_with_fallback
+            df60 = await get_stock_data_with_fallback(
                 intent.symbol, date.today() - timedelta(days=90), date.today(),
+                ibkr_provider=ib,
             )
             if df60 is not None and len(df60) >= 40 and "Close" in df60.columns:
                 closes = df60["Close"].astype(float).tolist()
@@ -1096,12 +1096,22 @@ def _dte_from_str(yyyymmdd: str) -> Optional[int]:
 
 
 async def _compute_atr_30d(symbol: str) -> Optional[float]:
-    """Wilder's ATR(30) via Polygon daily bars. None on failure."""
+    """Wilder's ATR(30) — uses provider fallback chain (Polygon -> IBKR ->
+    FMP -> yfinance) so a single provider rate-limit doesn't kill the
+    indicator. None on total failure."""
     try:
         from datetime import date, timedelta
-        from tradingagents.dataflows.providers.polygon import PolygonProvider
-        p = PolygonProvider()
-        df = await p.get_stock_data(symbol, date.today() - timedelta(days=60), date.today())
+        from tradingagents.dataflows.fallback import get_stock_data_with_fallback
+        # IBKR singleton from positions module so fallback can use it
+        try:
+            from api.app.positions import _ibkr
+            ib = await _ibkr()
+        except Exception:
+            ib = None
+        df = await get_stock_data_with_fallback(
+            symbol, date.today() - timedelta(days=60), date.today(),
+            ibkr_provider=ib,
+        )
         if df is None or len(df) < 30 or "High" not in df.columns:
             return None
         # True range across the last 30 bars
@@ -1141,10 +1151,15 @@ async def _compute_daily_signals(symbol: str) -> dict[str, Optional[float]]:
     }
     try:
         from datetime import date, timedelta
-        from tradingagents.dataflows.providers.polygon import PolygonProvider
-        p = PolygonProvider()
-        df = await p.get_stock_data(
+        from tradingagents.dataflows.fallback import get_stock_data_with_fallback
+        try:
+            from api.app.positions import _ibkr
+            ib = await _ibkr()
+        except Exception:
+            ib = None
+        df = await get_stock_data_with_fallback(
             symbol, date.today() - timedelta(days=60), date.today(),
+            ibkr_provider=ib,
         )
         if df is None or len(df) < 20 or "Close" not in df.columns:
             return out
