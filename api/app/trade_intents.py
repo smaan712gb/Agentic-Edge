@@ -107,7 +107,7 @@ async def build_pmcc(run_id: str, symbol: str, body: BuildPmccIn) -> dict[str, A
     # Persist as pending_review intent
     walking_cfg = {
         "initial_offset_cents": 1, "walk_increment_cents": 1,
-        "walk_interval_sec": 30, "max_offset_pct_of_spread": 0.25,
+        "walk_interval_sec": 30, "max_offset_pct_of_spread": 0.50,
         "timeout_sec": 300,
     }
     async with db_session() as s:
@@ -239,7 +239,7 @@ async def submit_intent(intent_id: str) -> dict[str, Any]:
         initial_offset_cents=cfg.get("initial_offset_cents", 1),
         walk_increment_cents=cfg.get("walk_increment_cents", 1),
         walk_interval_sec=cfg.get("walk_interval_sec", 30),
-        max_offset_pct_of_spread=cfg.get("max_offset_pct_of_spread", 0.25),
+        max_offset_pct_of_spread=cfg.get("max_offset_pct_of_spread", 0.50),
         timeout_sec=cfg.get("timeout_sec", 300),
     )
     result = await submit_pmcc_combo(

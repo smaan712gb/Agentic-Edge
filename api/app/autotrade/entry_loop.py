@@ -285,7 +285,12 @@ async def _process_one(
     # Persist intent.
     walking_cfg = {
         "initial_offset_cents": 1, "walk_increment_cents": 1,
-        "walk_interval_sec": 30, "max_offset_pct_of_spread": 0.25,
+        # 0.50 = walk up to 50% of half-spread above mid. The previous 0.25
+        # capped at ~1% above mid for thin LEAP combos and abandoned every
+        # walk on names like HPE/ANET/AEHR. Per "high conviction, accept
+        # non-ideal price" policy — the walking-limit + abandon is the
+        # protection, not a tight cap.
+        "walk_interval_sec": 30, "max_offset_pct_of_spread": 0.50,
         "timeout_sec": 300,
         "leap_conid": cand.leap.conid, "short_call_conid": cand.short_call.conid,
         "spot_at_build": cand.spot, "auto_origin": "entry_loop",
@@ -329,7 +334,7 @@ async def _process_one(
     ]
     exec_cfg = ExecutionConfig(
         initial_offset_cents=1, walk_increment_cents=1,
-        walk_interval_sec=30, max_offset_pct_of_spread=0.25, timeout_sec=300,
+        walk_interval_sec=30, max_offset_pct_of_spread=0.50, timeout_sec=300,
     )
     try:
         result = await submit_pmcc_combo(

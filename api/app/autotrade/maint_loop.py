@@ -102,6 +102,12 @@ async def _tick() -> None:
 
     pos_by_symbol = {(p.get("symbol") or "").upper(): p for p in positions}
 
+    # Adopt any IBKR position that doesn't have a TradeIntent yet — gives
+    # the maintenance loop ownership of "orphan" positions (existing
+    # holdings imported into the system, manual fills, etc.) so they get
+    # monitored for exit triggers like everything else.
+    orphans_adopted = await _adopt_orphan_positions(positions)
+
     # Pull every open intent (the system's record of what it owns)
     async with db_session() as s:
         intents = (
@@ -112,6 +118,17 @@ async def _tick() -> None:
         ).scalars().all()
 
     if not intents:
+        # Heartbeat row even when there's nothing to evaluate — the operator
+        # needs to see the loop is alive on the runs page.
+        async with db_session() as s:
+            await record_auto_action(
+                s, loop="maintenance", action_type="heartbeat",
+                gate_result=_synthetic_passed_gate(),
+                payload={"intents_evaluated": 0,
+                         "ibkr_positions": len(positions),
+                         "orphans_adopted": orphans_adopted},
+                outcome="no_intents",
+            )
         return
 
     logger.info("maint loop: tick — %d open intent(s) to evaluate", len(intents))
@@ -128,6 +145,91 @@ async def _tick() -> None:
                 await _evaluate_pmcc(intent, latest_decisions.get(sym), ib)
         except Exception as e:
             logger.exception("maint loop: %s evaluation failed: %s", sym, e)
+
+    # End-of-tick heartbeat — the operator-visible "I'm alive and I checked".
+    async with db_session() as s:
+        await record_auto_action(
+            s, loop="maintenance", action_type="heartbeat",
+            gate_result=_synthetic_passed_gate(),
+            payload={"intents_evaluated": len(intents),
+                     "ibkr_positions": len(positions),
+                     "orphans_adopted": orphans_adopted},
+            outcome="ok",
+        )
+
+
+async def _adopt_orphan_positions(ibkr_positions: list[dict]) -> int:
+    """Create synthetic TradeIntent rows for IBKR positions that don't yet
+    have one. Without this, positions imported manually or held before the
+    system was deployed are invisible to the maintenance loop's exit logic.
+
+    Only stock positions are adopted automatically; option positions (PMCC
+    legs) need leg-aware metadata that lives in the run's intent record,
+    so we leave those for the operator to import via the admin endpoint.
+    """
+    if not ibkr_positions:
+        return 0
+    sym_to_pos = {(p.get("symbol") or "").upper(): p
+                  for p in ibkr_positions if p.get("symbol")}
+    if not sym_to_pos:
+        return 0
+
+    async with db_session() as s:
+        # Symbols that already have an OPEN intent (any open lifecycle state)
+        rows = (
+            await s.execute(
+                select(TradeIntent.symbol)
+                .where(TradeIntent.symbol.in_(list(sym_to_pos.keys())))
+                .where(TradeIntent.status.in_(["filled", "submitted", "submitting"]))
+                .where(TradeIntent.position_state.in_(
+                    ["pmcc_full", "leap_pending", "leap_open_naked", "pending"]))
+            )
+        ).all()
+        owned = {(r[0] or "").upper() for r in rows}
+
+        new_count = 0
+        for sym, pos in sym_to_pos.items():
+            if sym in owned:
+                continue
+            qty = float(pos.get("qty") or 0)
+            if qty == 0:
+                continue
+            sec_type = str(pos.get("sec_type") or "STK").upper()
+            # Phase A only adopts equity. Option leg adoption needs the
+            # combo's expiry/strike/right metadata, which we treat as a
+            # separate (operator-confirmed) import path.
+            if sec_type != "STK":
+                continue
+            avg = float(pos.get("avg_price") or 0)
+            intent = TradeIntent(
+                symbol=sym,
+                side="BUY" if qty > 0 else "SELL",
+                qty=abs(qty),
+                limit_px=avg if avg > 0 else None,
+                status="filled",
+                structure="stock",
+                position_state="leap_pending",   # legacy state name = "live"
+                entry_strategy="adopted_orphan",
+                rationale=(
+                    f"Adopted from existing IBKR position "
+                    f"({abs(qty):.0f} sh @ ${avg:.2f})."
+                ),
+                walking_config={
+                    "adopted_at": datetime.now(timezone.utc).isoformat(),
+                    "source": "maint_loop_orphan_adopt",
+                },
+            )
+            s.add(intent)
+            new_count += 1
+        if new_count:
+            await s.flush()
+
+    if new_count:
+        logger.info(
+            "maint loop: adopted %d orphan IBKR position(s) as synthetic intents",
+            new_count,
+        )
+    return new_count
 
 
 # ---------------------------------------------------------------------------
