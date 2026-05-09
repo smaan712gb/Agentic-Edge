@@ -393,6 +393,18 @@ async def _evaluate_stock(intent: TradeIntent, pos: Optional[dict], latest_decis
                 logger.debug("auction imbalance fetch failed for %s: %s",
                              intent.symbol, e)
 
+    # Insider-selling acceleration signal — FMP Form 4 aggregator,
+    # 4-hour cache so the per-tick cost is one cache hit per name.
+    insider_pressure = None
+    try:
+        from tradingagents.dataflows.providers.fmp import FmpProvider
+        insider_pressure = await FmpProvider().get_insider_sell_pressure(
+            intent.symbol,
+        )
+    except Exception as e:
+        logger.debug("insider sell-pressure fetch failed for %s: %s",
+                     intent.symbol, e)
+
     exhaustion = evaluate_momentum_exhaustion(
         symbol=intent.symbol, current_price=last,
         ma_20d=signals.get("ma_20d"),
@@ -403,6 +415,7 @@ async def _evaluate_stock(intent: TradeIntent, pos: Optional[dict], latest_decis
         atr_30d=atr_30d,
         auction_imbalance=auction_imbalance,
         auction_price=auction_price,
+        insider_pressure=insider_pressure,
     )
 
     rotation_candidate = None
