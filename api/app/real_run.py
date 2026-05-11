@@ -28,8 +28,31 @@ def _now_iso() -> str:
 
 
 async def real_run(run_id: str, theme: dict[str, Any]) -> None:
-    """Execute a real DeepSeek+providers theme run; persist + stream events."""
-    from tradingagents.scorecard.runner import RunEvent, ThemeRunner
+    """Execute a real DeepSeek+providers theme run; persist + stream events.
+
+    Two runners are available:
+
+    * FastThemeRunner (default) — ~3 LLM calls per theme + 1 per ticker.
+      A 6-ticker theme run completes in 15-60 seconds. Production-grade
+      latency. Uses deepseek-v4-flash with thinking disabled + JSON output.
+      Same output schema as the slow runner.
+    * ThemeRunner (legacy) — full LangGraph multi-agent pipeline with
+      bull/bear debate, risk panel, etc. ~15 LLM calls per ticker;
+      30-90 minutes per theme. Demo-grade. Kept for research mode.
+
+    Toggle via env: USE_FAST_SCORER=false to fall back to the slow path.
+    """
+    import os
+    use_fast = (os.environ.get("USE_FAST_SCORER", "true").lower()
+                in ("true", "1", "yes", "on"))
+    if use_fast:
+        from tradingagents.scorecard.fast_runner import (
+            RunEvent, FastThemeRunner as _RunnerCls,
+        )
+    else:
+        from tradingagents.scorecard.runner import (
+            RunEvent, ThemeRunner as _RunnerCls,
+        )
     from tradingagents.scorecard.schema import ThemeInput
 
     q = RUN_QUEUES[run_id]
@@ -50,7 +73,12 @@ async def real_run(run_id: str, theme: dict[str, Any]) -> None:
         tickers=list(theme["symbols"]),
     )
 
-    UNITS_PER_TICKER = 14
+    # Per-ticker finished-event count differs by runner:
+    #   * FastThemeRunner emits 8 per ticker (market, fundamentals, news,
+    #     options, social, research_manager, trader, scorecard) + 1 ranker.
+    #   * Slow ThemeRunner emits ~14 (5 analysts + bull + bear + manager +
+    #     trader + 3 risk + PM + scorecard) + 1 ranker.
+    UNITS_PER_TICKER = 8 if use_fast else 14
     total_units = UNITS_PER_TICKER * len(theme_in.tickers) + 1
     done_units = {"n": 0}
 
@@ -129,7 +157,7 @@ async def real_run(run_id: str, theme: dict[str, Any]) -> None:
                 f"⚠ {ev.error or 'unknown error'}",
             )
 
-    runner = ThemeRunner(on_event=on_event)
+    runner = _RunnerCls(on_event=on_event)
     try:
         report = await runner.run(theme_in)
         async with db_session() as s:
