@@ -242,6 +242,47 @@ class EquitySnapshot(Base):
     notional:    Mapped[Optional[float]] = mapped_column(Float, nullable=True)
 
 
+class ClosingAccumulationSignal(Base):
+    """Daily closing-bell accumulation sweep — one row per (symbol, date).
+
+    Surfaces three look-alike patterns and discriminates between them:
+      - real accumulation (VWAP-bid all day + AH follow-through)
+      - short covering (rallies into close but AH fades)
+      - gamma-pinned ramp (also fades AH)
+
+    The AH-holds-close + theme-confirmation booleans are what separates
+    real institutional flow from the look-alikes.
+    """
+
+    __tablename__ = "closing_accumulation_signals"
+    __table_args__ = (
+        UniqueConstraint("symbol", "date", name="uq_cba_symbol_date"),
+        Index("ix_cba_date_confidence", "date", "confidence"),
+    )
+
+    id:              Mapped[int]     = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol:          Mapped[str]     = mapped_column(String(10), nullable=False)
+    date:            Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    theme_id:        Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    setup_passes:    Mapped[bool]    = mapped_column(Boolean, nullable=False)
+    confidence:      Mapped[str]     = mapped_column(String(8), nullable=False)
+    gate1_passes:    Mapped[bool]    = mapped_column(Boolean, nullable=False)
+    gate2_passes:    Mapped[bool]    = mapped_column(Boolean, nullable=False)
+    theme_confirmed: Mapped[Optional[bool]]  = mapped_column(Boolean, nullable=True)
+    last_30m_rvol:   Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    day_rvol:        Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    pct_session_above_vwap: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ah_print_count:  Mapped[Optional[int]]   = mapped_column(Integer, nullable=True)
+    ah_cumulative_volume: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    ah_holds_close:  Mapped[Optional[bool]]  = mapped_column(Boolean, nullable=True)
+    moc_price:       Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    vwap:            Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    entry_recommendation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    rationale:       Mapped[Optional[str]]   = mapped_column(Text, nullable=True)
+    failure_filters: Mapped[Optional[Any]]   = mapped_column(JSON, nullable=True)
+    captured_at:     Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
 class IvSnapshot(Base):
     """Daily front-month ATM call IV snapshot per symbol.
 

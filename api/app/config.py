@@ -155,8 +155,12 @@ class Settings(BaseSettings):
     ALERT_EMAIL_TO: Optional[str] = None
 
     # ----- Limits / governance ----------------------------------------
-    MAX_RUNS_PER_USER_PER_HOUR: int = 5
-    MAX_THEMES_PER_USER: int = 20
+    # MAX_RUNS_PER_USER_PER_HOUR was sized for the slow LangGraph pipeline
+    # (one run took 30+ min, so 5/hr made sense). FastThemeRunner runs
+    # in 30-60 sec, so we cap at 120/hr (= one full universe of 20 themes
+    # six times an hour). Override via env if needed.
+    MAX_RUNS_PER_USER_PER_HOUR: int = 120
+    MAX_THEMES_PER_USER: int = 30
     MAX_TICKERS_PER_THEME: int = 50
 
     # ------------------------------------------------------------------

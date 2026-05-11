@@ -7,6 +7,7 @@ Exposes the engine, sessionmaker, and ORM models. Repositories live in
 from .base import Base, db_engine, db_session, get_session, init_db
 from .models import (
     AutoAction,
+    ClosingAccumulationSignal,
     EquitySnapshot,
     IvSnapshot,
     Position,
@@ -28,6 +29,7 @@ __all__ = [
     "get_session",
     "init_db",
     "AutoAction",
+    "ClosingAccumulationSignal",
     "EquitySnapshot",
     "IvSnapshot",
     "Position",

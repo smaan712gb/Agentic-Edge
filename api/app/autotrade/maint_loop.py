@@ -1364,6 +1364,140 @@ async def _resolve_stuck_runs(idle_timeout_min: int = 15) -> int:
     return count
 
 
+async def run_closing_accumulation_sweep() -> dict[str, Any]:
+    """Sweep the theme-universe for closing-bell accumulation signals.
+
+    Runs both gates (end-of-day quality + AH follow-through) plus the
+    failure filters per the operator's confirmation-stack framework.
+    Persists one row per (symbol, today's-date) into
+    closing_accumulation_signals.
+
+    Designed to run once per day at ~15:50 ET, ideally on its own cron
+    (the data window is 15:50-16:30 ET). Can also be triggered manually
+    via the admin endpoint for testing on any day's data.
+
+    Returns: ``{themes_scanned, symbols_evaluated, setups_found,
+                  details: [{symbol, confidence, ...}, ...]}``
+    """
+    from datetime import date as _date
+    from tradingagents.strategies.maintenance.closing_accumulation import (
+        sweep_theme_for_accumulation,
+    )
+    from api.app.db import ClosingAccumulationSignal, ThemeSymbol, Theme
+
+    # Get IBKR singleton
+    try:
+        from api.app.positions import _ibkr
+        ib = await _ibkr()
+    except Exception as e:
+        logger.warning("CBA sweep: IBKR unavailable: %s", e)
+        return {"themes_scanned": 0, "symbols_evaluated": 0,
+                "setups_found": 0, "error": str(e)}
+
+    # Build the theme -> symbol map
+    theme_symbols_map: dict[str, list[str]] = {}
+    async with db_session() as s:
+        rows = (
+            await s.execute(
+                select(Theme.id, ThemeSymbol.symbol)
+                .join(ThemeSymbol, ThemeSymbol.theme_id == Theme.id)
+            )
+        ).all()
+    for theme_id, sym in rows:
+        if not sym:
+            continue
+        theme_symbols_map.setdefault(theme_id, []).append(sym.upper())
+
+    if not theme_symbols_map:
+        return {"themes_scanned": 0, "symbols_evaluated": 0,
+                "setups_found": 0}
+
+    today = _date.today()
+    today_dt = datetime(today.year, today.month, today.day, tzinfo=timezone.utc)
+    total_eval = 0
+    setups_found = 0
+    details: list[dict[str, Any]] = []
+
+    for theme_id, symbols in theme_symbols_map.items():
+        try:
+            signals = await sweep_theme_for_accumulation(
+                theme_id=theme_id, symbols=symbols, ibkr=ib,
+            )
+        except Exception as e:
+            logger.warning("CBA: theme %s sweep failed: %s", theme_id, e)
+            continue
+
+        for sig in signals:
+            total_eval += 1
+            if sig.setup_passes:
+                setups_found += 1
+
+            # Upsert one row per (symbol, date). Pattern matches the
+            # IV-snapshot capture: idempotent within the day.
+            async with db_session() as s:
+                existing = (
+                    await s.execute(
+                        select(ClosingAccumulationSignal.id)
+                        .where(ClosingAccumulationSignal.symbol == sig.symbol)
+                        .where(ClosingAccumulationSignal.date == today_dt)
+                    )
+                ).first()
+                m = sig.metrics
+                payload = dict(
+                    symbol=sig.symbol,
+                    date=today_dt,
+                    theme_id=theme_id,
+                    setup_passes=sig.setup_passes,
+                    confidence=sig.confidence,
+                    gate1_passes=sig.gate1_passes,
+                    gate2_passes=sig.gate2_passes,
+                    theme_confirmed=sig.theme_confirmed,
+                    last_30m_rvol=(m.last_30m_rvol if m else None),
+                    day_rvol=(m.day_rvol if m else None),
+                    pct_session_above_vwap=(m.pct_session_above_vwap if m else None),
+                    ah_print_count=(m.ah_print_count if m else None),
+                    ah_cumulative_volume=(m.ah_cumulative_volume if m else None),
+                    ah_holds_close=(m.ah_holds_close if m else None),
+                    moc_price=(m.moc_price if m else None),
+                    vwap=(m.vwap if m else None),
+                    entry_recommendation=sig.entry_recommendation,
+                    rationale=sig.rationale,
+                    failure_filters=sig.failure_filters_tripped,
+                )
+                if existing:
+                    await s.execute(
+                        ClosingAccumulationSignal.__table__.update()
+                        .where(ClosingAccumulationSignal.id == existing[0])
+                        .values(**{k: v for k, v in payload.items()
+                                   if k not in ("symbol", "date")})
+                    )
+                else:
+                    s.add(ClosingAccumulationSignal(**payload))
+
+            if sig.setup_passes or sig.confidence in ("high", "medium"):
+                details.append({
+                    "symbol": sig.symbol,
+                    "theme_id": theme_id,
+                    "confidence": sig.confidence,
+                    "gate1": sig.gate1_passes,
+                    "gate2": sig.gate2_passes,
+                    "theme_confirmed": sig.theme_confirmed,
+                    "entry": sig.entry_recommendation,
+                    "rationale": sig.rationale,
+                })
+
+    logger.info(
+        "CBA sweep done: %d themes, %d symbols evaluated, %d setups found",
+        len(theme_symbols_map), total_eval, setups_found,
+    )
+    return {
+        "themes_scanned": len(theme_symbols_map),
+        "symbols_evaluated": total_eval,
+        "setups_found": setups_found,
+        "details": details,
+    }
+
+
 async def _watch_insider_universe() -> int:
     """Sweep FMP's universe-wide insider trade stream, filter to
     theme-universe symbols, audit fresh activity.

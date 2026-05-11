@@ -390,3 +390,80 @@ async def trigger_reconcile(
             for m in result.mismatches
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Closing-Bell Accumulation
+# ---------------------------------------------------------------------------
+
+
+@router.post("/closing-accumulation/run-now")
+async def closing_accumulation_run_now(
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    """Trigger the closing-bell accumulation sweep across all theme symbols.
+
+    Persists one row per (symbol, today's-date) into
+    closing_accumulation_signals. Returns a summary + the high/medium
+    confidence setups (full results live in the table).
+
+    Designed for the ~15:50-16:30 ET window. Outside that window the
+    AH metrics will come back empty (gate 2 fails) and most signals
+    will be no-confidence — which is correct, not an error.
+    """
+    _require_admin(x_admin_token)
+    from .autotrade.maint_loop import run_closing_accumulation_sweep
+    result = await run_closing_accumulation_sweep()
+    return result
+
+
+@router.get("/closing-accumulation/today")
+async def closing_accumulation_today(
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    min_confidence: str = "medium",
+) -> dict[str, Any]:
+    """Read today's CBA signals (persisted by the most recent sweep).
+
+    ``min_confidence`` filters the result list. Use 'low' to see
+    near-misses, 'none' to see everything including failures.
+    """
+    _require_admin(x_admin_token)
+    from datetime import date as _date
+    today_dt = datetime(_date.today().year, _date.today().month,
+                        _date.today().day, tzinfo=timezone.utc)
+    from .db import ClosingAccumulationSignal
+    confidence_order = {"none": 0, "low": 1, "medium": 2, "high": 3}
+    threshold = confidence_order.get(min_confidence.lower(), 2)
+    async with db_session() as s:
+        rows = (
+            await s.execute(
+                select(ClosingAccumulationSignal)
+                .where(ClosingAccumulationSignal.date == today_dt)
+                .order_by(ClosingAccumulationSignal.confidence.desc())
+            )
+        ).scalars().all()
+    out = []
+    for r in rows:
+        if confidence_order.get(r.confidence, 0) < threshold:
+            continue
+        out.append({
+            "symbol": r.symbol,
+            "theme_id": r.theme_id,
+            "confidence": r.confidence,
+            "setup_passes": r.setup_passes,
+            "gate1_passes": r.gate1_passes,
+            "gate2_passes": r.gate2_passes,
+            "theme_confirmed": r.theme_confirmed,
+            "last_30m_rvol": r.last_30m_rvol,
+            "day_rvol": r.day_rvol,
+            "pct_session_above_vwap": r.pct_session_above_vwap,
+            "ah_print_count": r.ah_print_count,
+            "ah_holds_close": r.ah_holds_close,
+            "vwap": r.vwap,
+            "moc_price": r.moc_price,
+            "entry_recommendation": r.entry_recommendation,
+            "rationale": r.rationale,
+            "failure_filters": r.failure_filters,
+        })
+    return {"date": today_dt.date().isoformat(), "count": len(out),
+            "signals": out}
