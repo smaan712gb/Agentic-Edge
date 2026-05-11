@@ -85,7 +85,7 @@ async def _tick() -> None:
     # zombie 'running' runs so the UI doesn't show false-positives and
     # so the operator can re-trigger without manual intervention.
     try:
-        await _resolve_stuck_runs(timeout_min=30)
+        await _resolve_stuck_runs(idle_timeout_min=15)
     except Exception as e:
         logger.warning("maint loop: stuck-run watchdog failed: %s", e)
 
