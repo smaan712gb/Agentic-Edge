@@ -128,6 +128,14 @@ class Settings(BaseSettings):
     FMP_API_KEY: Optional[str] = None
     ALPHA_VANTAGE_API_KEY: Optional[str] = None
 
+    # ----- Manager conviction → entry sizing tilt ---------------------
+    # Names that tracked legendary investors hold (cross-fund confirmed) get
+    # a bounded size BOOST — never a gate, never a block (favor attempting).
+    # Neutral (1.0) for untracked names, so behaviour is unchanged for them.
+    # The boost lifts the %-of-NAV target but stays under the absolute $ cap.
+    MANAGER_CONVICTION_ENABLED: bool = True
+    MANAGER_CONVICTION_MAX_FACTOR: float = 1.30   # cap: 4+ confirming managers
+
     # ----- SEC EDGAR (Hedge Fund Signal Tracker) ----------------------
     # SEC requires a descriptive User-Agent with a contact email or it 403s
     # every request. With this unset the EDGAR poller no-ops (logs a warning)

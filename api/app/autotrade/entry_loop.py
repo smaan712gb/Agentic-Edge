@@ -343,12 +343,17 @@ async def _process_one(
         return False
     cand = elig.candidate
 
-    # NAV-aware sizing: target ~7% NAV per spread × macro sizing_factor,
-    # capped at $250k absolute.
+    # Manager-conviction tilt: names tracked legendary investors hold with
+    # cross-fund confirmation get a bounded size boost (never a gate). Neutral
+    # (1.0) for untracked names.
+    conviction_factor, conviction_meta = await _manager_conviction(symbol)
+
+    # NAV-aware sizing: target ~7% NAV per spread × macro sizing_factor ×
+    # conviction, capped at $250k absolute.
     nav = await _fetch_nav(ib)
     n_contracts = _size_pmcc_contracts(
         net_debit_per_spread=cand.net_debit, nav=nav,
-        sizing_factor=sizing_factor,
+        sizing_factor=sizing_factor, conviction_factor=conviction_factor,
     )
     if n_contracts <= 0:
         logger.info("auto-entry: %s sized to 0 contracts (macro=%s blocks)",
@@ -356,8 +361,9 @@ async def _process_one(
         return False
     total_debit = round(cand.net_debit * n_contracts * 100, 2)
     logger.info(
-        "auto-entry: %s sized to %d contracts (NAV=$%.0f × sf=%.2f, debit/spread=$%.2f, total=$%.0f, macro=%s)",
-        symbol, n_contracts, nav, sizing_factor, cand.net_debit, total_debit, macro_regime,
+        "auto-entry: %s sized to %d contracts (NAV=$%.0f × sf=%.2f × conv=%.2f, debit/spread=$%.2f, total=$%.0f, macro=%s%s)",
+        symbol, n_contracts, nav, sizing_factor, conviction_factor, cand.net_debit, total_debit, macro_regime,
+        (f", smart-money={conviction_meta.get('manager_count')}mgr" if conviction_meta.get("matched") else ""),
     )
 
     # Persist intent. Keep this dict in sync with the ExecutionConfig
@@ -378,6 +384,7 @@ async def _process_one(
         "leap_conid": cand.leap.conid, "short_call_conid": cand.short_call.conid,
         "spot_at_build": cand.spot, "auto_origin": "entry_loop",
         "nav_at_build": nav, "target_pct_nav": PMCC_TARGET_PCT_NAV,
+        "conviction_factor": conviction_factor, "manager_conviction": conviction_meta,
     }
     async with db_session() as s:
         intent = TradeIntent(
@@ -512,6 +519,17 @@ PMCC_MAX_DOLLARS       = 250_000
 STOCK_FALLBACK_NAV_PCT = 0.03
 
 
+async def _manager_conviction(symbol: str) -> tuple[float, dict]:
+    """Bounded smart-money sizing tilt for a symbol (1.0 = neutral). Lazy
+    import + fail-open so the tracker never blocks an entry."""
+    try:
+        from api.app.hedge_funds.conviction import manager_conviction
+        return await manager_conviction(symbol)
+    except Exception as e:
+        logger.debug("conviction unavailable for %s: %s", symbol, e)
+        return 1.0, {}
+
+
 async def _fetch_nav(ib: Any) -> float:
     """Read NetLiquidation from IBKR. Returns 0.0 if unreachable."""
     try:
@@ -530,22 +548,27 @@ async def _fetch_nav(ib: Any) -> float:
 
 def _size_pmcc_contracts(
     *, net_debit_per_spread: float, nav: float,
-    sizing_factor: float = 1.0,
+    sizing_factor: float = 1.0, conviction_factor: float = 1.0,
 ) -> int:
     """Target contracts so net debit deployed ≈ PMCC_TARGET_PCT_NAV × NAV,
     capped at PMCC_MAX_DOLLARS. Minimum 1 contract.
 
-    ``sizing_factor`` (0.0–1.0) tightens the target per-spread when the
-    macro regime is elevated/defensive/panic. Passed through from the
-    macro_regime module — calm regime = 1.0 (no change), defensive 0.50,
-    panic 0.0 (no new entries). Zero short-circuits to 0 contracts so
-    entries are blocked entirely.
+    ``sizing_factor`` (0.0–1.0) tightens the target when the macro regime is
+    elevated/defensive/panic (calm=1.0, defensive 0.50, panic 0.0 → blocked).
+
+    ``conviction_factor`` (≥1.0) BOOSTS the %-of-NAV target for names tracked
+    legendary investors hold with cross-fund confirmation. It lifts the
+    percentage allocation but is re-capped against PMCC_MAX_DOLLARS, so smart
+    money can tilt allocation without ever breaching the absolute ceiling.
     """
     if net_debit_per_spread <= 0 or nav <= 0:
         return 1
     if sizing_factor <= 0:
         return 0
-    target = min(nav * PMCC_TARGET_PCT_NAV, PMCC_MAX_DOLLARS) * sizing_factor
+    # Conviction lifts the % target, then the absolute $ cap clamps it, then
+    # the macro factor tightens — order matters so the cap is never exceeded.
+    target = min(nav * PMCC_TARGET_PCT_NAV * max(conviction_factor, 1.0),
+                 PMCC_MAX_DOLLARS) * sizing_factor
     n = int(target / (net_debit_per_spread * 100))
     return max(1, n)
 
@@ -616,7 +639,9 @@ async def _try_stock_fallback(
     limit = round((bid + 0.01) if bid > 0 else (last + 0.01), 2)
     if ask > 0 and limit > ask:
         limit = round(ask, 2)
-    target_dollars = nav * STOCK_FALLBACK_NAV_PCT * sizing_factor
+    # Same bounded smart-money tilt as the PMCC path (boost only, capped).
+    conviction_factor, _conv_meta = await _manager_conviction(symbol)
+    target_dollars = nav * STOCK_FALLBACK_NAV_PCT * sizing_factor * max(conviction_factor, 1.0)
     if target_dollars <= 0:
         async with db_session() as s:
             await record_auto_action(
