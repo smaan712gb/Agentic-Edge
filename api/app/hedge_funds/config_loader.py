@@ -53,21 +53,33 @@ async def load_managers_from_config(path: Path | None = None) -> int:
             logger.warning("hedge_funds: skipping manager block missing slug/name: %r", block)
             continue
 
+        # A manager's CIK is stable, so once resolved we persist it. Only run
+        # the (flaky, network) "lookup" when we have NOTHING stored yet — re-
+        # resolving every boot let a transient EDGAR hiccup flip an already-
+        # resolved manager (e.g. Atreides) back to inactive.
+        async with db_session() as s:
+            existing = await HedgeFundRepo(s).get_manager_by_slug(slug)
+        existing_ciks = {c.cik for c in existing.ciks} if existing else set()
+
         ciks: list[tuple[str, str | None]] = []
         for raw in block.get("ciks", []):
             if str(raw).lower() == "lookup":
+                if existing_ciks:
+                    continue  # already resolved before — keep the stored CIK
                 resolved = await _resolve_cik(edgar, name)
                 if resolved:
                     ciks.append((resolved, name))
                     logger.info("hedge_funds: resolved CIK %s for %s", resolved, name)
                 else:
-                    logger.warning("hedge_funds: could not resolve CIK for %s — left inactive", name)
+                    logger.warning("hedge_funds: CIK lookup for %s failed this run "
+                                   "(will retry next boot)", name)
             else:
                 padded = _cik10(raw)
                 if padded:
                     ciks.append((padded, name))
 
-        active = bool(ciks)  # no CIKs → inactive, poller skips it
+        # Active if we have ANY CIK — newly resolved this run OR already stored.
+        active = bool(ciks) or bool(existing_ciks)
         async with db_session() as s:
             await HedgeFundRepo(s).upsert_manager(
                 slug=slug, name=name, ciks=ciks,
