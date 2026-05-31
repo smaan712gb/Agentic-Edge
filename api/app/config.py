@@ -128,6 +128,13 @@ class Settings(BaseSettings):
     FMP_API_KEY: Optional[str] = None
     ALPHA_VANTAGE_API_KEY: Optional[str] = None
 
+    # ----- SEC EDGAR (Hedge Fund Signal Tracker) ----------------------
+    # SEC requires a descriptive User-Agent with a contact email or it 403s
+    # every request. With this unset the EDGAR poller no-ops (logs a warning)
+    # rather than hammering SEC anonymously. Free — no API key, just the UA.
+    EDGAR_USER_AGENT_EMAIL: Optional[str] = None
+    EDGAR_POLL_ENABLED: bool = True
+
     # ----- Execution (IBKR) -------------------------------------------
     IBKR_HOST: str = "127.0.0.1"
     IBKR_PORT: int = 7497

@@ -151,14 +151,24 @@ async def _gate_strategy_budget(
     caps = caps or DEFAULT_CAPS
     start, now = _today_window()
 
-    # Count passed actions today. Exclude bookkeeping action types
-    # (anything ending in _gate_passed) — those represent gate evaluations,
-    # not actual trade attempts. Only outcome-bearing rows count toward
-    # the daily caps.
-    bookkeeping_only = ("_gate_passed",)
+    # Count passed actions today, but exclude *informational* rows that
+    # don't represent trade attempts. Maintenance loops emit alerts,
+    # heartbeats, regime checks, and pressure-holds with gate_status='passed'
+    # purely for audit trail — if those count toward AUTO_MAX_TRADES_PER_DAY,
+    # the cap is hit within minutes by background noise (self-amplifying:
+    # every rejection then logs another row, but those are 'rejected' so
+    # they don't actually feed the counter — only 'passed' informational
+    # rows do, which is enough to break things).
+    bookkeeping_suffix = ("_gate_passed", "_ineligible", "_hold")
+    bookkeeping_prefix = ("filing_alert_", "macro_regime_", "sector_regime_")
+    bookkeeping_exact = ("heartbeat",)
     def _exclude_bookkeeping(q):
-        for suffix in bookkeeping_only:
+        for suffix in bookkeeping_suffix:
             q = q.where(~AutoAction.action_type.like(f"%{suffix}"))
+        for prefix in bookkeeping_prefix:
+            q = q.where(~AutoAction.action_type.like(f"{prefix}%"))
+        for exact in bookkeeping_exact:
+            q = q.where(AutoAction.action_type != exact)
         return q
 
     passed_today = (
@@ -198,11 +208,13 @@ async def _gate_strategy_budget(
     if symbol is not None:
         sym_today = (
             await session.execute(
-                select(func.count())
-                .select_from(AutoAction)
-                .where(AutoAction.timestamp >= start)
-                .where(AutoAction.gate_status == "passed")
-                .where(AutoAction.symbol == symbol)
+                _exclude_bookkeeping(
+                    select(func.count())
+                    .select_from(AutoAction)
+                    .where(AutoAction.timestamp >= start)
+                    .where(AutoAction.gate_status == "passed")
+                    .where(AutoAction.symbol == symbol)
+                )
             )
         ).scalar_one()
         if sym_today >= caps["AUTO_PER_SYMBOL_ACTIONS_PER_DAY"]:
@@ -212,11 +224,15 @@ async def _gate_strategy_budget(
                 detail={"symbol": symbol},
             )
 
-    # Min interval since last passed action
+    # Min interval since last passed trade action (excludes heartbeats,
+    # filing alerts, regime-check bookkeeping — those fire on their own
+    # cadence and would otherwise gate every entry attempt).
     last_passed_ts = (
         await session.execute(
-            select(func.max(AutoAction.timestamp))
-            .where(AutoAction.gate_status == "passed")
+            _exclude_bookkeeping(
+                select(func.max(AutoAction.timestamp))
+                .where(AutoAction.gate_status == "passed")
+            )
         )
     ).scalar_one()
     if last_passed_ts is not None:

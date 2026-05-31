@@ -7,7 +7,7 @@ change a shape here, change it there too.
 Modes:
   USE_MOCK_RUN=1   the run executor is deterministic (no LLM cost) — see _simulate_run
   MOCK_DATA=1      positions / equity curve return seeded data instead of real IBKR
-  (neither)        production: DeepSeek + real providers + IBKR paper account
+  (neither)        production: real LLM + real providers + paper brokerage
 
 Run:
     alembic -c api/alembic.ini upgrade head
@@ -15,6 +15,30 @@ Run:
 """
 
 from __future__ import annotations
+
+# ---------------------------------------------------------------------------
+# Windows asyncio policy — MUST run before any other module imports asyncio
+# state. ib_insync binds its Futures (_OverlappedFuture under Proactor) to the
+# loop that created them; uvicorn defaults to ProactorEventLoop on Windows,
+# and the heartbeat / entry / maint background tasks then trip "Future
+# attached to a different loop" the moment they touch a reconnected provider.
+# Selector loop avoids the IOCP-future binding entirely.
+# ---------------------------------------------------------------------------
+import sys as _sys
+if _sys.platform == "win32":
+    import asyncio as _asyncio_bootstrap
+    _asyncio_bootstrap.set_event_loop_policy(
+        _asyncio_bootstrap.WindowsSelectorEventLoopPolicy()
+    )
+
+# Note: we deliberately do NOT call nest_asyncio.apply() here. ib_insync.IB
+# captures the running loop at construction (__init__), and nest_asyncio's
+# loop patching can hand back a different loop than the running one,
+# manifesting as "Future attached to a different loop" once background
+# tasks (heartbeat / entry / maint) touch the provider. The fix that works
+# on Windows is: keep the selector policy above, and pre-create the IBKR
+# provider in lifespan startup so the socket binds to the FastAPI main
+# loop before any background task can race it. See `lifespan()` below.
 
 import asyncio
 import json
@@ -184,6 +208,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     await init_db()
 
+    # Hedge Fund Signal Tracker — upsert tracked managers from managers.toml
+    # (config is source of truth). Best-effort: a config/parse error must not
+    # block API startup.
+    try:
+        from .hedge_funds.config_loader import load_managers_from_config
+        await load_managers_from_config()
+    except Exception as e:
+        logger.warning("hedge-fund manager config load failed: %s", e)
+
+    # Pre-bind the IBKR provider to THIS loop. ib_insync.IB captures the
+    # running loop at construction; if we let the heartbeat task be the
+    # first to call _ibkr(), the IB socket binds to a different loop
+    # reference than the one running the entry/maint/scheduler tasks,
+    # producing "Future attached to a different loop" errors. Pre-creating
+    # it here (eagerly, swallowing connection errors) guarantees the
+    # socket's loop is the main FastAPI loop. If the broker isn't running,
+    # the heartbeat will retry on its own cadence — the failure here is
+    # not fatal to startup.
+    if not settings.MOCK_DATA:
+        try:
+            from .positions import _ibkr
+            await _ibkr()
+            logger.info("IBKR provider bound to main loop")
+        except Exception as e:
+            logger.warning(
+                "IBKR pre-bind failed (%s) — heartbeat will retry; "
+                "autotrade entries will defer until broker is up", e,
+            )
+
     from .scheduler import start_scheduler, stop_scheduler
     from .autotrade.entry_loop import start_entry_loop, stop_entry_loop
     from .autotrade.maint_loop import start_maintenance_loop, stop_maintenance_loop
@@ -222,6 +275,10 @@ app.include_router(_admin_router)
 # Trade-intent endpoints (build PMCC, submit, cancel).
 from .trade_intents import router as _trade_intents_router  # noqa: E402
 app.include_router(_trade_intents_router)
+
+# Hedge Fund Signal Tracker (managers, holdings, overlap, smart-money read).
+from .hedge_funds.routes import router as _hedge_funds_router  # noqa: E402
+app.include_router(_hedge_funds_router)
 
 
 # ---------------------------------------------------------------------------
@@ -494,22 +551,48 @@ async def stream_run(run_id: str) -> StreamingResponse:
         if r is None:
             raise HTTPException(404, "run not found")
         snapshot_payload = {"type": "snapshot", "run": RunRepo.to_dto(r)}
-        terminal = r.status in ("done", "error")
+        initial_terminal = r.status in ("done", "error")
 
     async def gen():
         yield f"data: {json.dumps(snapshot_payload)}\n\n"
-        if terminal:
-            return  # already done — snapshot is enough
+
+        # If the run was already terminal at snapshot time, drain any
+        # unconsumed messages still on the queue (e.g., a `done` that
+        # landed between snapshot read and now) without blocking, then
+        # emit a synthetic done so the client transitions cleanly.
+        if initial_terminal:
+            q = RUN_QUEUES.get(run_id)
+            if q is not None:
+                while True:
+                    try:
+                        msg = q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    yield f"data: {json.dumps(msg)}\n\n"
+                    if msg.get("type") == "done":
+                        return
+            yield f"data: {json.dumps({'type': 'done', 'run': snapshot_payload['run']})}\n\n"
+            return
+
+        # Live stream — drain the queue and re-check DB on keepalive so a
+        # run that finished between snapshot read and queue subscribe still
+        # terminates cleanly (the runner's `done` message may have been
+        # consumed by an earlier subscriber or never queued at all).
         q = RUN_QUEUES[run_id]
         while True:
             try:
                 msg = await asyncio.wait_for(q.get(), timeout=15.0)
             except asyncio.TimeoutError:
+                async with db_session() as s2:
+                    r2 = await RunRepo(s2).get(run_id)
+                if r2 is not None and r2.status in ("done", "error"):
+                    yield f"data: {json.dumps({'type': 'done', 'run': RunRepo.to_dto(r2)})}\n\n"
+                    return
                 yield ": keepalive\n\n"
                 continue
             yield f"data: {json.dumps(msg)}\n\n"
             if msg.get("type") == "done":
-                break
+                return
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 

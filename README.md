@@ -20,7 +20,7 @@
 
 You feed it a theme — *AI infrastructure*, *advanced memory*, *grid power*, *small modular reactors*, *optical networking*, anything else you're researching. A team of agents fans out, reads catalysts, pulls fundamentals, watches options flow, debates the bull and bear case, and ranks the names that fit best. The scorecard is the output. The reasoning is on the page, not behind a black box.
 
-Connect a paper Interactive Brokers account and the system can attempt to act on its own conclusions — with NAV-aware sizing, a five-stage gate stack, and a kill switch one click away.
+Connect a paper brokerage account and the system can attempt to act on its own conclusions — with NAV-aware sizing, a five-stage gate stack, and a kill switch one click away.
 
 > **This is research and decision-support software, not financial advice.** Live brokerage execution is disabled by default and the project actively refuses to run against a non-paper account. Markets do things no model has seen. Use at your own risk.
 
@@ -50,7 +50,7 @@ The interface is a Next.js 15 app with a live agent-network visualisation on the
 - **Themes.** Add a theme — *AI infrastructure*, *advanced memory*, *grid power*, *small modular reactors*, *optical networking*, or your own — seed it with tickers and a thesis sentence. The universe is editable at any time.
 - **Runs.** Every research run is recorded with the agent timeline, intermediate findings, and the final scorecard. Click any agent in the workflow diagram to read what it concluded for each ticker and why.
 - **Scorecard.** Ranked output combining the bull/bear debate, options flow, regime read, and the trader's recommendation per name. Composite score and the supporting rationale travel together.
-- **Performance.** Today's gain/loss, account equity curve, and current positions when an IBKR paper account is connected.
+- **Performance.** Today's gain/loss, account equity curve, and current positions when a paper brokerage account is connected.
 - **Kill switch.** One click in the sidebar halts every automation loop. The state is stored in the database so a restart can't accidentally re-arm trading.
 
 ### Home — the digital trading floor
@@ -216,9 +216,9 @@ The agent graph and provider SDK live under an `agents/` package the API imports
 | Frontend | Real |
 | API contract | Real and stable |
 | Theme + run persistence | Real (SQLAlchemy + Alembic; SQLite for dev, Postgres-ready) |
-| Provider clients (Polygon, FMP, AlphaVantage, Unusual Whales, IBKR, DeepSeek) | Real |
-| Agent scorecard graph | Working end-to-end with DeepSeek V4 |
-| IBKR paper execution | Working (combo + single-leg, walking-limit, atomic) |
+| Provider clients (market data, options flow, fundamentals, macro, brokerage, reasoning models) | Real |
+| Agent scorecard graph | Working end-to-end |
+| Paper-brokerage execution | Working (combo + single-leg, walking-limit, atomic) |
 | Maintenance loop (rolls, closes, earnings hedge) | Working |
 | Live-broker mode | Disabled by design — paper only |
 
@@ -230,9 +230,9 @@ Treat anything not in the list as planned but unverified.
 
 The service is configured entirely through environment variables — see `.env.example` for the full list. A few that matter:
 
-- `DEEPSEEK_API_KEY` — required to run real agent flows.
-- `POLYGON_API_KEY`, `UNUSUAL_WHALES_API_KEY`, `FMP_API_KEY`, `ALPHA_VANTAGE_API_KEY` — provider keys; missing keys disable the corresponding analyst.
-- `IBKR_HOST`, `IBKR_PORT`, `IBKR_CLIENT_ID`, `IBKR_MODE=paper` — paper-trading wiring. The system rejects `IBKR_MODE=live`.
+- Reasoning-model API key — required to run real agent flows.
+- Market-data, options-flow, fundamentals, and macro provider keys — missing keys disable the corresponding analyst; see `.env.example` for the exact variable names.
+- Paper-brokerage host / port / client id / mode — paper-trading wiring. The system refuses to start unless the mode flag is set to paper.
 - `ADMIN_API_TOKEN` — required for admin endpoints (kill switch, scheduler, reconcile). The service refuses placeholder values like `changeme`.
 
 ---
@@ -253,7 +253,7 @@ If any of those interest you, the contributing guide explains how to pick one up
 
 ## Disclaimer
 
-Agentic Edge is research and decision-support software. It is **not** investment advice, a recommendation to buy or sell any security, or a guarantee of any outcome. The default execution mode is paper trading on Interactive Brokers and the system actively refuses to operate against a live account without explicit, deliberate configuration changes. Past performance is not indicative of future results. Markets can and do produce outcomes that no model has seen. Use this software at your own risk and consult a licensed financial advisor before making investment decisions.
+Agentic Edge is research and decision-support software. It is **not** investment advice, a recommendation to buy or sell any security, or a guarantee of any outcome. The default execution mode is paper trading and the system actively refuses to operate against a live account without explicit, deliberate configuration changes. Past performance is not indicative of future results. Markets can and do produce outcomes that no model has seen. Use this software at your own risk and consult a licensed financial advisor before making investment decisions.
 
 ---
 
@@ -261,7 +261,7 @@ Agentic Edge is research and decision-support software. It is **not** investment
 
 Issues, bug reports, and pull requests are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) to see how the project is organised and which contributions are most useful right now. Security reports go through [SECURITY.md](SECURITY.md), not public issues.
 
-Topics that help others find this project on GitHub: `agentic-ai`, `langgraph`, `quantitative-finance`, `options-trading`, `interactive-brokers`, `nextjs`, `fastapi`, `deepseek`, `paper-trading`, `investment-research`.
+Topics that help others find this project on GitHub: `agentic-ai`, `quantitative-finance`, `options-trading`, `nextjs`, `fastapi`, `paper-trading`, `investment-research`.
 
 ---
 

@@ -33,7 +33,7 @@ export default function HomePage() {
         <FeatureCard
           icon={<ShieldCheck className="h-4 w-4" />}
           title="Paper-only by design"
-          body="Approved trades route to Interactive Brokers in paper mode through a double-gated wrapper: env IBKR_MODE=paper AND account ID prefix D — both must hold or the call raises. Live trading is intentionally not a path the agents can take."
+          body="Approved trades route to the paper-only brokerage through a double-gated wrapper: the broker-mode flag must be paper AND the account ID must carry the paper prefix — both must hold or the call raises. Live trading is intentionally not a path the agents can take."
         />
       </div>
 

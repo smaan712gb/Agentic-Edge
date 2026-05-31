@@ -263,7 +263,9 @@ class ClosingAccumulationSignal(Base):
     id:              Mapped[int]     = mapped_column(Integer, primary_key=True, autoincrement=True)
     symbol:          Mapped[str]     = mapped_column(String(10), nullable=False)
     date:            Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    theme_id:        Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    theme_id:        Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("themes.id", ondelete="SET NULL"), nullable=True,
+    )
     setup_passes:    Mapped[bool]    = mapped_column(Boolean, nullable=False)
     confidence:      Mapped[str]     = mapped_column(String(8), nullable=False)
     gate1_passes:    Mapped[bool]    = mapped_column(Boolean, nullable=False)
@@ -475,3 +477,154 @@ class TradeAuditLog(Base):
     ibkr_account:    Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     payload:         Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
     timestamp:       Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# Hedge Fund Signal Tracker — named-manager EDGAR positioning
+# ---------------------------------------------------------------------------
+#
+# Decision-support layer that tracks *named* legendary investors (Gerstner,
+# Coatue, Aschenbrenner, Baker, ...) via their SEC EDGAR filings, distinct
+# from the anonymous aggregate-13F signal the agents already consume. A
+# manager is a logical entity that may file under several CIKs (Situational
+# Awareness has two; Coatue files across many sub-advisers) — hence the
+# split between HedgeFundManager and ManagerCik.
+
+
+class HedgeFundManager(Base):
+    """A tracked investor. Seeded from ``managers.toml`` (config is the
+    source of truth) and upserted on startup, so adding a manager is a
+    config edit, not a migration."""
+
+    __tablename__ = "hedge_fund_managers"
+    __table_args__ = (
+        UniqueConstraint("slug", name="uq_hf_manager_slug"),
+        Index("ix_hf_manager_active", "active"),
+    )
+
+    id:                Mapped[int]    = mapped_column(Integer, primary_key=True, autoincrement=True)
+    slug:              Mapped[str]    = mapped_column(String(64), nullable=False)
+    name:              Mapped[str]    = mapped_column(String(200), nullable=False)
+    # macro_only managers (e.g. D.E. Shaw) get tracked for context but never
+    # produce a single-name conviction signal — their alpha decays too fast.
+    macro_only:        Mapped[bool]   = mapped_column(Boolean, nullable=False, default=False)
+    active:            Mapped[bool]   = mapped_column(Boolean, nullable=False, default=True)
+    primary_themes:    Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)   # list[str] of theme ids
+    weighting_profile: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)   # dict[str,float]
+    last_filing_at:    Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at:        Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at:        Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    ciks: Mapped[list["ManagerCik"]] = relationship(
+        back_populates="manager", cascade="all, delete-orphan", lazy="selectin",
+    )
+
+
+class ManagerCik(Base):
+    """A SEC CIK that maps to a manager. Many-to-one so the two-CIK and
+    sub-adviser cases collapse to one logical manager."""
+
+    __tablename__ = "manager_ciks"
+    __table_args__ = (
+        UniqueConstraint("cik", name="uq_manager_cik"),
+        Index("ix_manager_cik_manager", "manager_id"),
+    )
+
+    id:          Mapped[int]    = mapped_column(Integer, primary_key=True, autoincrement=True)
+    manager_id:  Mapped[int]    = mapped_column(Integer, ForeignKey("hedge_fund_managers.id", ondelete="CASCADE"), nullable=False)
+    cik:         Mapped[str]    = mapped_column(String(10), nullable=False)   # 10-digit zero-padded
+    entity_name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+
+    manager: Mapped[HedgeFundManager] = relationship(back_populates="ciks")
+
+
+class Filing(Base):
+    """One EDGAR filing we've ingested. ``accession_no`` is the idempotency
+    key — the poller skips anything already stored."""
+
+    __tablename__ = "filings"
+    __table_args__ = (
+        UniqueConstraint("accession_no", name="uq_filing_accession"),
+        Index("ix_filing_manager_form", "manager_id", "form_type"),
+        Index("ix_filing_filed_at", "filed_at"),
+    )
+
+    id:           Mapped[int]    = mapped_column(Integer, primary_key=True, autoincrement=True)
+    manager_id:   Mapped[int]    = mapped_column(Integer, ForeignKey("hedge_fund_managers.id", ondelete="CASCADE"), nullable=False)
+    cik:          Mapped[str]    = mapped_column(String(10), nullable=False)
+    form_type:    Mapped[str]    = mapped_column(String(16), nullable=False)   # 13F-HR, SC 13D, 4, ...
+    accession_no: Mapped[str]    = mapped_column(String(32), nullable=False)
+    filed_at:     Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    period_end:   Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    raw_url:      Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    parsed_json:  Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)   # form-specific summary
+    ingested_at:  Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+class FundHolding(Base):
+    """One position from a 13F filing, deduped to the parent-manager level
+    and value-normalised to whole USD on ingest. CUSIP + issuer name are the
+    canonical identity; ``ticker`` is a best-effort enrichment (13F never
+    reports a ticker)."""
+
+    __tablename__ = "fund_holdings"
+    __table_args__ = (
+        UniqueConstraint("filing_id", "cusip", "put_call_flag", name="uq_holding_filing_cusip_pc"),
+        Index("ix_holding_manager_period", "manager_id", "period_end"),
+        Index("ix_holding_ticker", "ticker"),
+        Index("ix_holding_cusip", "cusip"),
+    )
+
+    id:               Mapped[int]    = mapped_column(Integer, primary_key=True, autoincrement=True)
+    manager_id:       Mapped[int]    = mapped_column(Integer, ForeignKey("hedge_fund_managers.id", ondelete="CASCADE"), nullable=False)
+    filing_id:        Mapped[int]    = mapped_column(Integer, ForeignKey("filings.id", ondelete="CASCADE"), nullable=False)
+    cusip:            Mapped[str]    = mapped_column(String(9), nullable=False)
+    issuer_name:      Mapped[str]    = mapped_column(String(200), nullable=False)
+    ticker:           Mapped[Optional[str]] = mapped_column(String(12), nullable=True)
+    value_usd:        Mapped[float]  = mapped_column(Float, nullable=False)
+    shares:           Mapped[float]  = mapped_column(Float, nullable=False)
+    # '' for long underlying, 'C'/'P' for option rows. Part of the unique key
+    # so a put and the underlying don't collide.
+    put_call_flag:    Mapped[str]    = mapped_column(String(1), nullable=False, default="")
+    pct_of_portfolio: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    period_end:       Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    captured_at:      Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+class PositionChange(Base):
+    """Quarter-over-quarter delta for a (manager, security). Recomputed from
+    the latest two 13F periods each sweep; ``change_type`` is the headline."""
+
+    __tablename__ = "position_changes"
+    __table_args__ = (
+        UniqueConstraint("manager_id", "cusip", "current_period", name="uq_poschg_mgr_cusip_period"),
+        Index("ix_poschg_manager", "manager_id"),
+        Index("ix_poschg_ticker", "ticker"),
+    )
+
+    id:             Mapped[int]    = mapped_column(Integer, primary_key=True, autoincrement=True)
+    manager_id:     Mapped[int]    = mapped_column(Integer, ForeignKey("hedge_fund_managers.id", ondelete="CASCADE"), nullable=False)
+    cusip:          Mapped[str]    = mapped_column(String(9), nullable=False)
+    ticker:         Mapped[Optional[str]] = mapped_column(String(12), nullable=True)
+    issuer_name:    Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    prior_shares:   Mapped[float]  = mapped_column(Float, nullable=False, default=0.0)
+    current_shares: Mapped[float]  = mapped_column(Float, nullable=False, default=0.0)
+    change_pct:     Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    change_type:    Mapped[str]    = mapped_column(String(8), nullable=False)   # new|add|trim|exit|hold
+    prior_period:   Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    current_period: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    computed_at:    Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+class CusipTickerMap(Base):
+    """CUSIP → ticker resolution cache. 13F reports CUSIP + issuer name only;
+    this is the best-effort enrichment layer, populated from Form 4 issuer
+    symbols and provider lookups."""
+
+    __tablename__ = "cusip_ticker_map"
+
+    cusip:        Mapped[str]    = mapped_column(String(9), primary_key=True)
+    ticker:       Mapped[Optional[str]] = mapped_column(String(12), nullable=True)
+    issuer_name:  Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    resolved_via: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)   # form4|fmp|manual
+    updated_at:   Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)

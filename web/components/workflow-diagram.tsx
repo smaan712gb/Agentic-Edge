@@ -10,7 +10,7 @@
  * at the gamma + chain workstation, Bull and Bear at podiums, Research
  * Manager on the bench, Trader at the order ticket, three Risk voices
  * around a round table, the Portfolio Manager at the executive desk,
- * the Theme Ranker at the whiteboard, and the IBKR paper-trade door.
+ * the Theme Ranker at the whiteboard, and the paper-trade door.
  *
  * Lives on the Home tab. Click any employee to see their role and a
  * sample line of reasoning. Click "Run a theme" to walk through the
@@ -22,12 +22,15 @@
 
 import * as React from "react";
 
+// Agent ids are internal — the user-visible labels live in INFO below.
+// Stable ids let the SVG and the run-sequence array reference each role
+// independently of how it's labeled on screen.
 type AgentId =
-  | "polygon" | "uw" | "fmp" | "av" | "ibkr-live"
+  | "market-feed" | "flow-feed" | "fundamentals-feed" | "macro-feed" | "broker-feed"
   | "market" | "sentiment" | "news" | "fundamentals" | "options-flow"
   | "bull" | "bear" | "research-mgr" | "trader"
   | "risk" | "pm"
-  | "ranker" | "ibkr";
+  | "ranker" | "broker";
 
 interface AgentInfo {
   title: string;
@@ -37,117 +40,117 @@ interface AgentInfo {
 }
 
 const INFO: Record<AgentId, AgentInfo> = {
-  polygon: {
-    title: "Polygon · live OHLCV + chains",
-    role: "Data feed (Stocks Advanced + Options Advanced)",
-    desc: "Primary market-data feed. Streams the price aggregates the Market analyst reads and the full options chains the Options Flow analyst reads.",
+  "market-feed": {
+    title: "Market data · live OHLCV + chains",
+    role: "Data feed (equities + options)",
+    desc: "The primary market-data feed. Streams the price aggregates the Market analyst reads and the full options chains the Options Flow analyst reads.",
   },
-  uw: {
-    title: "Unusual Whales · institutional flow",
+  "flow-feed": {
+    title: "Options flow · institutional positioning",
     role: "Data feed",
     desc: "Sweeps, blocks above ask, gamma exposure curves with call and put walls, max-pain levels per expiry, dark-pool prints. Smart-money grounding for the Options Flow analyst.",
   },
-  fmp: {
-    title: "FMP Ultimate · fundamentals",
+  "fundamentals-feed": {
+    title: "Fundamentals · statements + ratios",
     role: "Data feed",
     desc: "Income statement, balance sheet, cash flow, ratios, owner earnings. Aggressively cached (24h TTL) since fundamentals change slowly.",
   },
-  av: {
-    title: "AlphaVantage · macro",
+  "macro-feed": {
+    title: "Macro · rates + economic series",
     role: "Data feed",
     desc: "Treasury yields, Fed funds, CPI, GDP, payrolls. The macro context the News analyst layers on top of sector reads.",
   },
-  "ibkr-live": {
-    title: "IBKR · live market data + account",
+  "broker-feed": {
+    title: "Brokerage feed · live quotes + account",
     role: "Data feed (live)",
-    desc: "Interactive Brokers feeds Level-1 quotes, the live position book, NAV and P&L. The same gateway is the execution endpoint at the bottom — but execution is double-gated to paper-only.",
+    desc: "The brokerage feed provides Level-1 quotes, the live position book, NAV and P&L. The same gateway is the execution endpoint at the bottom — but execution is double-gated to paper-only.",
     quote: "L1 CRDO bid 84.20 × 500 / ask 84.22 × 400. NAV $1.04M. Optical exposure 12.6%.",
   },
   market: {
     title: "Market analyst",
-    role: "V4-Flash · MTF technicals",
-    desc: "Reads daily and weekly aggregates. Outputs the structured technical setup that feeds the MTF axis of the scorecard.",
+    role: "Quick reasoning · MTF technicals",
+    desc: "Reads daily and weekly aggregates from the market data feed. Outputs the structured technical setup that feeds the MTF axis of the scorecard.",
     quote: "CRDO daily and weekly are aligned bullish; momentum confirmed by MACD cross above signal line, with RSI(14) at 58 — room to run.",
   },
   sentiment: {
     title: "Sentiment analyst",
-    role: "V4-Flash · social + retail mood",
+    role: "Quick reasoning · social + retail mood",
     desc: "Reads social-media and retail-sentiment proxies. Calibrates short-term mood vs. price action — a counter-signal when retail piles in late.",
     quote: "Retail enthusiasm rising but lagging price; flow is institutional, not chase. Sentiment supports the Bull but not as the primary driver.",
   },
   news: {
     title: "News analyst",
-    role: "V4-Flash · sector + macro headlines",
+    role: "Quick reasoning · sector + macro headlines",
     desc: "Reads sector and macro news through the lens of the active theme. Surfaces catalysts and disconfirming evidence for the researchers to debate.",
     quote: "Hyperscaler capex revised up 18% for 2026 reinforces the 800G demand thesis. No disconfirming signal in last-72h news flow.",
   },
   fundamentals: {
     title: "Fundamentals analyst",
-    role: "V4-Flash · margins, FCF, leverage",
+    role: "Quick reasoning · margins, FCF, leverage",
     desc: "Quality screen at the workstation: gross / operating margins, ROIC, FCF yield, leverage, R&D intensity. Flags zombie tickers that ride a thesis without earning capital.",
     quote: "CRDO trailing GM 65.2%, FCF yield 3.4%, net cash. Quality-tilt allocation supported within the optical theme.",
   },
   "options-flow": {
     title: "Options flow analyst",
-    role: "V4-Flash · gamma, sweeps, max pain",
-    desc: "Reads UW + Polygon together: gamma walls, max pain per expiry, unusual sweeps, GEX. Outputs the Options Sentiment axis (institutional positioning vs. retail).",
+    role: "Quick reasoning · gamma, sweeps, max pain",
+    desc: "Reads the institutional-flow feed and the options-chain feed together: gamma walls, max pain per expiry, unusual sweeps, GEX. Outputs the Options Sentiment axis (institutional positioning vs. retail).",
     quote: "Call wall at 95 reinforces upside magnet; aggregate sweep premium $4.2M biased above ask in 2026-06 expiries. Gamma flips negative below 78.",
   },
   bull: {
     title: "Bull researcher",
-    role: "V4-Pro · long thesis advocate",
+    role: "Deep reasoning · long thesis advocate",
     desc: "At the podium, building the strongest possible long case from all five analyst reports. Defends against the Bear in N rounds.",
     quote: "Institutional positioning + clean technicals + thesis-confirming fundamentals. The cleanest expression of the 800G ramp; rerate is in front of us.",
   },
   bear: {
     title: "Bear researcher",
-    role: "V4-Pro · short / skip thesis advocate",
+    role: "Deep reasoning · short / skip thesis advocate",
     desc: "At the opposite podium, building the strongest short or skip case. Looks for crowded trades, negative gamma traps, fundamental softness behind a hot narrative.",
     quote: "Premium sweep volume can fade post-earnings; if the call wall breaks, gamma flips and stops cascade. Position sizing must reflect this asymmetric tail.",
   },
   "research-mgr": {
     title: "Research manager",
-    role: "V4-Pro · the judge",
+    role: "Deep reasoning · the judge",
     desc: "On the bench between the two podiums. Reads the full debate transcript, picks a side or Hold, assigns a 1–5 conviction score. The Conviction Gate auto-Holds anything below threshold.",
     quote: "Buy. Conviction 4/5. Bull case grounded in flow + fundamentals; Bear tail risk priced into sizing not into the thesis.",
   },
   trader: {
     title: "Trader",
-    role: "V4-Pro · order ticket",
+    role: "Deep reasoning · order ticket",
     desc: "At the trading desk. Translates the research plan into a concrete order: action, size, entry zone, stop level, target, risk-reward.",
     quote: "Long 1.2% NAV. Entry 84–86, stop 76 (below gamma flip), target 102 (above call wall). Risk-reward 2.5:1.",
   },
   risk: {
     title: "Risk committee",
-    role: "V4-Pro · three-voice debate",
+    role: "Deep reasoning · three-voice debate",
     desc: "Aggressive, Neutral and Conservative argue position size around the round table. Surfaces correlation, liquidity tails, and theme-overlap concerns before the PM signs.",
     quote: "Final consensus: 1.0% NAV (trimmed for theme overlap). Tighten stop to $76, honoring the gamma-flip level.",
   },
   pm: {
     title: "Portfolio manager",
-    role: "V4-Pro · final approve / reject",
+    role: "Deep reasoning · final approve / reject",
     desc: "Executive office. Final approve / reject; final position size after rebalancing for theme overlap and correlation. Issues a TradeIntent or holds.",
-    quote: "Approved. Final size 1.0% NAV. Stop 76, target 102. Trade routed to IBKR paper.",
+    quote: "Approved. Final size 1.0% NAV. Stop 76, target 102. Trade routed to the paper account.",
   },
   ranker: {
     title: "Theme ranker",
-    role: "V4-Pro · cross-ticker prioritization",
+    role: "Deep reasoning · cross-ticker prioritization",
     desc: "At the whiteboard, fans every TickerScore in the theme back in, ranks them, and writes the prose justification for the leaderboard.",
     quote: "Top names are the cleanest expressions of the thesis. Bottom of the list: execution-risk-heavy — underweight.",
   },
-  ibkr: {
-    title: "IBKR · paper-trade gateway",
+  broker: {
+    title: "Brokerage · paper-trade gateway",
     role: "Execution",
-    desc: "Routes approved TradeIntents to Interactive Brokers in paper mode. Hard-gated: env IBKR_MODE=paper AND account ID prefix D — both must hold or the call raises. Live trading is intentionally not a path the agents can take.",
+    desc: "Routes approved TradeIntents to the paper-only brokerage. Hard-gated: the broker-mode flag must be set to paper AND the account ID prefix must match the paper convention — both must hold or the call raises. Live trading is intentionally not a path the agents can take.",
   },
 };
 
 const RUN_SEQUENCE: AgentId[] = [
-  "polygon", "uw", "fmp", "av", "ibkr-live",
+  "market-feed", "flow-feed", "fundamentals-feed", "macro-feed", "broker-feed",
   "market", "sentiment", "news", "fundamentals", "options-flow",
   "bull", "bear", "research-mgr", "trader",
   "risk", "pm",
-  "ranker", "ibkr",
+  "ranker", "broker",
 ];
 
 type Status = "idle" | "running" | "done";
@@ -250,7 +253,7 @@ export default function WorkflowDiagram() {
               The full hedge-fund team runs in parallel for every ticker in the theme. Five analysts feed reports
               into the Bull–Bear debate; the Research Manager picks a side and a conviction score; the Trader
               writes a concrete order ticket; three Risk voices argue position size; the Portfolio Manager signs
-              off; the Theme Ranker writes the leaderboard; the IBKR paper-trade gateway logs and blocks anything
+              off; the Theme Ranker writes the leaderboard; the paper-trade gateway logs and blocks anything
               outside paper mode.
             </p>
           </>
@@ -364,10 +367,10 @@ function FloorSvg({
         <rect width="1320" height="120" rx="12" fill="url(#ae-grad-rack)" stroke="#232a3a" />
         <text x="20" y="26" fontSize="11" fontWeight="600" fill="#6c7388" letterSpacing="0.08em">DATA ROOM · LIVE FEEDS</text>
 
-        <g className={cls("polygon")} onClick={click("polygon")} transform="translate(20, 42)">
+        <g className={cls("market-feed")} onClick={click("market-feed")} transform="translate(20, 42)">
           <rect className="ae-bg" width="240" height="62" rx="8" fill="#0b0d12" stroke="#232a3a" />
           <circle className="ae-pulse" cx="14" cy="14" r="4" fill="#38bdf8" />
-          <text x="26" y="18" fontSize="12" fontWeight="500" fill="#e7eaf2">Polygon</text>
+          <text x="26" y="18" fontSize="12" fontWeight="500" fill="#e7eaf2">Market data</text>
           <text x="26" y="32" fontSize="9" fill="#6c7388">OHLCV · options chains</text>
           <g clipPath="url(#ae-clip-poly)">
             <g className="ae-ticker" fontSize="9" fill="#7dd3fc" fontFamily="ui-monospace, monospace">
@@ -376,10 +379,10 @@ function FloorSvg({
           </g>
         </g>
 
-        <g className={cls("uw")} onClick={click("uw")} transform="translate(280, 42)">
+        <g className={cls("flow-feed")} onClick={click("flow-feed")} transform="translate(280, 42)">
           <rect className="ae-bg" width="240" height="62" rx="8" fill="#0b0d12" stroke="#232a3a" />
           <circle className="ae-pulse" cx="14" cy="14" r="4" fill="#7c5cff" />
-          <text x="26" y="18" fontSize="12" fontWeight="500" fill="#e7eaf2">Unusual Whales</text>
+          <text x="26" y="18" fontSize="12" fontWeight="500" fill="#e7eaf2">Options flow</text>
           <text x="26" y="32" fontSize="9" fill="#6c7388">Flow · gamma · max pain</text>
           <g clipPath="url(#ae-clip-uw)">
             <g className="ae-ticker" fontSize="9" fill="#c4b5fd" fontFamily="ui-monospace, monospace">
@@ -388,10 +391,10 @@ function FloorSvg({
           </g>
         </g>
 
-        <g className={cls("fmp")} onClick={click("fmp")} transform="translate(540, 42)">
+        <g className={cls("fundamentals-feed")} onClick={click("fundamentals-feed")} transform="translate(540, 42)">
           <rect className="ae-bg" width="240" height="62" rx="8" fill="#0b0d12" stroke="#232a3a" />
           <circle className="ae-pulse" cx="14" cy="14" r="4" fill="#34d399" />
-          <text x="26" y="18" fontSize="12" fontWeight="500" fill="#e7eaf2">FMP Ultimate</text>
+          <text x="26" y="18" fontSize="12" fontWeight="500" fill="#e7eaf2">Fundamentals</text>
           <text x="26" y="32" fontSize="9" fill="#6c7388">Income · balance · cash flow</text>
           <g clipPath="url(#ae-clip-fmp)">
             <g className="ae-ticker" fontSize="9" fill="#6ee7b7" fontFamily="ui-monospace, monospace">
@@ -400,10 +403,10 @@ function FloorSvg({
           </g>
         </g>
 
-        <g className={cls("av")} onClick={click("av")} transform="translate(800, 42)">
+        <g className={cls("macro-feed")} onClick={click("macro-feed")} transform="translate(800, 42)">
           <rect className="ae-bg" width="240" height="62" rx="8" fill="#0b0d12" stroke="#232a3a" />
           <circle className="ae-pulse" cx="14" cy="14" r="4" fill="#fbbf24" />
-          <text x="26" y="18" fontSize="12" fontWeight="500" fill="#e7eaf2">AlphaVantage</text>
+          <text x="26" y="18" fontSize="12" fontWeight="500" fill="#e7eaf2">Macro</text>
           <text x="26" y="32" fontSize="9" fill="#6c7388">Macro · global indicators</text>
           <g clipPath="url(#ae-clip-av)">
             <g className="ae-ticker" fontSize="9" fill="#fcd34d" fontFamily="ui-monospace, monospace">
@@ -412,10 +415,10 @@ function FloorSvg({
           </g>
         </g>
 
-        <g className={cls("ibkr-live")} onClick={click("ibkr-live")} transform="translate(1060, 42)">
+        <g className={cls("broker-feed")} onClick={click("broker-feed")} transform="translate(1060, 42)">
           <rect className="ae-bg" width="240" height="62" rx="8" fill="#0b0d12" stroke="#f87171" strokeWidth="1.5" />
           <circle className="ae-pulse ae-blink" cx="14" cy="14" r="4" fill="#f87171" />
-          <text x="26" y="18" fontSize="12" fontWeight="500" fill="#e7eaf2">IBKR <tspan fontSize="9" fill="#fca5a5">live</tspan></text>
+          <text x="26" y="18" fontSize="12" fontWeight="500" fill="#e7eaf2">Brokerage <tspan fontSize="9" fill="#fca5a5">live</tspan></text>
           <text x="26" y="32" fontSize="9" fill="#6c7388">Market data · positions · P&amp;L</text>
           <g clipPath="url(#ae-clip-ib)">
             <g className="ae-ticker" fontSize="9" fill="#fca5a5" fontFamily="ui-monospace, monospace">
@@ -436,7 +439,7 @@ function FloorSvg({
 
       {/* ANALYST POD */}
       <g transform="translate(40, 240)">
-        <text x="0" y="0" fontSize="11" fontWeight="600" fill="#6c7388" letterSpacing="0.08em">ANALYST POD · DEEPSEEK V4-FLASH</text>
+        <text x="0" y="0" fontSize="11" fontWeight="600" fill="#6c7388" letterSpacing="0.08em">ANALYST POD · QUICK REASONING</text>
 
         {/* Market */}
         <g className={cls("market")} onClick={click("market")} transform="translate(0, 14)">
@@ -624,7 +627,7 @@ function FloorSvg({
 
       {/* DEBATE */}
       <g transform="translate(40, 510)">
-        <text x="0" y="0" fontSize="11" fontWeight="600" fill="#6c7388" letterSpacing="0.08em">DEBATE STAGE · DEEPSEEK V4-PRO · DIALECTICAL COLLABORATION</text>
+        <text x="0" y="0" fontSize="11" fontWeight="600" fill="#6c7388" letterSpacing="0.08em">DEBATE STAGE · DEEP REASONING · DIALECTICAL COLLABORATION</text>
 
         <g className={cls("bull")} onClick={click("bull")} transform="translate(0, 14)">
           <rect className="ae-bg" width="380" height="220" rx="10" fill="#161a23" stroke="#232a3a" filter="url(#ae-shadow)" />
@@ -652,7 +655,7 @@ function FloorSvg({
             </g>
           </g>
           <text x="190" y="186" textAnchor="middle" fontSize="13" fontWeight="500" fill="#e7eaf2">Bull researcher</text>
-          <text x="190" y="200" textAnchor="middle" fontSize="10" fill="#98a0b3">Long thesis advocate · V4-Pro</text>
+          <text x="190" y="200" textAnchor="middle" fontSize="10" fill="#98a0b3">Long thesis advocate · deep reasoning</text>
           <circle className="ae-pulse" cx="360" cy="20" r="4" fill="#6c7388" />
         </g>
 
@@ -678,7 +681,7 @@ function FloorSvg({
             </g>
           </g>
           <text x="120" y="186" textAnchor="middle" fontSize="13" fontWeight="500" fill="#e7eaf2">Research manager</text>
-          <text x="120" y="200" textAnchor="middle" fontSize="10" fill="#98a0b3">Synthesis + conviction · V4-Pro</text>
+          <text x="120" y="200" textAnchor="middle" fontSize="10" fill="#98a0b3">Synthesis + conviction · deep reasoning</text>
           <circle className="ae-pulse" cx="220" cy="20" r="4" fill="#6c7388" />
         </g>
 
@@ -708,7 +711,7 @@ function FloorSvg({
             </g>
           </g>
           <text x="190" y="186" textAnchor="middle" fontSize="13" fontWeight="500" fill="#e7eaf2">Bear researcher</text>
-          <text x="190" y="200" textAnchor="middle" fontSize="10" fill="#98a0b3">Short thesis advocate · V4-Pro</text>
+          <text x="190" y="200" textAnchor="middle" fontSize="10" fill="#98a0b3">Short thesis advocate · deep reasoning</text>
           <circle className="ae-pulse" cx="360" cy="20" r="4" fill="#6c7388" />
         </g>
 
@@ -739,7 +742,7 @@ function FloorSvg({
 
       {/* RISK + PM */}
       <g transform="translate(40, 770)">
-        <text x="0" y="0" fontSize="11" fontWeight="600" fill="#6c7388" letterSpacing="0.08em">RISK COMMITTEE + PORTFOLIO MANAGER · V4-PRO</text>
+        <text x="0" y="0" fontSize="11" fontWeight="600" fill="#6c7388" letterSpacing="0.08em">RISK COMMITTEE + PORTFOLIO MANAGER · DEEP REASONING</text>
 
         <g className={cls("risk")} onClick={click("risk")} transform="translate(0, 14)">
           <rect className="ae-bg" width="800" height="200" rx="10" fill="#161a23" stroke="#232a3a" filter="url(#ae-shadow)" />
@@ -872,7 +875,7 @@ function FloorSvg({
           <circle className="ae-pulse" cx="780" cy="20" r="4" fill="#6c7388" />
         </g>
 
-        <g className={cls("ibkr")} onClick={click("ibkr")} transform="translate(820, 14)">
+        <g className={cls("broker")} onClick={click("broker")} transform="translate(820, 14)">
           <rect className="ae-bg" width="500" height="150" rx="10" fill="#161a23" stroke="#232a3a" filter="url(#ae-shadow)" />
           <g transform="translate(60, 14)">
             <rect width="180" height="124" rx="4" fill="#0b0d12" stroke="#232a3a" />
@@ -882,7 +885,7 @@ function FloorSvg({
             <text x="90" y="60" textAnchor="middle" fontSize="9" fontWeight="500" fill="#98a0b3">TRADING ONLY</text>
             <rect x="158" y="68" width="12" height="4" rx="2" fill="#fbbf24" />
             <rect x="36" y="92" width="108" height="20" rx="3" fill="#f87171" />
-            <text x="90" y="106" textAnchor="middle" fontSize="11" fontWeight="600" fill="#0b0d12">IBKR</text>
+            <text x="90" y="106" textAnchor="middle" fontSize="11" fontWeight="600" fill="#0b0d12">BROKER</text>
             <circle cx="22" cy="100" r="4" fill="#34d399" className="ae-blink" />
             <text x="22" y="120" textAnchor="middle" fontSize="6" fill="#6c7388">READY</text>
           </g>
@@ -894,13 +897,13 @@ function FloorSvg({
               <text x="10" y="32">12:14:08  TradeIntent received</text>
               <text x="10" y="44">12:14:08  whatIfOrder previewed ✓</text>
               <text x="10" y="56" fill="#34d399">12:14:08  Order placed: BUY CRDO 100</text>
-              <text x="10" y="68">12:14:09  IBKR order_id 8821, perm 4419</text>
-              <text x="10" y="80">12:14:09  Account D-prefix verified</text>
+              <text x="10" y="68">12:14:09  Broker order_id 8821, perm 4419</text>
+              <text x="10" y="80">12:14:09  Paper-prefix verified</text>
               <text x="10" y="92" fill="#f87171" fontWeight="600">      Live mode → BLOCKED</text>
             </g>
           </g>
-          <text x="250" y="186" textAnchor="middle" fontSize="13" fontWeight="500" fill="#e7eaf2">IBKR · paper-trade gateway</text>
-          <text x="250" y="200" textAnchor="middle" fontSize="10" fill="#98a0b3">Hard-gated: env=paper AND account D-prefix</text>
+          <text x="250" y="186" textAnchor="middle" fontSize="13" fontWeight="500" fill="#e7eaf2">Brokerage · paper-trade gateway</text>
+          <text x="250" y="200" textAnchor="middle" fontSize="10" fill="#98a0b3">Hard-gated: env=paper AND paper account prefix</text>
           <circle className="ae-pulse" cx="480" cy="20" r="4" fill="#6c7388" />
         </g>
       </g>

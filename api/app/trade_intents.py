@@ -104,10 +104,14 @@ async def build_pmcc(run_id: str, symbol: str, body: BuildPmccIn) -> dict[str, A
         raise HTTPException(422, f"PMCC ineligible: {elig.reason}")
     cand = elig.candidate
 
-    # Persist as pending_review intent
+    # Persist as pending_review intent. Same conservative cap as the
+    # auto-entry loop: operator-built PMCCs are entries, and entries can
+    # afford to abandon and re-try; better to skip a thin name than pay
+    # 40% of spread above mid. Operator can override walking_cfg per-build
+    # on the preview screen if they want a different posture.
     walking_cfg = {
         "initial_offset_cents": 1, "walk_increment_cents": 1,
-        "walk_interval_sec": 30, "max_offset_pct_of_spread": 0.50,
+        "walk_interval_sec": 30, "max_offset_pct_of_spread": 0.30,
         "timeout_sec": 300,
     }
     async with db_session() as s:
@@ -239,7 +243,10 @@ async def submit_intent(intent_id: str) -> dict[str, Any]:
         initial_offset_cents=cfg.get("initial_offset_cents", 1),
         walk_increment_cents=cfg.get("walk_increment_cents", 1),
         walk_interval_sec=cfg.get("walk_interval_sec", 30),
-        max_offset_pct_of_spread=cfg.get("max_offset_pct_of_spread", 0.50),
+        # Default 0.30 of half-spread (was 0.50): keep the operator path
+        # aligned with the auto-entry path's conservative cap. Per-intent
+        # overrides via walking_config still work.
+        max_offset_pct_of_spread=cfg.get("max_offset_pct_of_spread", 0.30),
         timeout_sec=cfg.get("timeout_sec", 300),
     )
     result = await submit_pmcc_combo(

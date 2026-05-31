@@ -166,17 +166,36 @@ export default function PerformancePage() {
                 </tr>
               </thead>
               <tbody className="text-[var(--color-fg)]">
-                {positions.map((p) => (
-                  <tr key={p.symbol} className="border-t border-[var(--color-border)]">
-                    <td className="py-3 font-medium">{p.symbol}</td>
-                    <td className="py-3">{p.qty}</td>
-                    <td className="py-3">{fmtMoney(p.avg_price)}</td>
-                    <td className="py-3">{fmtMoney(p.last_price)}</td>
-                    <td className={`py-3 text-right font-medium ${p.pnl >= 0 ? "text-[var(--color-up)]" : "text-[var(--color-down)]"}`}>
-                      {fmtMoneyDelta(p.pnl)}
-                    </td>
-                  </tr>
-                ))}
+                {positions.map((p) => {
+                  const isOption = p.sec_type === "OPT";
+                  // Each leg of a PMCC has its own conid; same symbol shows up
+                  // twice (LEAP long + short call short). Without a composite
+                  // key React collapses them and renders the wrong one.
+                  const key = p.conid && p.conid > 0
+                    ? `${p.sec_type ?? "STK"}-${p.conid}`
+                    : `${p.sec_type ?? "STK"}-${p.symbol}`;
+                  const label = isOption
+                    ? `${p.symbol} ${p.expiry ?? ""} $${p.strike ?? "?"} ${p.right ?? ""}`.trim()
+                    : p.symbol;
+                  return (
+                    <tr key={key} className="border-t border-[var(--color-border)]">
+                      <td className="py-3 font-medium">
+                        {label}
+                        {isOption && (
+                          <span className="ml-2 text-xs uppercase opacity-60">
+                            {p.qty > 0 ? "long" : "short"} option
+                          </span>
+                        )}
+                      </td>
+                      <td className="py-3">{p.qty}</td>
+                      <td className="py-3">{fmtMoney(p.avg_price)}</td>
+                      <td className="py-3">{fmtMoney(p.last_price)}</td>
+                      <td className={`py-3 text-right font-medium ${p.pnl >= 0 ? "text-[var(--color-up)]" : "text-[var(--color-down)]"}`}>
+                        {fmtMoneyDelta(p.pnl)}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

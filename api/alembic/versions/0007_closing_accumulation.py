@@ -28,8 +28,11 @@ def upgrade() -> None:
         "closing_accumulation_signals",
         sa.Column("id", sa.Integer, primary_key=True, autoincrement=True),
         sa.Column("symbol", sa.String(10), nullable=False),
-        sa.Column("date", sa.Date, nullable=False),
-        sa.Column("theme_id", sa.String(64), nullable=True),
+        # `date` is a tz-aware DateTime to match models.ClosingAccumulationSignal.
+        # The 15:50 ET sweep records a precise instant, not a calendar day —
+        # using sa.Date would silently truncate the time-of-day on Postgres.
+        sa.Column("date", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("theme_id", sa.String(64), sa.ForeignKey("themes.id", ondelete="SET NULL"), nullable=True),
         sa.Column("setup_passes", sa.Boolean, nullable=False),
         sa.Column("confidence", sa.String(8), nullable=False),    # high|medium|low|none
         sa.Column("gate1_passes", sa.Boolean, nullable=False),

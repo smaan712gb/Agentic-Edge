@@ -117,6 +117,32 @@ async def _tick() -> None:
     # monitored for exit triggers like everything else.
     orphans_adopted = await _adopt_orphan_positions(positions)
 
+    # Off-theme sweep: any stock long whose symbol isn't in any current
+    # theme gets walked out so the capital can recycle into theme-aligned
+    # candidates. Runs after orphan adoption so newly-adopted positions
+    # have already been screened against the universe.
+    try:
+        off_theme_closed = await _sweep_off_theme_stocks(positions, ib)
+        if off_theme_closed:
+            logger.info("off-theme sweep: %d position(s) submitted for close", off_theme_closed)
+    except Exception as e:
+        logger.exception("off-theme sweep failed: %s", e)
+
+    # Orphan PMCC reconciliation: catches the case where the walker's
+    # per-call post-walk reconcile didn't fire (older intents abandoned
+    # before that fix landed; or unusual race where reconcile itself
+    # erred). For every PMCC intent in abandoned/error state, check if
+    # its LEAP + short-call conids actually exist in the IBKR account —
+    # if so, the trade filled and we need to flip the intent to filled
+    # so maintenance logic can manage it. Without this, abandoned-but-
+    # filled PMCCs sit naked, unmanaged.
+    try:
+        reconciled = await _reconcile_orphan_pmcc_intents(positions)
+        if reconciled:
+            logger.info("PMCC reconcile: marked %d previously-abandoned intent(s) as filled", reconciled)
+    except Exception as e:
+        logger.exception("PMCC reconcile failed: %s", e)
+
     # Macro regime read once per tick — VIX + SPX overlay applied across
     # all per-position evaluations downstream. Best-effort fetch; on
     # failure we get a 'calm' default and the audit row records the
@@ -233,22 +259,46 @@ async def _adopt_orphan_positions(ibkr_positions: list[dict]) -> int:
     """
     if not ibkr_positions:
         return 0
-    sym_to_pos = {(p.get("symbol") or "").upper(): p
-                  for p in ibkr_positions if p.get("symbol")}
-    if not sym_to_pos:
+    # Iterate per-position, not per-symbol — a PMCC has two positions on
+    # the same underlying (LEAP long + short call short) and a sym-keyed
+    # dict would lose one of them, then the survivor gets misadopted as
+    # a stock at the option's premium-per-contract price.
+    stock_positions: list[dict] = []
+    for p in ibkr_positions:
+        sym = (p.get("symbol") or "").strip()
+        if not sym:
+            continue
+        # Provider returns `secType` (camelCase from ib_insync); we also
+        # accept snake_case for callers that already lower-cased it. If
+        # the key is missing we treat it as UNKNOWN (skip), NOT as STK —
+        # the old default-to-STK behaviour is what was misadopting LEAP
+        # legs as stock orphans and causing accidental short sales.
+        sec_type = str(p.get("secType") or p.get("sec_type") or "").upper()
+        if sec_type != "STK":
+            continue
+        stock_positions.append(p)
+    if not stock_positions:
         return 0
+
+    syms = sorted({(p.get("symbol") or "").upper() for p in stock_positions})
 
     from api.app.db import ThemeSymbol
 
     async with db_session() as s:
-        # Symbols that already have an OPEN intent (any open lifecycle state)
+        # Symbols already covered by a non-terminal intent. Include
+        # PMCC-related states so that an abandoned/error PMCC intent
+        # (which may flip to filled on the same tick via the orphan-PMCC
+        # reconcile) still blocks a fake stock-orphan from being created
+        # for the LEAP leg's underlying.
         rows = (
             await s.execute(
                 select(TradeIntent.symbol)
-                .where(TradeIntent.symbol.in_(list(sym_to_pos.keys())))
-                .where(TradeIntent.status.in_(["filled", "submitted", "submitting"]))
+                .where(TradeIntent.symbol.in_(syms))
+                .where(TradeIntent.status.in_(
+                    ["filled", "submitted", "submitting", "abandoned", "error", "closing"]))
                 .where(TradeIntent.position_state.in_(
-                    ["pmcc_full", "leap_pending", "leap_open_naked", "pending"]))
+                    ["pmcc_full", "leap_pending", "leap_open_naked", "pending",
+                     "abandoned", "closing"]))
             )
         ).all()
         owned = {(r[0] or "").upper() for r in rows}
@@ -256,15 +306,15 @@ async def _adopt_orphan_positions(ibkr_positions: list[dict]) -> int:
         # Theme universe — only adopt positions in this set.
         theme_rows = (
             await s.execute(
-                select(ThemeSymbol.symbol)
-                .where(ThemeSymbol.symbol.in_(list(sym_to_pos.keys())))
+                select(ThemeSymbol.symbol).where(ThemeSymbol.symbol.in_(syms))
             )
         ).all()
         in_theme_universe = {(r[0] or "").upper() for r in theme_rows if r[0]}
 
         new_count = 0
         skipped_non_theme = 0
-        for sym, pos in sym_to_pos.items():
+        for pos in stock_positions:
+            sym = (pos.get("symbol") or "").upper()
             if sym in owned:
                 continue
             if sym not in in_theme_universe:
@@ -273,12 +323,7 @@ async def _adopt_orphan_positions(ibkr_positions: list[dict]) -> int:
             qty = float(pos.get("qty") or 0)
             if qty == 0:
                 continue
-            sec_type = str(pos.get("sec_type") or "STK").upper()
-            # Phase A only adopts equity. Option leg adoption needs the
-            # combo's expiry/strike/right metadata, which we treat as a
-            # separate (operator-confirmed) import path.
-            if sec_type != "STK":
-                continue
+            sec_type = "STK"  # Already filtered above; recorded for clarity below.
             avg = float(pos.get("avg_price") or 0)
             intent = TradeIntent(
                 symbol=sym,
@@ -309,6 +354,318 @@ async def _adopt_orphan_positions(ibkr_positions: list[dict]) -> int:
             new_count, skipped_non_theme,
         )
     return new_count
+
+
+# ---------------------------------------------------------------------------
+# Off-theme position sweep
+# ---------------------------------------------------------------------------
+
+
+async def _sweep_off_theme_stocks(ibkr_positions: list[dict], ib: Any) -> int:
+    """Close stock positions whose symbol is not in any current theme.
+
+    Off-theme positions consume buying power that could be redeployed
+    against high-conviction theme candidates. The orphan-adopt step
+    already excludes them (no TradeIntent is created), so they sit in
+    the account untracked forever. This sweep walks them out with a
+    marketable limit sell.
+
+    Closes regardless of unrealized P&L — operator policy is "capital
+    follows mandate"; anchoring on a single lot's drawdown defeats the
+    rotation. Lots that subsequently rejoin a theme can be re-bought via
+    the normal entry loop.
+
+    Skips:
+      * non-equity sec_types
+      * positions with an active TradeIntent (handled by _evaluate_stock)
+      * negative qty (shorts — separate flow)
+
+    Returns the count of close orders submitted.
+    """
+    from api.app.db import ThemeSymbol
+    from sqlalchemy import distinct
+
+    # Build (sym, qty, pos) for longs only, sec_type=STK. Note: the IBKR
+    # provider returns positions with key "secType" (camelCase from
+    # ib_insync), not "sec_type" — orphan_adopt's snake_case lookup works
+    # by accident because it defaults to "STK" on miss.
+    stock_longs: list[tuple[str, float, dict]] = []
+    for p in ibkr_positions:
+        sec_type = str(p.get("secType") or p.get("sec_type") or "").upper()
+        if sec_type != "STK":
+            continue
+        qty = float(p.get("qty") or 0)
+        if qty <= 0:
+            continue
+        sym = (p.get("symbol") or "").upper()
+        if not sym:
+            continue
+        stock_longs.append((sym, qty, p))
+    if not stock_longs:
+        return 0
+
+    syms = [s for s, _, _ in stock_longs]
+    async with db_session() as s:
+        # Symbols in any active theme universe.
+        in_universe_rows = (
+            await s.execute(
+                select(distinct(ThemeSymbol.symbol)).where(ThemeSymbol.symbol.in_(syms))
+            )
+        ).all()
+        in_universe = {(r[0] or "").upper() for r in in_universe_rows if r[0]}
+
+        # Symbols already under management (active intent). Those route
+        # through _evaluate_stock / _evaluate_pmcc; don't double-close.
+        managed_rows = (
+            await s.execute(
+                select(TradeIntent.symbol)
+                .where(TradeIntent.symbol.in_(syms))
+                .where(TradeIntent.status.in_(["filled", "submitted", "submitting", "closing"]))
+                .where(TradeIntent.position_state.in_(
+                    ["pmcc_full", "leap_pending", "leap_open_naked", "pending", "closing"]
+                ))
+            )
+        ).all()
+        managed = {(r[0] or "").upper() for r in managed_rows}
+
+    off_theme = [(sym, qty, pos) for sym, qty, pos in stock_longs
+                 if sym not in in_universe and sym not in managed]
+    if not off_theme:
+        return 0
+
+    logger.info(
+        "off-theme sweep: %d position(s) not in any theme: %s",
+        len(off_theme), [s for s, _, _ in off_theme],
+    )
+
+    closed = 0
+    for sym, qty, pos in off_theme:
+        try:
+            await _execute_off_theme_close(sym=sym, qty=qty, pos=pos, ib=ib)
+            closed += 1
+        except Exception as e:
+            logger.exception("off-theme close failed for %s: %s", sym, e)
+    return closed
+
+
+async def _execute_off_theme_close(*, sym: str, qty: float, pos: dict, ib: Any) -> None:
+    """Submit a marketable LMT SELL to close one off-theme stock position.
+
+    Creates a synthetic TradeIntent so the close has a full audit trail
+    (TradeAuditLog + auto_actions) symmetric with every other system trade.
+    """
+    from ib_insync import Stock  # type: ignore
+    from tradingagents.dataflows.providers.base import TradeIntent as IntentDC
+
+    ib_inst = await ib._ensure_connected()
+    contract = Stock(sym, "SMART", "USD")
+    qualified = await ib_inst.qualifyContractsAsync(contract)
+    if not qualified:
+        logger.warning("off-theme close: could not qualify %s", sym)
+        return
+    contract = qualified[0]
+    ticker = ib_inst.reqMktData(contract, "", False, False)
+    await asyncio.sleep(1.5)
+    bid = float(ticker.bid or 0)
+    ask = float(ticker.ask or 0)
+    last = float(ticker.last or 0)
+    try: ib_inst.cancelMktData(contract)
+    except Exception: pass
+
+    if bid > 0:
+        limit = round(bid - 0.01, 2)
+    elif last > 0:
+        limit = round(last - 0.01, 2)
+    else:
+        logger.warning("off-theme close: no quote for %s; skipping", sym)
+        return
+
+    avg = float(pos.get("avg_price") or 0)
+    async with db_session() as s:
+        intent = TradeIntent(
+            symbol=sym, side="SELL", qty=int(qty),
+            limit_px=limit,
+            status="closing", structure="stock",
+            position_state="closing",
+            entry_strategy="off_theme_close",
+            rationale=(
+                f"Off-theme cleanup: {sym} not in any active theme universe. "
+                f"Closing {qty:.0f} sh (cost basis ${avg:.2f}) to free capital "
+                f"for theme-aligned candidates."
+            ),
+            walking_config={
+                "source": "off_theme_sweep",
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+                "avg_price": avg, "bid_at_close": bid, "last_at_close": last,
+            },
+        )
+        s.add(intent)
+        await s.flush()
+        intent_id = intent.id
+        s.add(TradeAuditLog(
+            intent_id=intent_id, action="off_theme_close_attempt",
+            payload={"symbol": sym, "qty": qty, "limit": limit, "avg": avg,
+                     "bid": bid, "ask": ask},
+        ))
+
+    intent_dc = IntentDC(
+        ticker=sym, side="SELL", qty=int(qty),
+        order_type="LMT", limit_px=limit, tif="DAY", account_mode="paper",
+    )
+    try:
+        result = await ib.submit_trade(intent_dc)
+    except Exception as e:
+        logger.exception("off-theme close submit failed for %s: %s", sym, e)
+        async with db_session() as s:
+            s.add(TradeAuditLog(
+                intent_id=intent_id, action="off_theme_close_outcome",
+                outcome="error", error=str(e),
+            ))
+        return
+
+    order_id = str(result.get("ibkr_order_id") or "")
+    async with db_session() as s:
+        s.add(TradeAuditLog(
+            intent_id=intent_id, action="off_theme_close_outcome",
+            outcome="submitted",
+            payload={"order_id": order_id, "limit": limit, "qty": qty},
+        ))
+        await record_auto_action(
+            s, loop="maintenance", action_type="off_theme_stock_close",
+            gate_result=_synthetic_passed_gate(), symbol=sym,
+            intent_id=intent_id,
+            payload={"qty": qty, "limit": limit, "avg": avg,
+                     "reason": "off_theme_cleanup"},
+            outcome="submitted", ibkr_order_id=order_id,
+        )
+    await alert(
+        level="info",
+        title=f"Off-theme close: {sym}",
+        body=f"{qty:.0f} sh @ LMT ${limit} (cost basis ${avg:.2f}). Not in any active theme.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Orphan PMCC reconciliation
+# ---------------------------------------------------------------------------
+
+
+async def _reconcile_orphan_pmcc_intents(ibkr_positions: list[dict]) -> int:
+    """Flip abandoned/error PMCC intents to filled when broker holds the legs.
+
+    The walker now has a post-walk reconcile inside each execution call,
+    but two cases still need a sweep-level catch-up:
+
+      1. Intents abandoned BEFORE the per-walker reconcile fix landed
+         (legacy state from yesterday's session). Without this sweep
+         they'd never re-enter the maintenance flow.
+
+      2. Edge cases where the per-walker reconcile itself errored
+         (IBKR temporarily unreachable during the post-walk check).
+         The position is in the account; the intent is stuck.
+
+    Match strategy: intent.walking_config carries ``leap_conid`` and
+    ``short_call_conid``. If both conids appear in the current IBKR
+    positions list with non-zero qty in the expected directions
+    (LEAP qty>0, short call qty<0), the trade actually filled.
+
+    Returns the count of intents reconciled.
+    """
+    # Build a conid -> position map from the current IBKR snapshot.
+    by_conid: dict[int, dict] = {}
+    for p in ibkr_positions:
+        cid = int(p.get("conid") or 0)
+        if cid:
+            by_conid[cid] = p
+    if not by_conid:
+        return 0
+
+    async with db_session() as s:
+        # Pull every abandoned/error PMCC intent. Cheap — the table is small
+        # and we filter by status.
+        rows = (
+            await s.execute(
+                select(TradeIntent)
+                .where(TradeIntent.structure.in_(["pmcc", "pmcc_sequenced"]))
+                .where(TradeIntent.status.in_(["abandoned", "error"]))
+                .where(TradeIntent.position_state.in_(["abandoned", "pending"]))
+            )
+        ).scalars().all()
+
+        reconciled_count = 0
+        for intent in rows:
+            cfg = intent.walking_config or {}
+            leap_conid = int(cfg.get("leap_conid") or 0)
+            short_conid = int(cfg.get("short_call_conid") or 0)
+            if not leap_conid or not short_conid:
+                continue
+            leap_pos = by_conid.get(leap_conid)
+            short_pos = by_conid.get(short_conid)
+            if leap_pos is None or short_pos is None:
+                continue
+            leap_qty = float(leap_pos.get("qty") or 0)
+            short_qty = float(short_pos.get("qty") or 0)
+            if leap_qty <= 0 or short_qty >= 0:
+                # Wrong direction — not a clean PMCC pair on these conids.
+                continue
+
+            # avg_price for options from IBKR is total cost basis per
+            # contract (premium × multiplier of 100). Convert to per-share.
+            leap_cost_total = float(leap_pos.get("avg_price") or 0)
+            short_cost_total = float(short_pos.get("avg_price") or 0)
+            leap_premium = round(leap_cost_total / 100.0, 2) if leap_cost_total else None
+            short_premium = round(short_cost_total / 100.0, 2) if short_cost_total else None
+            net_debit = None
+            if leap_premium is not None and short_premium is not None:
+                net_debit = round(leap_premium - short_premium, 2)
+
+            now = datetime.now(timezone.utc)
+            intent.status = "filled"
+            intent.position_state = "pmcc_full"
+            intent.leap_fill_price = leap_premium
+            intent.short_call_fill_price = short_premium
+            intent.net_debit_filled = net_debit
+            if intent.leap_filled_at is None:
+                intent.leap_filled_at = now
+            if intent.short_call_filled_at is None:
+                intent.short_call_filled_at = now
+            cfg = dict(cfg)
+            cfg["reconciled_at"] = now.isoformat()
+            cfg["reconcile_source"] = "maint_loop_orphan_pmcc"
+            intent.walking_config = cfg
+
+            s.add(TradeAuditLog(
+                intent_id=intent.id, action="orphan_pmcc_reconciled",
+                outcome="filled",
+                payload={
+                    "leap_conid": leap_conid, "short_call_conid": short_conid,
+                    "leap_qty": leap_qty, "short_qty": short_qty,
+                    "leap_premium": leap_premium, "short_premium": short_premium,
+                    "net_debit": net_debit,
+                    "note": (
+                        "Broker positions show this PMCC actually filled; "
+                        "intent was marked abandoned by walker timeout. "
+                        "Flipping to filled so maintenance can manage it."
+                    ),
+                },
+            ))
+            await record_auto_action(
+                s, loop="maintenance",
+                action_type="orphan_pmcc_reconciled",
+                gate_result=_synthetic_passed_gate(),
+                symbol=intent.symbol, intent_id=intent.id,
+                payload={"leap_premium": leap_premium, "short_premium": short_premium,
+                         "net_debit": net_debit, "qty_leap": leap_qty, "qty_short": short_qty},
+                outcome="reconciled",
+            )
+            reconciled_count += 1
+            logger.warning(
+                "PMCC reconcile: %s intent %s flipped to filled "
+                "(broker has both legs; net debit ${:.2f})".format(net_debit or 0.0),
+                intent.symbol, intent.id[:8],
+            )
+
+    return reconciled_count
 
 
 # ---------------------------------------------------------------------------

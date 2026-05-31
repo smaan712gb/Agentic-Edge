@@ -9,11 +9,11 @@ import { fmtMoney } from "@/lib/utils";
  * One-click PMCC builder that lives next to each Buy decision in the
  * Run scorecard. Three states:
  *
- *   1. "Build" — initial; click probes IBKR chain, picks legs, returns intent.
+ *   1. "Build" — initial; click probes the option chain, picks legs, returns intent.
  *   2. Preview — shows the legs, max loss, walking config; user clicks Submit.
  *   3. Submitted — fires the executor; polls for fill or abandon; surfaces result.
  *
- * Errors surface inline (eligibility failure, gate rejection, IBKR not
+ * Errors surface inline (eligibility failure, gate rejection, broker not
  * reachable) so the operator sees the reason without leaving the page.
  */
 export function PmccBuilder({
@@ -58,7 +58,7 @@ export function PmccBuilder({
   const onSubmit = async () => {
     if (!intent) return;
     if (!confirm(
-      `Submit PMCC combo to IBKR paper?\n\n` +
+      `Submit PMCC combo to the paper account?\n\n` +
       `${symbol} × ${contracts} spreads\n` +
       `LEAP $${intent.leap.strike} ${intent.leap.expiry}\n` +
       `Short $${intent.short_call.strike} ${intent.short_call.expiry}\n` +
@@ -96,10 +96,10 @@ export function PmccBuilder({
           className="btn btn-primary"
           disabled={building}
           onClick={onBuild}
-          title="Probe IBKR option chain and pick PMCC legs"
+          title="Probe the option chain and pick PMCC legs"
         >
           {building ? <Loader2 className="h-4 w-4 animate-spin" /> : <Layers className="h-4 w-4" />}
-          {building ? "Probing IBKR…" : "Build PMCC"}
+          {building ? "Probing chain…" : "Build PMCC"}
         </button>
         {error && <span className="chip border-[var(--color-down)]/40 text-[var(--color-down)] text-[10px]"><AlertTriangle className="h-3 w-3" /> {error.slice(0, 80)}</span>}
       </div>
@@ -137,7 +137,7 @@ export function PmccBuilder({
             </button>
             <button className="btn btn-primary" onClick={onSubmit} disabled={submitting}>
               {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-              {submitting ? "Walking the limit…" : "Submit to IBKR"}
+              {submitting ? "Walking the limit…" : "Submit to broker"}
             </button>
           </div>
         )}

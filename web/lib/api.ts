@@ -45,7 +45,9 @@ export type Run = {
   theme_id: string;
   started_at: string;
   finished_at: string | null;
-  status: "queued" | "running" | "done" | "error";
+  // Lifecycle: runs are inserted in "running" state directly (no queue),
+  // transition to "done" on success or "error" on failure.
+  status: "running" | "done" | "error";
   progress: number;
   events: AgentEvent[];
   scores: SymbolScore[];
@@ -60,6 +62,16 @@ export type Position = {
   avg_price: number;
   last_price: number;
   pnl: number;
+  // Option-leg metadata (empty/null for stock positions). For PMCC entries
+  // the same underlying produces two rows (LEAP long + short call short) —
+  // conid is the only unique key across them.
+  sec_type?: "STK" | "OPT" | "FUT" | string;
+  conid?: number;
+  local_symbol?: string;
+  expiry?: string;       // YYYYMMDD when sec_type=OPT
+  strike?: number | null;
+  right?: "C" | "P" | "";
+  multiplier?: string;
 };
 export type TodayPerf = {
   equity: number;
@@ -147,6 +159,63 @@ export type ThemeRegime = {
   captured_at: string;
 };
 
+// --- Hedge Fund Signal Tracker -------------------------------------------
+
+export type ManagerChange = {
+  ticker: string | null;
+  cusip: string;
+  issuer_name: string | null;
+  prior_shares: number;
+  current_shares: number;
+  change_pct: number | null;
+  change_type: "new" | "add" | "trim" | "exit" | "hold";
+  current_period: string | null;
+};
+
+export type Manager = {
+  slug: string;
+  name: string;
+  macro_only: boolean;
+  active: boolean;
+  primary_themes: string[];
+  ciks: string[];
+  last_filing_at: string | null;
+  top_changes: ManagerChange[];
+};
+
+export type ManagerHolding = {
+  issuer_name: string;
+  ticker: string | null;
+  cusip: string;
+  value_usd: number;
+  shares: number;
+  put_call_flag: string;
+  pct_of_portfolio: number | null;
+  period_end: string | null;
+};
+
+export type OverlapRow = {
+  cusip: string;
+  issuer_name: string;
+  ticker: string | null;
+  managers: { slug: string; name: string; value_usd: number; shares: number; pct_of_portfolio: number | null }[];
+  aggregate_value_usd: number;
+  aggregate_shares: number;
+  manager_count: number;
+  confirmation: boolean;
+};
+
+export type SmartMoney = {
+  matched: boolean;
+  ticker: string | null;
+  cusip: string | null;
+  confirmation: boolean;
+  manager_count: number;
+  aggregate_value_usd: number;
+  aggregate_shares: number;
+  managers: { slug: string; name: string; value_usd: number; shares: number; put_call_flag: string; pct_of_portfolio: number | null; period_end: string | null }[];
+};
+
 async function jfetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
@@ -203,6 +272,19 @@ export const api = {
   },
   scheduler: {
     status: () => jfetch<SchedulerStatus>("/api/scheduler/status"),
+  },
+  managers: {
+    list: () => jfetch<Manager[]>("/api/managers"),
+    holdings: (slug: string, limit = 100) =>
+      jfetch<Manager & { holdings: ManagerHolding[] }>(`/api/managers/${slug}/holdings?limit=${limit}`),
+    overlap: (opts?: { theme?: string; minManagers?: number }) => {
+      const p = new URLSearchParams();
+      if (opts?.theme) p.set("theme", opts.theme);
+      if (opts?.minManagers) p.set("min_managers", String(opts.minManagers));
+      const qs = p.toString();
+      return jfetch<OverlapRow[]>(`/api/overlap${qs ? `?${qs}` : ""}`);
+    },
+    forSymbol: (symbol: string) => jfetch<SmartMoney>(`/api/managers/symbol/${symbol}`),
   },
   admin: {
     autotradeStatus: (token: string) =>

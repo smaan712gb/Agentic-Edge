@@ -1,0 +1,54 @@
+# Hedge Fund Signal Tracker — tracked managers (config is the source of truth).
+#
+# Edited here, not in the DB: on app startup these rows are upserted into
+# hedge_fund_managers / manager_ciks. Add a manager = add a [[manager]] block
+# and restart. A manager is a logical entity that can file under several CIKs.
+#
+# Fields:
+#   slug              stable id used in URLs/API (kebab-case)
+#   name              display name
+#   ciks              list of 10-digit (or shorter, auto-padded) SEC CIKs;
+#                     use "lookup" to resolve by name on first sweep
+#   macro_only        track for context, emit no single-name signal
+#   themes            Agentic Edge theme ids this manager leans into
+#   weighting_profile per-bucket conviction multipliers (informational Phase 1)
+
+[[manager]]
+slug = "gerstner-altimeter"
+name = "Brad Gerstner — Altimeter Capital"
+ciks = ["0001541617"]
+themes = ["ai-memory-wall", "custom-silicon-supply", "private-ai-compute"]
+weighting_profile = { ai_infra = 1.0, consumer_internet = 1.2, late_stage_growth = 1.2 }
+
+[[manager]]
+slug = "laffont-coatue"
+name = "Philippe Laffont — Coatue Management"
+# Coatue files 13F across many sub-advisers; the parser dedupes holdings by
+# CUSIP at this parent level so the position is the sum, not double-counted.
+ciks = ["0001135730"]
+themes = ["ai-memory-wall", "custom-silicon-supply", "ai-interconnect"]
+weighting_profile = { ai_infra = 1.1, consumer_internet = 1.1 }
+
+[[manager]]
+slug = "aschenbrenner-situational-awareness"
+name = "Leopold Aschenbrenner — Situational Awareness"
+# Two related CIKs treated as ONE logical manager (holdings aggregate).
+ciks = ["0002038540", "0002045724"]
+themes = ["ai-memory-wall", "data-center-power-wall", "nuclear-for-ai"]
+weighting_profile = { ai_infra = 1.4, power = 1.3 }
+
+[[manager]]
+slug = "baker-atreides"
+name = "Gavin Baker — Atreides Management"
+# CIK resolved by name on first sweep; until resolved the manager stays
+# inactive rather than erroring the run.
+ciks = ["lookup"]
+themes = ["advanced-packaging", "ai-test-metrology", "ai-interconnect"]
+weighting_profile = { hardware_bottleneck = 1.4, ai_infra = 1.1 }
+
+[[manager]]
+slug = "de-shaw"
+name = "D.E. Shaw & Co."
+ciks = ["0001009207"]
+macro_only = true   # book is futures/swaps-heavy; no single-name signal
+themes = []

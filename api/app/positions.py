@@ -79,12 +79,31 @@ async def positions_real() -> list[dict[str, Any]]:
             last_price = float(r.get("last_price") or 0)
             pnl = float(r.get("pnl") or (last_price - avg_price) * qty)
             account_id = str(r.get("account_id") or "default")
+            sec_type = str(r.get("secType") or "").upper()
             out.append({
                 "symbol": symbol, "qty": qty, "avg_price": avg_price,
                 "last_price": last_price, "pnl": pnl,
+                # Option leg metadata. For stocks these are empty/None;
+                # for options they let the UI render leg-level rows and
+                # disambiguate the two-legs-same-symbol case (PMCC).
+                "sec_type": sec_type or "STK",
+                "conid": int(r.get("conid") or 0),
+                "local_symbol": r.get("local_symbol") or "",
+                "expiry": r.get("expiry") or "",
+                "strike": r.get("strike"),
+                "right": r.get("right") or "",
+                "multiplier": r.get("multiplier") or "",
             })
-            # Upsert position snapshot. Use SQLAlchemy core dialect-specific
-            # path so the same code works on SQLite (dev) and Postgres (prod).
+            # Snapshot to DB — stocks only. The Position table has a
+            # UNIQUE(user_id, account_id, symbol) constraint which collides
+            # for the two-options-on-same-underlying case (PMCC = LEAP +
+            # short call). Options positions are tracked via TradeIntent
+            # (LEAP/short call fields on the intent row); snapshotting
+            # them here would either overwrite a stock row or trigger a
+            # constraint violation. Stocks-only is the correct scope for
+            # this snapshot table.
+            if sec_type and sec_type != "STK":
+                continue
             stmt = (
                 sqlite_upsert(Position).values(
                     user_id=None, account_id=account_id, symbol=symbol,

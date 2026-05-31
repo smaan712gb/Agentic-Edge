@@ -272,7 +272,22 @@ async def _process_one(
         return False
 
     # 1 contract for math; we re-size below based on NAV.
-    elig = await select_pmcc_legs(symbol=symbol, contracts=1, ibkr=ib)
+    # Wrap eligibility probe — symbols without listed options (ADRs like
+    # ABBNY, BESIY) raise ProviderError here. That's an "ineligible name",
+    # not a system error; treat it as ineligible and move on so one bad
+    # symbol doesn't crash the entire entry tick.
+    try:
+        elig = await select_pmcc_legs(symbol=symbol, contracts=1, ibkr=ib)
+    except Exception as e:
+        logger.info("auto-entry: %s PMCC probe failed — %s", symbol, e)
+        async with db_session() as s:
+            await record_auto_action(
+                s, loop="entry", action_type="open_pmcc_ineligible",
+                gate_result=gate, symbol=symbol,
+                payload={"run_id": run_id, "reason": f"probe_error: {e}"},
+                outcome="ineligible",
+            )
+        return True  # treat as processed; don't retry this symbol today
     if not elig.eligible or elig.candidate is None:
         # PMCC failed eligibility. For high-conviction names (composite ≥ 7),
         # fall back to a small stock buy — better to participate at reduced
@@ -326,15 +341,20 @@ async def _process_one(
         symbol, n_contracts, nav, sizing_factor, cand.net_debit, total_debit, macro_regime,
     )
 
-    # Persist intent.
+    # Persist intent. Keep this dict in sync with the ExecutionConfig
+    # constructed below — they're the same config in two forms (audit JSON
+    # vs dataclass). 5¢ steps because options >$3 have a 5¢ exchange min
+    # tick, so 1¢ walks were no-ops.
+    #
+    # Cap of 0.30 of half-spread (was 0.60): entries are the discretionary
+    # leg of every trade — we'd rather abandon a thin name and re-try next
+    # tick than pay 40% of spread above mid. Exits and rolls stay at 0.50
+    # in maint_loop because exits can't afford to abandon. The thin-combo
+    # path inside walking_limit.py separately caps its auto-widened cap at
+    # 0.50 so it can't push beyond the operator's intent.
     walking_cfg = {
-        "initial_offset_cents": 1, "walk_increment_cents": 1,
-        # 0.50 = walk up to 50% of half-spread above mid. The previous 0.25
-        # capped at ~1% above mid for thin LEAP combos and abandoned every
-        # walk on names like HPE/ANET/AEHR. Per "high conviction, accept
-        # non-ideal price" policy — the walking-limit + abandon is the
-        # protection, not a tight cap.
-        "walk_interval_sec": 30, "max_offset_pct_of_spread": 0.50,
+        "initial_offset_cents": 5, "walk_increment_cents": 5,
+        "walk_interval_sec": 30, "max_offset_pct_of_spread": 0.30,
         "timeout_sec": 300,
         "leap_conid": cand.leap.conid, "short_call_conid": cand.short_call.conid,
         "spot_at_build": cand.spot, "auto_origin": "entry_loop",
@@ -377,8 +397,8 @@ async def _process_one(
         {"conid": cand.short_call.conid,  "ratio": 1, "action": "SELL"},
     ]
     exec_cfg = ExecutionConfig(
-        initial_offset_cents=1, walk_increment_cents=1,
-        walk_interval_sec=30, max_offset_pct_of_spread=0.50, timeout_sec=300,
+        initial_offset_cents=5, walk_increment_cents=5,
+        walk_interval_sec=30, max_offset_pct_of_spread=0.30, timeout_sec=300,
     )
     try:
         result = await submit_pmcc_combo(
@@ -423,11 +443,38 @@ async def _process_one(
         )
 
     if result.status == "filled":
+        # Slippage telemetry — record the difference between the cap's
+        # anchor (mid at submit time) and the actual fill price. For BUY
+        # combos, positive slippage means we paid above mid. The walker
+        # carries the initial mid in result.mid_at_submit. Bias-protect by
+        # treating None as 0.
+        slippage_per_spread = None
+        if result.fill_price is not None and result.mid_at_submit is not None:
+            slippage_per_spread = round(result.fill_price - result.mid_at_submit, 4)
         await alert(
             level="info",
             title=f"PMCC filled: {symbol}",
-            body=f"@${result.fill_price:.2f} after {result.walk_steps} walk steps ({result.elapsed_sec:.0f}s)",
+            body=(
+                f"@${result.fill_price:.2f} after {result.walk_steps} walk steps "
+                f"({result.elapsed_sec:.0f}s)"
+                + (f" · slippage vs mid +${slippage_per_spread:.3f}/spread"
+                   if slippage_per_spread is not None else "")
+            ),
         )
+        # Slippage alarm — surface any fill that paid more than 5¢ above
+        # the mid at submit time. 5¢ per spread × 10 contracts × 100 mult
+        # = $50 of avoidable cost; worth an operator-visible warning so
+        # the cap or drift threshold can be re-tuned if this fires often.
+        if slippage_per_spread is not None and slippage_per_spread > 0.05:
+            await alert(
+                level="warning",
+                title=f"PMCC slippage > 5¢: {symbol}",
+                body=(
+                    f"filled @${result.fill_price:.2f} vs mid ${result.mid_at_submit:.2f} "
+                    f"(+${slippage_per_spread:.3f}/spread × {n_contracts} contracts × $100 "
+                    f"= ${slippage_per_spread * n_contracts * 100:.0f} above mid)"
+                ),
+            )
     elif result.status == "abandoned":
         await alert(
             level="warning",
@@ -685,7 +732,12 @@ async def _resolve_stuck_intents() -> None:
 
 
 async def _daily_cap_exhausted() -> bool:
-    """Quick check: have we already passed the daily new-entry cap?"""
+    """Quick check: have we already passed the daily new-entry cap?
+
+    Mirrors the bookkeeping-exclusion logic in ``auto_gate._gate_strategy_budget``
+    so this short-circuit doesn't trip on background informational rows
+    (``*_ineligible``, ``*_hold``, etc.) that aren't real entry attempts.
+    """
     from .auto_gate import DEFAULT_CAPS
     from sqlalchemy import func
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -698,6 +750,9 @@ async def _daily_cap_exhausted() -> bool:
                 .where(AutoAction.timestamp >= today)
                 .where(AutoAction.gate_status == "passed")
                 .where(AutoAction.loop == "entry")
+                .where(~AutoAction.action_type.like("%_gate_passed"))
+                .where(~AutoAction.action_type.like("%_ineligible"))
+                .where(~AutoAction.action_type.like("%_hold"))
             )
         ).scalar_one()
     return n >= DEFAULT_CAPS["AUTO_MAX_NEW_ENTRIES_PER_DAY"]

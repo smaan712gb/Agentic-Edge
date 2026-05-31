@@ -44,6 +44,20 @@ logger = logging.getLogger("agentic_edge.scheduler")
 
 _SCHEDULER: Optional[AsyncIOScheduler] = None
 _JOB_ID = "theme_daily_run"
+_CBA_JOB_ID = "closing_accumulation_hourly"
+# Hourly during US RTH, Mon-Fri. CBA gate 2 (AH follow-through) only
+# populates after 16:00 ET, so the 16:00 + 17:00 firings are the most
+# meaningful for entry signal. Earlier-hour runs still capture gate 1
+# (RVOL, VWAP position) so the operator can see intraday accumulation
+# building before the close.
+_CBA_CRON = "0 10-17 * * 1-5"
+
+_EDGAR_JOB_ID = "edgar_signal_sweep"
+# Every 15 min during extended hours, Mon-Fri. EDGAR filings post on a slow
+# cadence (13F quarterly; 13D/Form-4 sporadic) and the sweep skips anything
+# already stored, so this is well under SEC's fair-access limit while still
+# catching a new 13D within minutes during the trading day.
+_EDGAR_CRON = "*/15 8-20 * * 1-5"
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +76,24 @@ async def start_scheduler() -> None:
     _SCHEDULER = AsyncIOScheduler(timezone="America/New_York")
     if state.scheduler_enabled:
         _add_or_update_job(state.scheduler_cron)
+    # Closing-Bell Accumulation sweep: hourly during RTH, always-on
+    # (independent of theme_daily_run's enabled flag — operator wants
+    # this signal whether or not auto-fire is on).
+    _SCHEDULER.add_job(
+        _run_cba_sweep_job,
+        trigger=CronTrigger.from_crontab(_CBA_CRON, timezone="America/New_York"),
+        id=_CBA_JOB_ID, replace_existing=True,
+        misfire_grace_time=300, max_instances=1, coalesce=True,
+    )
+    # Hedge Fund Signal Tracker sweep — always-on, independent of the
+    # auto-fire flag (this is decision-support, not execution).
+    if get_settings().EDGAR_POLL_ENABLED:
+        _SCHEDULER.add_job(
+            _run_edgar_sweep_job,
+            trigger=CronTrigger.from_crontab(_EDGAR_CRON, timezone="America/New_York"),
+            id=_EDGAR_JOB_ID, replace_existing=True,
+            misfire_grace_time=300, max_instances=1, coalesce=True,
+        )
     _SCHEDULER.start()
     logger.info(
         "scheduler started (enabled=%s, cron=%s)",
@@ -195,6 +227,54 @@ async def _refresh_next_run_at() -> None:
         state = await s.get(SystemState, 1)
         if state is not None:
             state.scheduler_next_run_at = next_fire
+
+
+# ---------------------------------------------------------------------------
+# Closing-Bell Accumulation sweep — hourly during RTH
+# ---------------------------------------------------------------------------
+
+
+async def _run_cba_sweep_job() -> None:
+    """Fire run_closing_accumulation_sweep on its hourly cron tick.
+
+    Idempotent: the sweep upserts one row per (symbol, today's-date), so
+    each hour's run overwrites the prior hour's snapshot with the latest
+    intraday state. After 16:00 ET the AH metrics populate; runs before
+    that still capture gate 1 (RVOL, VWAP position) which is useful for
+    seeing accumulation building during the day.
+    """
+    try:
+        from .autotrade.maint_loop import run_closing_accumulation_sweep
+        result = await run_closing_accumulation_sweep()
+        logger.info(
+            "CBA sweep tick: %d themes, %d symbols, %d setups",
+            result.get("themes_scanned", 0),
+            result.get("symbols_evaluated", 0),
+            result.get("setups_found", 0),
+        )
+    except Exception as e:
+        logger.exception("CBA sweep tick failed: %s", e)
+
+
+async def _run_edgar_sweep_job() -> None:
+    """Fire the Hedge Fund Signal Tracker EDGAR sweep on its 15-min tick.
+
+    Idempotent: new filings are keyed by accession number, so each tick only
+    ingests what's appeared since the last. No-ops cleanly when
+    EDGAR_USER_AGENT_EMAIL is unset (logged in the sweep)."""
+    try:
+        from .hedge_funds.poller import run_edgar_sweep
+        result = await run_edgar_sweep()
+        if result.get("skipped_reason"):
+            logger.info("EDGAR sweep tick skipped: %s", result["skipped_reason"])
+        else:
+            logger.info(
+                "EDGAR sweep tick: %d managers, %d new filings, %d holdings, %d changes",
+                result.get("managers_scanned", 0), result.get("new_filings", 0),
+                result.get("holdings_upserted", 0), result.get("changes_computed", 0),
+            )
+    except Exception as e:
+        logger.exception("EDGAR sweep tick failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
