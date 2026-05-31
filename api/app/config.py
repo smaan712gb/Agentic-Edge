@@ -161,6 +161,20 @@ class Settings(BaseSettings):
     SLACK_WEBHOOK_URL: Optional[str] = None
     ALERT_EMAIL_TO: Optional[str] = None
 
+    # ----- Entry circuit breaker (account-level, halts NEW entries only) --
+    # Never closes positions — high-beta exits stay signal-driven. The
+    # breaker latches until manually re-armed via the admin endpoint.
+    BREAKER_ENABLED: bool = True
+    # Halt new entries if intraday NetLiq falls this fraction below the day's
+    # opening NAV. Account-level capital discipline ("stop adding on a bad
+    # day"), NOT a per-position stop. High-beta books swing hard, so keep
+    # this generous — 0.12 = 12% account drawdown intraday.
+    BREAKER_INTRADAY_NAV_DROP_PCT: float = 0.12
+    # Halt new entries when the available-funds cushion (AvailableFunds /
+    # NetLiquidation) drops below this — don't pile on risk when margin is
+    # tight. 0.10 = require at least 10% free.
+    BREAKER_MIN_MARGIN_CUSHION_PCT: float = 0.10
+
     # ----- Limits / governance ----------------------------------------
     # MAX_RUNS_PER_USER_PER_HOUR was sized for the slow LangGraph pipeline
     # (one run took 30+ min, so 5/hr made sense). FastThemeRunner runs

@@ -114,6 +114,25 @@ async def _tick() -> None:
     if (gate_rth() is not None) or (gate_open_auction_block() is not None):
         return
 
+    # Account-level circuit breaker — halts NEW entries (never closes
+    # positions) on a severe breach: intraday NAV drop, thin margin cushion,
+    # or a blind/stale broker. Latches until manually re-armed. The exit loop
+    # is unaffected; open high-beta positions keep exiting on their own
+    # signals, not on a down day.
+    try:
+        from api.app.positions import _ibkr
+        from .circuit_breaker import check_entry_breaker
+        ib_for_breaker = await _ibkr()
+        halt_reason = await check_entry_breaker(ib_for_breaker)
+        if halt_reason is not None:
+            logger.warning("auto-entry: circuit breaker halts new entries — %s", halt_reason)
+            return
+    except Exception as e:
+        # Fail closed: if we can't evaluate account health, don't open new
+        # positions this tick.
+        logger.warning("auto-entry: breaker check errored (%s) — skipping new entries this tick", e)
+        return
+
     # Pull today's completed runs and queue Buy decisions we haven't acted on.
     candidates = await _find_unprocessed_buys()
     if not candidates:

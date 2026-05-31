@@ -415,6 +415,18 @@ class SystemState(Base):
     last_kill_at:      Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     kill_reason:       Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # Entry circuit breaker — halts NEW entries (never closes positions) on a
+    # severe account-level breach. Latches until manually re-armed. The daily
+    # NAV reference (captured at the first RTH tick) drives the intraday-drop
+    # check. Deliberately distinct from autotrade_enabled: the breaker pauses
+    # only new entries; the maintenance/exit loop keeps managing open
+    # positions on their own signals.
+    entry_breaker_tripped:    Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    entry_breaker_reason:     Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    entry_breaker_tripped_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    breaker_nav_ref:          Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    breaker_nav_ref_date:     Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
     scheduler_enabled:      Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     scheduler_cron:         Mapped[str]  = mapped_column(String(64), default="0 9 * * 1-5", nullable=False)
     scheduler_next_run_at:  Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

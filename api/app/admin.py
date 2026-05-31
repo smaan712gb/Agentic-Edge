@@ -59,7 +59,26 @@ async def autotrade_status(
         "kill_reason":            state.kill_reason if state else None,
         "updated_at":             (state.updated_at.isoformat() if state else None),
         "updated_by":             state.updated_by if state else None,
+        "entry_breaker_tripped":  bool(state and state.entry_breaker_tripped),
+        "entry_breaker_reason":   state.entry_breaker_reason if state else None,
+        "entry_breaker_tripped_at": (state.entry_breaker_tripped_at.isoformat()
+                                     if state and state.entry_breaker_tripped_at else None),
     }
+
+
+@router.post("/autotrade/rearm-breaker")
+async def autotrade_rearm_breaker(
+    body: KillSwitchToggle,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    """Clear the entry circuit-breaker latch so NEW entries can resume.
+
+    Distinct from the kill switch: the breaker only paused new entries; the
+    maintenance/exit loop kept managing open positions throughout. Re-arming
+    re-captures the day's NAV reference on the next entry tick."""
+    _require_admin(x_admin_token)
+    from .autotrade.circuit_breaker import rearm_breaker
+    return await rearm_breaker(actor=body.actor)
 
 
 @router.post("/autotrade/enable")

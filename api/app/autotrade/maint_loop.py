@@ -441,18 +441,52 @@ async def _sweep_off_theme_stocks(ibkr_positions: list[dict], ib: Any) -> int:
     closed = 0
     for sym, qty, pos in off_theme:
         try:
-            await _execute_off_theme_close(sym=sym, qty=qty, pos=pos, ib=ib)
+            # Gate the close behind a real exit signal. Leaving a theme is not
+            # itself a reason to dump a high-beta name on a red day — only
+            # rotate out when the name is ALSO weakening (thesis broken or
+            # momentum rolled over below its 20d MA). Off-theme winners that
+            # still hold their trend are retained; the operator can re-home
+            # them into a theme.
+            exit_signal = await _off_theme_exit_signal(sym, pos)
+            if exit_signal is None:
+                logger.info("off-theme sweep: retaining %s — no exit signal (off-theme but holding trend)", sym)
+                continue
+            await _execute_off_theme_close(sym=sym, qty=qty, pos=pos, ib=ib, exit_signal=exit_signal)
             closed += 1
         except Exception as e:
             logger.exception("off-theme close failed for %s: %s", sym, e)
     return closed
 
 
-async def _execute_off_theme_close(*, sym: str, qty: float, pos: dict, ib: Any) -> None:
+async def _off_theme_exit_signal(sym: str, pos: dict) -> Optional[str]:
+    """Return an exit reason if an off-theme name is ALSO weakening, else None.
+
+    Reuses the same signals the managed-position path uses: a thesis break is
+    a hard rotate-out; otherwise a name trading below its 20-day MA has lost
+    momentum and is fair to recycle. A name still above its 20d MA (or with
+    too little history to judge) is retained — we don't dump trend-holding
+    winners just because they left a theme."""
+    from tradingagents.strategies.maintenance.theme_health import get_thesis_break_signal
+    async with db_session() as s:
+        thesis_break = await get_thesis_break_signal(s, sym)
+    if thesis_break:
+        return f"thesis broken: {thesis_break}"
+    signals = await _compute_daily_signals(sym)
+    ma20 = signals.get("ma_20d")
+    last = float(pos.get("last_price") or 0)
+    if ma20 and last > 0 and last < ma20:
+        return f"momentum rolled over (last ${last:.2f} < 20d MA ${ma20:.2f})"
+    return None
+
+
+async def _execute_off_theme_close(*, sym: str, qty: float, pos: dict, ib: Any,
+                                   exit_signal: str = "") -> None:
     """Submit a marketable LMT SELL to close one off-theme stock position.
 
-    Creates a synthetic TradeIntent so the close has a full audit trail
-    (TradeAuditLog + auto_actions) symmetric with every other system trade.
+    Only called once the off-theme name has *also* shown an exit signal
+    (``exit_signal``) — see ``_off_theme_exit_signal``. Creates a synthetic
+    TradeIntent so the close has a full audit trail (TradeAuditLog +
+    auto_actions) symmetric with every other system trade.
     """
     from ib_insync import Stock  # type: ignore
     from tradingagents.dataflows.providers.base import TradeIntent as IntentDC
@@ -489,12 +523,14 @@ async def _execute_off_theme_close(*, sym: str, qty: float, pos: dict, ib: Any) 
             position_state="closing",
             entry_strategy="off_theme_close",
             rationale=(
-                f"Off-theme cleanup: {sym} not in any active theme universe. "
-                f"Closing {qty:.0f} sh (cost basis ${avg:.2f}) to free capital "
-                f"for theme-aligned candidates."
+                f"Off-theme rotation: {sym} not in any active theme AND showing "
+                f"an exit signal ({exit_signal or 'n/a'}). Closing {qty:.0f} sh "
+                f"(cost basis ${avg:.2f}) to free capital for theme-aligned "
+                f"candidates. (Off-theme names still holding their trend are retained.)"
             ),
             walking_config={
                 "source": "off_theme_sweep",
+                "exit_signal": exit_signal,
                 "closed_at": datetime.now(timezone.utc).isoformat(),
                 "avg_price": avg, "bid_at_close": bid, "last_at_close": last,
             },
@@ -535,13 +571,14 @@ async def _execute_off_theme_close(*, sym: str, qty: float, pos: dict, ib: Any) 
             gate_result=_synthetic_passed_gate(), symbol=sym,
             intent_id=intent_id,
             payload={"qty": qty, "limit": limit, "avg": avg,
-                     "reason": "off_theme_cleanup"},
+                     "reason": "off_theme_rotation", "exit_signal": exit_signal},
             outcome="submitted", ibkr_order_id=order_id,
         )
     await alert(
         level="info",
-        title=f"Off-theme close: {sym}",
-        body=f"{qty:.0f} sh @ LMT ${limit} (cost basis ${avg:.2f}). Not in any active theme.",
+        title=f"Off-theme rotation: {sym}",
+        body=(f"{qty:.0f} sh @ LMT ${limit} (cost basis ${avg:.2f}). Off-theme "
+              f"AND weakening: {exit_signal or 'n/a'}."),
     )
 
 
