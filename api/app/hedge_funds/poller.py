@@ -88,6 +88,14 @@ async def run_edgar_sweep(
 
     cutoff = since or (datetime.now(timezone.utc).date() - timedelta(days=_DEFAULT_LOOKBACK_DAYS))
 
+    # Refresh the CUSIP->ticker map from the theme universe so newly-ingested
+    # holdings get a ticker (FMP-cached, cheap on repeat). Best-effort.
+    try:
+        from .enrich import resolve_theme_cusips
+        await resolve_theme_cusips()
+    except Exception as e:
+        logger.debug("CUSIP enrichment skipped: %s", e)
+
     # Snapshot the manager list (id, slug, macro_only, ciks) so we don't hold
     # a session across network calls.
     async with db_session() as s:
@@ -137,6 +145,14 @@ async def run_edgar_sweep(
                     summary["alerts"] += 1
             except Exception as e:
                 logger.exception("EDGAR: change recompute failed for %s: %s", name, e)
+
+    # Backfill ticker onto any holdings whose CUSIP is now mapped (covers rows
+    # ingested before their CUSIP was resolved).
+    try:
+        from .enrich import backfill_holding_tickers
+        await backfill_holding_tickers()
+    except Exception as e:
+        logger.debug("ticker backfill skipped: %s", e)
 
     logger.info(
         "EDGAR sweep: %d managers, %d new filings, %d holdings, %d changes, %d alerts",

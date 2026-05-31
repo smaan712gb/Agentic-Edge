@@ -205,6 +205,15 @@ export type OverlapRow = {
   confirmation: boolean;
 };
 
+export type UwFlow = {
+  gamma_sign: "positive" | "negative" | "neutral" | null;
+  gamma_flip_strike: number | null;
+  flow_premium_24h_call: number;
+  flow_premium_24h_put: number;
+  flow_tilt: "bullish" | "bearish" | "neutral" | null;
+  note: string;
+};
+
 export type SmartMoney = {
   matched: boolean;
   ticker: string | null;
@@ -285,6 +294,8 @@ export const api = {
       return jfetch<OverlapRow[]>(`/api/overlap${qs ? `?${qs}` : ""}`);
     },
     forSymbol: (symbol: string) => jfetch<SmartMoney>(`/api/managers/symbol/${symbol}`),
+    flow: (symbols: string[]) =>
+      jfetch<Record<string, UwFlow>>(`/api/managers/flow?symbols=${encodeURIComponent(symbols.join(","))}`),
   },
   admin: {
     autotradeStatus: (token: string) =>

@@ -5,6 +5,8 @@ the existing theme/run route style (repo + to_dto, thin handlers)."""
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import asdict
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -62,3 +64,27 @@ async def overlap(
 ) -> list[dict[str, Any]]:
     """Cross-fund overlap, optionally filtered to a theme's symbols."""
     return await cross_fund_overlap(theme_id=theme, min_managers=min_managers, limit=limit)
+
+
+@router.get("/api/managers/flow")
+async def managers_flow(symbols: str = Query(..., description="comma-separated tickers")) -> dict[str, Any]:
+    """Live UW positioning overlay (flow tilt, gamma, max-pain) for a set of
+    tickers — the smart-money names you want to see flow on. Reuses the same
+    UW context the theme-regime read uses. Capped to keep the fan-out small."""
+    syms = [s.strip().upper() for s in symbols.split(",") if s.strip()][:25]
+    if not syms:
+        return {}
+    try:
+        from tradingagents.signals.sector_regime import _fetch_uw_context
+    except Exception as e:
+        raise HTTPException(503, f"flow provider unavailable: {e}")
+
+    async def _one(sym: str) -> tuple[str, dict[str, Any]]:
+        try:
+            ctx = await _fetch_uw_context(sym)
+            return sym, asdict(ctx)
+        except Exception as e:
+            return sym, {"note": f"flow fetch failed: {e}", "flow_tilt": None, "gamma_sign": None}
+
+    results = await asyncio.gather(*[_one(s) for s in syms])
+    return {sym: ctx for sym, ctx in results}

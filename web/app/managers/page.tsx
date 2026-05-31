@@ -3,8 +3,31 @@
 import { useEffect, useState } from "react";
 import { Building2, ArrowUpRight, ArrowDownRight, Sparkles } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
-import { api, type Manager, type OverlapRow } from "@/lib/api";
+import { api, type Manager, type OverlapRow, type UwFlow } from "@/lib/api";
 import { fmtMoney, cn } from "@/lib/utils";
+
+const TILT_STYLE: Record<string, string> = {
+  bullish: "border-[var(--color-up)]/30 text-[var(--color-up)]",
+  bearish: "border-[var(--color-down)]/30 text-[var(--color-down)]",
+  neutral: "text-[var(--color-fg-muted)]",
+};
+
+function FlowCell({ flow }: { flow?: UwFlow }) {
+  if (!flow) return <span className="text-[var(--color-fg-dim)] text-xs">—</span>;
+  const tilt = flow.flow_tilt;
+  return (
+    <span className="flex items-center gap-1.5 text-xs">
+      {tilt ? (
+        <span className={cn("chip text-[10px]", TILT_STYLE[tilt])}>{tilt}</span>
+      ) : (
+        <span className="text-[var(--color-fg-dim)]">no flow</span>
+      )}
+      {flow.gamma_sign && flow.gamma_sign !== "neutral" && (
+        <span className="text-[var(--color-fg-dim)]">γ {flow.gamma_sign === "positive" ? "+" : "−"}</span>
+      )}
+    </span>
+  );
+}
 
 const CHANGE_TONE: Record<string, string> = {
   new: "text-[var(--color-up)]",
@@ -17,11 +40,19 @@ const CHANGE_TONE: Record<string, string> = {
 export default function ManagersPage() {
   const [managers, setManagers] = useState<Manager[] | null>(null);
   const [overlap, setOverlap] = useState<OverlapRow[] | null>(null);
+  const [flow, setFlow] = useState<Record<string, UwFlow>>({});
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     api.managers.list().then(setManagers).catch((e) => setError(String(e)));
-    api.managers.overlap({ minManagers: 2 }).then(setOverlap).catch(() => setOverlap([]));
+    api.managers.overlap({ minManagers: 2 }).then((rows) => {
+      setOverlap(rows);
+      // Overlay live flow on the names that resolved to a ticker.
+      const tickers = rows.map((r) => r.ticker).filter((t): t is string => !!t);
+      if (tickers.length) {
+        api.managers.flow(tickers).then(setFlow).catch(() => setFlow({}));
+      }
+    }).catch(() => setOverlap([]));
   }, []);
 
   return (
@@ -108,6 +139,7 @@ export default function ManagersPage() {
             <tr className="text-left border-b border-[var(--color-border)]">
               <th className="font-medium px-5 py-3">Name</th>
               <th className="font-medium px-5 py-3">Managers</th>
+              <th className="font-medium px-5 py-3">Flow</th>
               <th className="font-medium px-5 py-3 text-right">Aggregate value</th>
               <th className="font-medium px-5 py-3">Held by</th>
             </tr>
@@ -117,7 +149,7 @@ export default function ManagersPage() {
               <tr><td colSpan={4} className="px-5 py-4 text-[var(--color-fg-muted)]">Loading overlap…</td></tr>
             )}
             {overlap?.length === 0 && (
-              <tr><td colSpan={4} className="px-5 py-4 text-[var(--color-fg-muted)]">
+              <tr><td colSpan={5} className="px-5 py-4 text-[var(--color-fg-muted)]">
                 No overlapping positions yet — run the EDGAR backfill or wait for the first sweep.
               </td></tr>
             )}
@@ -131,6 +163,7 @@ export default function ManagersPage() {
                   {r.confirmation && <span className="chip text-[10px] border-[var(--color-up)]/30 text-[var(--color-up)] mr-2">{r.manager_count}× confirm</span>}
                   {!r.confirmation && r.manager_count}
                 </td>
+                <td className="px-5 py-3">{r.ticker ? <FlowCell flow={flow[r.ticker]} /> : <span className="text-[var(--color-fg-dim)] text-xs">—</span>}</td>
                 <td className="px-5 py-3 text-right tabular-nums">{fmtMoney(r.aggregate_value_usd)}</td>
                 <td className="px-5 py-3 text-[var(--color-fg-muted)] text-xs">
                   {r.managers.map((mm) => mm.name.split("—")[0].trim()).join(", ")}
