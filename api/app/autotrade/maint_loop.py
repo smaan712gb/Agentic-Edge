@@ -799,6 +799,30 @@ async def _evaluate_stock(
         )
         return
 
+    # ---- Rotation overlay -------------------------------------------
+    # If any theme this name lives in is flagged "rotating out", take profit
+    # on winners harder (treat as not-hot so the profit-preservation ladder
+    # trims) and tighten exit-pressure below. Never forces a loser out — the
+    # trim ladder is profit-gated and the exit-pressure bump is bounded.
+    rotation_active = False
+    rotation_themes: list[str] = []
+    try:
+        from .rotation_detector import any_theme_rotating
+        from api.app.db import ThemeSymbol as _ThemeSymbol
+        async with db_session() as s:
+            sym_theme_ids = [
+                r[0] for r in (await s.execute(
+                    select(_ThemeSymbol.theme_id).where(_ThemeSymbol.symbol == intent.symbol)
+                )).all() if r[0]
+            ]
+        rotation_active, rotation_themes = await any_theme_rotating(sym_theme_ids)
+        if rotation_active:
+            theme_hot = False  # let the profit ladder lock gains on winners
+            logger.info("maint: %s in rotating theme(s) %s — taking profit on strength + tightening exit",
+                        intent.symbol, rotation_themes)
+    except Exception as e:
+        logger.debug("rotation overlay failed for %s: %s", intent.symbol, e)
+
     # ---- Profit-preservation trim ladder ----------------------------
     signals = await _compute_daily_signals(intent.symbol)
     trim_today = await _check_trimmed_today(intent.symbol, kind="stock")
@@ -1011,12 +1035,18 @@ async def _evaluate_stock(
         except Exception as e:
             logger.warning("rotation lookup failed for %s: %s", intent.symbol, e)
 
+    # Fold the theme-rotation signal into exit pressure: take the stronger of
+    # the name-level rotation candidate delta and the theme-rotation delta, so
+    # a confirmed sector rotation tightens the existing (bounded) exit signal.
+    _name_rot = rotation_candidate.score_delta if rotation_candidate else 0.0
+    _theme_rot = get_settings().ROTATION_EXIT_PRESSURE_DELTA if rotation_active else 0.0
+    _rotation_delta = max(_name_rot or 0.0, _theme_rot) or None
     pressure = compute_exit_pressure(
         theme_composite=(best_theme.composite if best_theme else None),
         theme_streak_days=(best_theme.streak_days_below_floor if best_theme else 0),
         trim_band=trim.band,
         exhaustion_score=exhaustion.score,
-        rotation_score_delta=(rotation_candidate.score_delta if rotation_candidate else None),
+        rotation_score_delta=_rotation_delta,
     )
 
     # Per-tick observability row — captures the full picture even when

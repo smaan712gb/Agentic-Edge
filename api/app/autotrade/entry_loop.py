@@ -256,6 +256,25 @@ async def _process_one(
     """Run the gate, build the PMCC, submit it. Returns True if a trade was
     placed (or attempted), False if rejected upstream."""
 
+    # --- Rotation gate: don't add into a sector the institutions are
+    # leaving. Low-regret — only blocks NEW entries; holdings are untouched.
+    try:
+        from .rotation_detector import is_theme_rotating
+        rotating, score, signals = await is_theme_rotating(theme_id)
+        if rotating:
+            logger.info("auto-entry: %s skipped — theme %s rotating out %s", symbol, theme_id, signals)
+            async with db_session() as s:
+                await record_auto_action(
+                    s, loop="entry", action_type="entry_blocked_rotation",
+                    gate_result=None, symbol=symbol,
+                    payload={"run_id": run_id, "theme_id": theme_id,
+                             "rotation_score": score, "signals": signals},
+                    outcome="blocked_rotation",
+                )
+            return False
+    except Exception as e:
+        logger.debug("rotation gate check failed for %s: %s", symbol, e)
+
     # --- Gate stack ----
     async with db_session() as s:
         gate = await check_auto_action(

@@ -148,6 +148,19 @@ class Settings(BaseSettings):
     # on portfolio + theme names. No paid feeds. Off-switch only.
     NEWS_SWEEP_ENABLED: bool = True
 
+    # ----- Theme Rotation Detector ------------------------------------
+    # Flags a theme as "rotating out" when ROTATION_MIN_SIGNALS of {RS
+    # breakdown, options-flow distribution, breadth deterioration} agree.
+    # On a flagged theme: halt new entries + take profit on winners +
+    # tighten exit-pressure sensitivity. Low-regret — never dumps a loser.
+    ROTATION_DETECTOR_ENABLED: bool = True
+    ROTATION_MIN_SIGNALS: int = 2               # require confirmation
+    ROTATION_BREADTH_BELOW_MA_PCT: float = 0.60  # breadth-signal trip threshold
+    # Exit-pressure delta injected for a held name in a rotating theme. Maps
+    # via the rotation subscore (25 -> max subscore, weight 0.15 ≈ +15 pts of
+    # composite) — tightens the existing signal, never forces a drawdown exit.
+    ROTATION_EXIT_PRESSURE_DELTA: float = 25.0
+
     # ----- Execution (IBKR) -------------------------------------------
     IBKR_HOST: str = "127.0.0.1"
     IBKR_PORT: int = 7497

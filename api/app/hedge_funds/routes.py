@@ -90,6 +90,21 @@ async def managers_flow(symbols: str = Query(..., description="comma-separated t
     return {sym: ctx for sym, ctx in results}
 
 
+@router.get("/api/rotation")
+async def rotation_status() -> list[dict[str, Any]]:
+    """Per-theme rotation-detector state (flagged themes first)."""
+    from sqlalchemy import select as _select
+    from ..db import ThemeRotation
+    async with db_session() as s:
+        rows = (await s.execute(_select(ThemeRotation).order_by(
+            ThemeRotation.flagged.desc(), ThemeRotation.score.desc()))).scalars().all()
+    return [{
+        "theme_id": r.theme_id, "flagged": r.flagged, "score": r.score,
+        "signals_tripped": r.signals_tripped or [], "evidence": r.evidence or {},
+        "computed_at": r.computed_at.isoformat() if r.computed_at else None,
+    } for r in rows]
+
+
 @router.get("/api/mentions")
 async def mentions(
     symbol: Optional[str] = None,

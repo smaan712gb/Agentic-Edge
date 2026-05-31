@@ -52,6 +52,11 @@ _CBA_JOB_ID = "closing_accumulation_hourly"
 # building before the close.
 _CBA_CRON = "0 10-17 * * 1-5"
 
+_ROTATION_JOB_ID = "theme_rotation_sweep"
+# Every 30 min during RTH — rotation is a multi-day signal, but a half-hour
+# cadence catches a fresh flag quickly without hammering data providers.
+_ROTATION_CRON = "15,45 9-16 * * 1-5"
+
 _NEWS_JOB_ID = "chokepoint_news_sweep"
 # Hourly during US RTH + an hour either side, Mon-Fri. News flows during the
 # session; the sweep dedups so re-runs are cheap.
@@ -105,6 +110,14 @@ async def start_scheduler() -> None:
             _run_news_sweep_job,
             trigger=CronTrigger.from_crontab(_NEWS_CRON, timezone="America/New_York"),
             id=_NEWS_JOB_ID, replace_existing=True,
+            misfire_grace_time=300, max_instances=1, coalesce=True,
+        )
+    # Theme rotation detector — always-on (feeds entry + maint loops).
+    if get_settings().ROTATION_DETECTOR_ENABLED:
+        _SCHEDULER.add_job(
+            _run_rotation_sweep_job,
+            trigger=CronTrigger.from_crontab(_ROTATION_CRON, timezone="America/New_York"),
+            id=_ROTATION_JOB_ID, replace_existing=True,
             misfire_grace_time=300, max_instances=1, coalesce=True,
         )
     _SCHEDULER.start()
@@ -267,6 +280,20 @@ async def _run_cba_sweep_job() -> None:
         )
     except Exception as e:
         logger.exception("CBA sweep tick failed: %s", e)
+
+
+async def _run_rotation_sweep_job() -> None:
+    """Fire the theme rotation detector on its cron tick."""
+    try:
+        from .autotrade.rotation_detector import run_rotation_sweep
+        result = await run_rotation_sweep()
+        if result.get("skipped_reason"):
+            logger.info("rotation sweep tick skipped: %s", result["skipped_reason"])
+        else:
+            logger.info("rotation sweep tick: %d themes, %d flagged",
+                        result.get("themes", 0), result.get("flagged", 0))
+    except Exception as e:
+        logger.exception("rotation sweep tick failed: %s", e)
 
 
 async def _run_news_sweep_job() -> None:

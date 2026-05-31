@@ -661,6 +661,25 @@ class NewsMention(Base):
     captured_at:     Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
 
+class ThemeRotation(Base):
+    """Latest rotation-detector state per theme (one row per theme).
+
+    Captures whether institutions appear to be rotating OUT of a theme, from
+    leading signals (options-flow distribution, relative-strength breakdown,
+    breadth deterioration). ``flagged`` = 2+ signals tripped. Read by the
+    entry loop (halt new entries) and maintenance loop (take profit on
+    winners + tighten exit-pressure sensitivity)."""
+
+    __tablename__ = "theme_rotation"
+
+    theme_id:        Mapped[str]    = mapped_column(String(64), ForeignKey("themes.id", ondelete="CASCADE"), primary_key=True)
+    flagged:         Mapped[bool]   = mapped_column(Boolean, nullable=False, default=False)
+    score:           Mapped[float]  = mapped_column(Float, nullable=False, default=0.0)   # 0..1 = signals tripped / available
+    signals_tripped: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)   # list[str]
+    evidence:        Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)   # per-signal detail
+    computed_at:     Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
 class CusipTickerMap(Base):
     """CUSIP → ticker resolution cache. 13F reports CUSIP + issuer name only;
     this is the best-effort enrichment layer, populated from Form 4 issuer
