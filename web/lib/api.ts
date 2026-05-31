@@ -214,6 +214,19 @@ export type UwFlow = {
   note: string;
 };
 
+export type Mention = {
+  ticker: string;
+  theme_id: string | null;
+  headline: string;
+  provider: string;
+  chokepoint_hits: string[];
+  sentiment: "bullish" | "bearish" | "neutral" | null;
+  conviction: number | null;
+  summary: string | null;
+  published_at: string | null;
+  captured_at: string | null;
+};
+
 export type SmartMoney = {
   matched: boolean;
   ticker: string | null;
@@ -296,6 +309,8 @@ export const api = {
     forSymbol: (symbol: string) => jfetch<SmartMoney>(`/api/managers/symbol/${symbol}`),
     flow: (symbols: string[]) =>
       jfetch<Record<string, UwFlow>>(`/api/managers/flow?symbols=${encodeURIComponent(symbols.join(","))}`),
+    mentions: (symbol?: string) =>
+      jfetch<Mention[]>(`/api/mentions${symbol ? `?symbol=${encodeURIComponent(symbol)}` : ""}`),
   },
   admin: {
     autotradeStatus: (token: string) =>

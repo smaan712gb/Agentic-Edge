@@ -3,7 +3,8 @@
 import { useEffect, useState } from "react";
 import { Building2, ArrowUpRight, ArrowDownRight, Sparkles } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
-import { api, type Manager, type OverlapRow, type UwFlow } from "@/lib/api";
+import { api, type Manager, type OverlapRow, type UwFlow, type Mention } from "@/lib/api";
+import { Newspaper } from "lucide-react";
 import { fmtMoney, cn } from "@/lib/utils";
 
 const TILT_STYLE: Record<string, string> = {
@@ -41,10 +42,12 @@ export default function ManagersPage() {
   const [managers, setManagers] = useState<Manager[] | null>(null);
   const [overlap, setOverlap] = useState<OverlapRow[] | null>(null);
   const [flow, setFlow] = useState<Record<string, UwFlow>>({});
+  const [mentions, setMentions] = useState<Mention[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     api.managers.list().then(setManagers).catch((e) => setError(String(e)));
+    api.managers.mentions().then(setMentions).catch(() => setMentions([]));
     api.managers.overlap({ minManagers: 2 }).then((rows) => {
       setOverlap(rows);
       // Overlay live flow on the names that resolved to a ticker.
@@ -172,6 +175,39 @@ export default function ManagersPage() {
             ))}
           </tbody>
         </table>
+      </div>
+
+      {/* Chokepoint news (Phase 3) */}
+      <div className="flex items-center gap-2 mt-8 mb-3">
+        <Newspaper className="h-4 w-4 text-[var(--color-accent)]" />
+        <h2 className="text-lg font-semibold tracking-tight">Chokepoint news</h2>
+        <span className="text-xs text-[var(--color-fg-dim)]">supply-chain headlines on your names (IB feed)</span>
+      </div>
+      <div className="glass divide-y divide-[var(--color-border)]">
+        {mentions === null && <div className="p-5 text-[var(--color-fg-muted)]">Loading…</div>}
+        {mentions?.length === 0 && (
+          <div className="p-5 text-sm text-[var(--color-fg-muted)]">
+            No chokepoint headlines yet — the news sweep runs hourly during market hours.
+          </div>
+        )}
+        {mentions?.map((m, i) => (
+          <div key={i} className="p-4 flex items-start gap-3">
+            <span className="font-medium text-sm w-14 shrink-0">{m.ticker}</span>
+            <div className="min-w-0">
+              <div className="text-sm text-[var(--color-fg)]">{m.headline}</div>
+              {m.summary && <div className="text-xs text-[var(--color-fg-muted)] mt-1">{m.summary}</div>}
+              <div className="flex flex-wrap items-center gap-1.5 mt-2">
+                {m.sentiment && (
+                  <span className={cn("chip text-[10px]", TILT_STYLE[m.sentiment] ?? "")}>{m.sentiment}</span>
+                )}
+                {m.chokepoint_hits.slice(0, 4).map((h) => (
+                  <span key={h} className="chip text-[10px] text-[var(--color-fg-muted)]">{h}</span>
+                ))}
+                <span className="text-[10px] text-[var(--color-fg-dim)] ml-1">{m.provider}</span>
+              </div>
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   );

@@ -52,6 +52,11 @@ _CBA_JOB_ID = "closing_accumulation_hourly"
 # building before the close.
 _CBA_CRON = "0 10-17 * * 1-5"
 
+_NEWS_JOB_ID = "chokepoint_news_sweep"
+# Hourly during US RTH + an hour either side, Mon-Fri. News flows during the
+# session; the sweep dedups so re-runs are cheap.
+_NEWS_CRON = "30 8-17 * * 1-5"
+
 _EDGAR_JOB_ID = "edgar_signal_sweep"
 # Every 15 min during extended hours, Mon-Fri. EDGAR filings post on a slow
 # cadence (13F quarterly; 13D/Form-4 sporadic) and the sweep skips anything
@@ -92,6 +97,14 @@ async def start_scheduler() -> None:
             _run_edgar_sweep_job,
             trigger=CronTrigger.from_crontab(_EDGAR_CRON, timezone="America/New_York"),
             id=_EDGAR_JOB_ID, replace_existing=True,
+            misfire_grace_time=300, max_instances=1, coalesce=True,
+        )
+    # Phase 3 chokepoint news sweep — always-on (decision-support).
+    if get_settings().NEWS_SWEEP_ENABLED:
+        _SCHEDULER.add_job(
+            _run_news_sweep_job,
+            trigger=CronTrigger.from_crontab(_NEWS_CRON, timezone="America/New_York"),
+            id=_NEWS_JOB_ID, replace_existing=True,
             misfire_grace_time=300, max_instances=1, coalesce=True,
         )
     _SCHEDULER.start()
@@ -254,6 +267,20 @@ async def _run_cba_sweep_job() -> None:
         )
     except Exception as e:
         logger.exception("CBA sweep tick failed: %s", e)
+
+
+async def _run_news_sweep_job() -> None:
+    """Fire the chokepoint news sweep on its cron tick. Idempotent (deduped)."""
+    try:
+        from .hedge_funds.news import run_news_sweep
+        result = await run_news_sweep()
+        if result.get("skipped_reason"):
+            logger.info("news sweep tick skipped: %s", result["skipped_reason"])
+        else:
+            logger.info("news sweep tick: %d symbols, %d hits, %d stored",
+                        result.get("symbols", 0), result.get("hits", 0), result.get("stored", 0))
+    except Exception as e:
+        logger.exception("news sweep tick failed: %s", e)
 
 
 async def _run_edgar_sweep_job() -> None:

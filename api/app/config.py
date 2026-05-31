@@ -143,6 +143,11 @@ class Settings(BaseSettings):
     EDGAR_USER_AGENT_EMAIL: Optional[str] = None
     EDGAR_POLL_ENABLED: bool = True
 
+    # ----- Phase 3 chokepoint news layer (free, IB-sourced) -----------
+    # Sweeps the account's IBKR news providers for chokepoint-relevant items
+    # on portfolio + theme names. No paid feeds. Off-switch only.
+    NEWS_SWEEP_ENABLED: bool = True
+
     # ----- Execution (IBKR) -------------------------------------------
     IBKR_HOST: str = "127.0.0.1"
     IBKR_PORT: int = 7497

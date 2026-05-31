@@ -628,6 +628,39 @@ class PositionChange(Base):
     computed_at:    Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
 
+class NewsMention(Base):
+    """A chokepoint-relevant news item for a tracked ticker (Phase 3).
+
+    Sourced from the account's IBKR news providers, filtered to portfolio +
+    theme symbols and the chokepoint keyword dictionary, then sentiment-tagged
+    by the LLM. Deduped by (source_type, provider, article_id, ticker)."""
+
+    __tablename__ = "news_mentions"
+    __table_args__ = (
+        UniqueConstraint("source_type", "provider", "article_id", "ticker",
+                         name="uq_mention_source_article_ticker"),
+        Index("ix_mention_ticker_captured", "ticker", "captured_at"),
+        Index("ix_mention_captured", "captured_at"),
+    )
+
+    id:              Mapped[int]    = mapped_column(Integer, primary_key=True, autoincrement=True)
+    source_type:     Mapped[str]    = mapped_column(String(24), nullable=False, default="ib_news")
+    provider:        Mapped[str]    = mapped_column(String(24), nullable=False, default="")
+    article_id:      Mapped[str]    = mapped_column(String(64), nullable=False, default="")
+    ticker:          Mapped[str]    = mapped_column(String(12), nullable=False)
+    theme_id:        Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("themes.id", ondelete="SET NULL"), nullable=True,
+    )
+    headline:        Mapped[str]    = mapped_column(Text, nullable=False, default="")
+    url:             Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    chokepoint_hits: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)   # list[str]
+    sentiment:       Mapped[Optional[str]] = mapped_column(String(8), nullable=True)   # bullish|bearish|neutral
+    conviction:      Mapped[Optional[float]] = mapped_column(Float, nullable=True)      # 0..1
+    summary:         Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    published_at:    Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    captured_at:     Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
 class CusipTickerMap(Base):
     """CUSIP → ticker resolution cache. 13F reports CUSIP + issuer name only;
     this is the best-effort enrichment layer, populated from Form 4 issuer

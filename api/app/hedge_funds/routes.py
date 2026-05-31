@@ -88,3 +88,26 @@ async def managers_flow(symbols: str = Query(..., description="comma-separated t
 
     results = await asyncio.gather(*[_one(s) for s in syms])
     return {sym: ctx for sym, ctx in results}
+
+
+@router.get("/api/mentions")
+async def mentions(
+    symbol: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+) -> list[dict[str, Any]]:
+    """Recent chokepoint news mentions (Phase 3), newest first, optionally
+    filtered to one ticker."""
+    from sqlalchemy import select as _select
+    from ..db import NewsMention
+    async with db_session() as s:
+        q = _select(NewsMention).order_by(NewsMention.captured_at.desc()).limit(limit)
+        if symbol:
+            q = q.where(NewsMention.ticker == symbol.upper())
+        rows = (await s.execute(q)).scalars().all()
+    return [{
+        "ticker": m.ticker, "theme_id": m.theme_id, "headline": m.headline,
+        "provider": m.provider, "chokepoint_hits": m.chokepoint_hits or [],
+        "sentiment": m.sentiment, "conviction": m.conviction, "summary": m.summary,
+        "published_at": m.published_at.isoformat() if m.published_at else None,
+        "captured_at": m.captured_at.isoformat() if m.captured_at else None,
+    } for m in rows]
