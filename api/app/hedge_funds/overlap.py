@@ -52,6 +52,9 @@ async def cross_fund_overlap(
         results = (await s.execute(q)).all()
 
     # Aggregate by CUSIP in Python (small N — handful of managers × ~hundreds).
+    # Managers are keyed by slug so a manager filing under multiple CIKs counts
+    # ONCE (Situational Awareness has two CIKs) — otherwise the cross-fund
+    # confirmation count is inflated.
     by_cusip: dict[str, dict[str, Any]] = {}
     for holding, slug, name in results:
         if theme_tickers is not None:
@@ -61,26 +64,29 @@ async def cross_fund_overlap(
             "cusip": holding.cusip,
             "issuer_name": holding.issuer_name,
             "ticker": holding.ticker,
-            "managers": [],
-            "aggregate_value_usd": 0.0,
-            "aggregate_shares": 0.0,
+            "_managers": {},  # slug -> aggregated entry
         })
-        row["managers"].append({
-            "slug": slug, "name": name,
-            "value_usd": holding.value_usd, "shares": holding.shares,
+        m = row["_managers"].setdefault(slug, {
+            "slug": slug, "name": name, "value_usd": 0.0, "shares": 0.0,
             "pct_of_portfolio": holding.pct_of_portfolio,
         })
-        row["aggregate_value_usd"] += holding.value_usd
-        row["aggregate_shares"] += holding.shares
-        # Prefer a non-null ticker if any manager's row has one.
+        m["value_usd"] += holding.value_usd
+        m["shares"] += holding.shares
         if holding.ticker and not row["ticker"]:
             row["ticker"] = holding.ticker
 
-    rows = [
-        {**r, "manager_count": len(r["managers"]),
-         "confirmation": len(r["managers"]) >= 2}
-        for r in by_cusip.values()
-        if len(r["managers"]) >= min_managers
-    ]
+    rows = []
+    for r in by_cusip.values():
+        managers = list(r["_managers"].values())
+        if len(managers) < min_managers:
+            continue
+        rows.append({
+            "cusip": r["cusip"], "issuer_name": r["issuer_name"], "ticker": r["ticker"],
+            "managers": managers,
+            "aggregate_value_usd": sum(m["value_usd"] for m in managers),
+            "aggregate_shares": sum(m["shares"] for m in managers),
+            "manager_count": len(managers),
+            "confirmation": len(managers) >= 2,
+        })
     rows.sort(key=lambda r: (r["manager_count"], r["aggregate_value_usd"]), reverse=True)
     return rows[:limit]

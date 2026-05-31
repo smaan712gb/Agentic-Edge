@@ -7,6 +7,7 @@ poller, routes, and overlap calc share one query surface.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -21,6 +22,20 @@ from api.app.db import (
     ManagerCik,
     PositionChange,
 )
+
+
+@dataclass
+class AggHolding:
+    """A per-manager position aggregated across that manager's CIKs/filings
+    for one period. Quacks like FundHolding for the DTO/reporting paths."""
+    cusip: str
+    put_call_flag: str
+    issuer_name: str
+    ticker: Optional[str]
+    value_usd: float
+    shares: float
+    pct_of_portfolio: Optional[float]
+    period_end: Optional[datetime]
 
 
 class HedgeFundRepo:
@@ -95,13 +110,40 @@ class HedgeFundRepo:
         )).scalars().all()
         return list(rows)
 
-    async def holdings_for_period(self, manager_id: int, period_end: datetime) -> list[FundHolding]:
-        return list((await self.s.execute(
-            select(FundHolding)
+    async def holdings_for_period(self, manager_id: int, period_end: datetime) -> list["AggHolding"]:
+        """Holdings for a manager at a period, **aggregated per security**.
+
+        A manager can file under several CIKs (Situational Awareness has two),
+        each producing its own 13F for the same quarter — so the raw rows
+        double-count a name. We sum value/shares by (cusip, put_call_flag) so
+        every downstream read (top-20, Q/Q deltas, overlap, smart-money) sees
+        one true per-manager position. pct_of_portfolio is recomputed against
+        the aggregated total."""
+        rows = (await self.s.execute(
+            select(
+                FundHolding.cusip,
+                FundHolding.put_call_flag,
+                func.max(FundHolding.issuer_name),
+                func.max(FundHolding.ticker),
+                func.sum(FundHolding.value_usd),
+                func.sum(FundHolding.shares),
+            )
             .where(FundHolding.manager_id == manager_id)
             .where(FundHolding.period_end == period_end)
-            .order_by(FundHolding.value_usd.desc())
-        )).scalars().all())
+            .group_by(FundHolding.cusip, FundHolding.put_call_flag)
+        )).all()
+        total = sum((r[4] or 0.0) for r in rows) or 1.0
+        out = [
+            AggHolding(
+                cusip=r[0], put_call_flag=r[1] or "", issuer_name=r[2] or "",
+                ticker=r[3], value_usd=r[4] or 0.0, shares=r[5] or 0.0,
+                pct_of_portfolio=round(100.0 * (r[4] or 0.0) / total, 3),
+                period_end=period_end,
+            )
+            for r in rows
+        ]
+        out.sort(key=lambda h: h.value_usd, reverse=True)
+        return out
 
     async def latest_holdings(self, manager_id: int, limit: int = 100) -> list[FundHolding]:
         periods = await self.latest_13f_periods(manager_id, limit=1)
@@ -156,17 +198,20 @@ class HedgeFundRepo:
             q = q.where(FundHolding.cusip == (cusip or "").upper())
 
         rows = (await self.s.execute(q)).all()
-        managers: list[dict[str, Any]] = []
-        agg_value = 0.0
-        agg_shares = 0.0
+        # Dedupe by manager (a manager's multiple CIKs each file a 13F, so the
+        # same name shows up once per CIK) — sum within a manager, then count
+        # DISTINCT managers so the cross-fund confirmation isn't inflated.
+        by_mgr: dict[str, dict[str, Any]] = {}
         for holding, mgr in rows:
-            managers.append({
-                "slug": mgr.slug, "name": mgr.name,
-                "value_usd": holding.value_usd, "shares": holding.shares,
+            m = by_mgr.setdefault(mgr.slug, {
+                "slug": mgr.slug, "name": mgr.name, "value_usd": 0.0, "shares": 0.0,
                 "put_call_flag": holding.put_call_flag,
                 "pct_of_portfolio": holding.pct_of_portfolio,
                 "period_end": holding.period_end.isoformat() if holding.period_end else None,
             })
+            m["value_usd"] += holding.value_usd
+            m["shares"] += holding.shares
+        managers = list(by_mgr.values())
         agg_value = sum(m["value_usd"] for m in managers)
         agg_shares = sum(m["shares"] for m in managers)
         return {
