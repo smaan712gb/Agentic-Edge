@@ -214,6 +214,15 @@ export type UwFlow = {
   note: string;
 };
 
+export type RotationRow = {
+  theme_id: string;
+  flagged: boolean;
+  score: number;
+  signals_tripped: string[];
+  evidence: Record<string, any>;
+  computed_at: string | null;
+};
+
 export type Mention = {
   ticker: string;
   theme_id: string | null;
@@ -311,6 +320,7 @@ export const api = {
       jfetch<Record<string, UwFlow>>(`/api/managers/flow?symbols=${encodeURIComponent(symbols.join(","))}`),
     mentions: (symbol?: string) =>
       jfetch<Mention[]>(`/api/mentions${symbol ? `?symbol=${encodeURIComponent(symbol)}` : ""}`),
+    rotation: () => jfetch<RotationRow[]>("/api/rotation"),
   },
   admin: {
     autotradeStatus: (token: string) =>

@@ -3,9 +3,15 @@
 import { useEffect, useState } from "react";
 import { Building2, ArrowUpRight, ArrowDownRight, Sparkles } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
-import { api, type Manager, type OverlapRow, type UwFlow, type Mention } from "@/lib/api";
-import { Newspaper } from "lucide-react";
+import { api, type Manager, type OverlapRow, type UwFlow, type Mention, type RotationRow } from "@/lib/api";
+import { Newspaper, AlertTriangle, ShieldCheck } from "lucide-react";
 import { fmtMoney, cn } from "@/lib/utils";
+
+const SIGNAL_LABEL: Record<string, string> = {
+  rs_breakdown: "RS breakdown",
+  flow_distribution: "bearish flow",
+  breadth_deterioration: "weak breadth",
+};
 
 const TILT_STYLE: Record<string, string> = {
   bullish: "border-[var(--color-up)]/30 text-[var(--color-up)]",
@@ -43,11 +49,13 @@ export default function ManagersPage() {
   const [overlap, setOverlap] = useState<OverlapRow[] | null>(null);
   const [flow, setFlow] = useState<Record<string, UwFlow>>({});
   const [mentions, setMentions] = useState<Mention[] | null>(null);
+  const [rotation, setRotation] = useState<RotationRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     api.managers.list().then(setManagers).catch((e) => setError(String(e)));
     api.managers.mentions().then(setMentions).catch(() => setMentions([]));
+    api.managers.rotation().then(setRotation).catch(() => setRotation([]));
     api.managers.overlap({ minManagers: 2 }).then((rows) => {
       setOverlap(rows);
       // Overlay live flow on the names that resolved to a ticker.
@@ -71,6 +79,60 @@ export default function ManagersPage() {
           {error}
         </div>
       )}
+
+      {/* Theme rotation panel — the act-now signal */}
+      {(() => {
+        const flagged = (rotation ?? []).filter((r) => r.flagged);
+        const monitored = rotation?.length ?? 0;
+        if (rotation === null) return null;
+        if (flagged.length === 0) {
+          return (
+            <div className="glass p-4 mb-6 flex items-center gap-2 text-sm">
+              <ShieldCheck className="h-4 w-4 text-[var(--color-up)]" />
+              <span className="text-[var(--color-fg-muted)]">
+                No theme rotation flagged — {monitored} theme{monitored === 1 ? "" : "s"} monitored. New entries open; exits on normal signals.
+              </span>
+            </div>
+          );
+        }
+        return (
+          <div className="mb-6">
+            <div className="flex items-center gap-2 mb-2">
+              <AlertTriangle className="h-4 w-4 text-[var(--color-down)]" />
+              <h2 className="text-lg font-semibold tracking-tight">Rotation alert</h2>
+              <span className="text-xs text-[var(--color-fg-dim)]">
+                institutions leaving these sectors — new entries halted, profit taken on winners, exits tightened
+              </span>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {flagged.map((r) => (
+                <div key={r.theme_id} className="glass p-4 border-[var(--color-down)]/40">
+                  <div className="flex items-center justify-between">
+                    <span className="font-medium">{r.theme_id}</span>
+                    <span className="chip text-[10px] border-[var(--color-down)]/40 text-[var(--color-down)]">
+                      {r.signals_tripped.length} signals
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5 mt-2">
+                    {r.signals_tripped.map((sig) => (
+                      <span key={sig} className="chip text-[10px] text-[var(--color-down)]">
+                        {SIGNAL_LABEL[sig] ?? sig}
+                      </span>
+                    ))}
+                  </div>
+                  {r.evidence?.breadth && (
+                    <div className="text-xs text-[var(--color-fg-dim)] mt-2">
+                      breadth {Math.round((r.evidence.breadth.fraction ?? 0) * 100)}% below 20d MA
+                      {r.evidence?.regime?.mean_momentum_20d_pct != null &&
+                        ` · momentum ${r.evidence.regime.mean_momentum_20d_pct.toFixed(1)}%`}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Manager tiles */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
