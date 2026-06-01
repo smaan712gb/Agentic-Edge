@@ -31,6 +31,20 @@ if _sys.platform == "win32":
         _asyncio_bootstrap.WindowsSelectorEventLoopPolicy()
     )
 
+# Trust the OS certificate store for ALL outbound TLS — LLM API (DeepSeek via
+# the OpenAI SDK), SEC EDGAR, and every data vendor. Behind a corporate
+# TLS-intercepting proxy the default certifi bundle rejects the proxy's CA, so
+# the OpenAI/httpx clients fail with "Connection error" and every agent call
+# dies silently (runs finish in seconds with zero scores). truststore makes
+# the stdlib ssl use the OS store (which trusts the proxy CA), fixing all
+# clients at once. Must run before any SSL context is created.
+try:
+    import truststore as _truststore
+    _truststore.inject_into_ssl()
+except Exception as _e:  # pragma: no cover — falls back to certifi
+    import logging as _logging
+    _logging.getLogger("agentic_edge").warning("truststore inject failed: %s", _e)
+
 # Note: we deliberately do NOT call nest_asyncio.apply() here. ib_insync.IB
 # captures the running loop at construction (__init__), and nest_asyncio's
 # loop patching can hand back a different loop than the running one,
