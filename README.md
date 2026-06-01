@@ -211,7 +211,7 @@ Start IB Gateway in paper mode, enable the API, and set `IBKR_PORT=4002` (paper)
 └── tests/             Provider smoke tests
 ```
 
-The agent graph and provider SDK live under an `agents/` package the API imports. See `docs/ARCHITECTURE.md` for the full breakdown — analyst nodes, model assignment, the gate stack, the walking-limit executor, and the persistence schema.
+The reasoning agents and provider clients live in the **`tradingagents`** package, installed automatically from `api/requirements.txt` (it's pinned to the [engine repo](https://github.com/smaan712gb/TradingAgents)). You don't vendor it into this repo — `pip install -r api/requirements.txt` pulls it. To hack on the engine itself, clone that repo and `pip install -e .` over the pinned version. See `docs/ARCHITECTURE.md` for the full breakdown — analyst nodes, the gate stack, the walking-limit executor, and the persistence schema.
 
 ---
 
@@ -284,3 +284,11 @@ If this project saved you a few mornings of research, consider starring the repo
 ## License
 
 [MIT](LICENSE) — with an additional financial-software disclaimer. The short version: do whatever you want with the code, but don't blame us for what the market does.
+
+The agent + provider engine (the `tradingagents` package) is licensed separately under the **Apache License 2.0**.
+
+---
+
+## Acknowledgements
+
+The reasoning engine began as a fork of the open-source **[TradingAgents](https://github.com/TauricResearch/TradingAgents)** multi-agent framework by Tauric Research (Apache License 2.0), and has been substantially extended for Agentic Edge — a thematic chokepoint universe, options-flow and smart-money signals, a theme-rotation detector, the LEAPS execution + maintenance loops, and the FastAPI/Next.js platform around it. Our fork lives at [smaan712gb/TradingAgents](https://github.com/smaan712gb/TradingAgents). See [`NOTICE`](NOTICE) for attribution details.

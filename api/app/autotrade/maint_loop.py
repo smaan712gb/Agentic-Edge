@@ -176,11 +176,15 @@ async def _tick() -> None:
     # feeds the thesis-break detector via _filing_breaks_by_symbol below.
     filing_breaks_by_symbol = await _watch_8k_filings(pos_by_symbol)
 
-    # Daily IV snapshot capture — one row per (symbol, date) for every
-    # theme-universe symbol. Idempotent: a snapshot for today's date
-    # short-circuits the inner fetch. Builds the historical IV
-    # distribution that the percentile signal needs.
-    await _capture_daily_iv_snapshots(ib)
+    # Daily IV snapshot capture — builds the front-month IV-percentile
+    # distribution used by the momentum-exhaustion exit signal. This probes
+    # ~30-day options across the whole universe, which is a SHORT-DATED
+    # construct: irrelevant to a LEAPS-only book (we hold 2027/2028 LEAPs and
+    # never trade front-month). Skip it entirely in LEAPS-only mode — it was
+    # the source of the option-chain churn / Error 200 noise, and exit
+    # pressure runs fine on its underlying-based signals without it.
+    if not get_settings().LEAPS_ONLY:
+        await _capture_daily_iv_snapshots(ib)
 
     # Insider universe sweep — pulls FMP's latest insider trades stream,
     # filters to theme-universe symbols, fires insider_alert audit rows
@@ -193,7 +197,12 @@ async def _tick() -> None:
         intents = (
             await s.execute(
                 select(TradeIntent).where(TradeIntent.status.in_(["filled", "submitted"]))
-                .where(TradeIntent.position_state.in_(["pmcc_full", "leap_pending"]))
+                .where(TradeIntent.position_state.in_(
+                    # PMCC states + LEAPS-only states. `leap_open` was MISSING,
+                    # so the entire LEAPS-only book was invisible to the
+                    # maintenance loop (no exits/rolls/rotation). leap_open is
+                    # the filled bare-LEAP state set by _process_leaps_only.
+                    ["pmcc_full", "leap_pending", "leap_open", "leap_open_naked", "closing"]))
             )
         ).scalars().all()
 
@@ -300,8 +309,8 @@ async def _adopt_orphan_positions(ibkr_positions: list[dict]) -> int:
                 .where(TradeIntent.status.in_(
                     ["filled", "submitted", "submitting", "abandoned", "error", "closing"]))
                 .where(TradeIntent.position_state.in_(
-                    ["pmcc_full", "leap_pending", "leap_open_naked", "pending",
-                     "abandoned", "closing"]))
+                    ["pmcc_full", "leap_pending", "leap_open", "leap_open_naked",
+                     "pending", "abandoned", "closing"]))
             )
         ).all()
         owned = {(r[0] or "").upper() for r in rows}
@@ -425,7 +434,8 @@ async def _sweep_off_theme_stocks(ibkr_positions: list[dict], ib: Any) -> int:
                 .where(TradeIntent.symbol.in_(syms))
                 .where(TradeIntent.status.in_(["filled", "submitted", "submitting", "closing"]))
                 .where(TradeIntent.position_state.in_(
-                    ["pmcc_full", "leap_pending", "leap_open_naked", "pending", "closing"]
+                    ["pmcc_full", "leap_pending", "leap_open", "leap_open_naked",
+                     "pending", "closing"]
                 ))
             )
         ).all()
@@ -705,6 +715,82 @@ async def _reconcile_orphan_pmcc_intents(ibkr_positions: list[dict]) -> int:
                 intent.symbol, intent.id[:8],
             )
 
+        # ---- LEAPS-only orphans -------------------------------------
+        # Same race as PMCC, but a bare long LEAP has NO short call, so
+        # the pair-match above (which requires short_qty < 0) can never
+        # fire for it. Match on leap_conid alone with qty > 0. Without
+        # this, an Adaptive LEAP order that the walker timed-out on but
+        # IBKR filled afterward sits unmanaged — no exits, no rotation
+        # protection — which is exactly the silent-drawdown failure mode.
+        leap_rows = (
+            await s.execute(
+                select(TradeIntent)
+                .where(TradeIntent.structure == "leap_only")
+                .where(TradeIntent.status.in_(["abandoned", "error"]))
+                .where(TradeIntent.position_state.in_(["abandoned", "pending"]))
+            )
+        ).scalars().all()
+
+        for intent in leap_rows:
+            cfg = intent.walking_config or {}
+            leap_conid = int(cfg.get("leap_conid") or 0)
+            if not leap_conid:
+                continue
+            leap_pos = by_conid.get(leap_conid)
+            if leap_pos is None:
+                continue
+            leap_qty = float(leap_pos.get("qty") or 0)
+            if leap_qty <= 0:
+                continue
+
+            # IbkrProvider.get_positions reports avg_price as the PER-SHARE
+            # option premium (its P&L uses (last-avg)*100*qty), so the entry
+            # path stores leap_fill_price = avg_price directly. Do the same
+            # here — do NOT divide by 100 (that older convention, still in the
+            # PMCC branch above, mismatches this provider's units).
+            leap_premium = round(float(leap_pos.get("avg_price") or 0), 2) or None
+
+            now = datetime.now(timezone.utc)
+            intent.status = "filled"
+            intent.position_state = "leap_open"
+            intent.leap_fill_price = leap_premium
+            intent.net_debit_filled = leap_premium
+            if intent.leap_filled_at is None:
+                intent.leap_filled_at = now
+            cfg = dict(cfg)
+            cfg["reconciled_at"] = now.isoformat()
+            cfg["reconcile_source"] = "maint_loop_orphan_leap"
+            intent.walking_config = cfg
+
+            s.add(TradeAuditLog(
+                intent_id=intent.id, action="orphan_leap_reconciled",
+                outcome="filled",
+                payload={
+                    "leap_conid": leap_conid, "leap_qty": leap_qty,
+                    "leap_premium": leap_premium,
+                    "note": (
+                        "Broker holds this LEAP; intent was marked abandoned "
+                        "by the Adaptive-order walker timeout but IBKR filled "
+                        "it afterward. Flipping to filled so maintenance "
+                        "(exits/rotation/roll) can manage it."
+                    ),
+                },
+            ))
+            await record_auto_action(
+                s, loop="maintenance",
+                action_type="orphan_leap_reconciled",
+                gate_result=_synthetic_passed_gate(),
+                symbol=intent.symbol, intent_id=intent.id,
+                payload={"leap_premium": leap_premium, "qty_leap": leap_qty},
+                outcome="reconciled",
+            )
+            reconciled_count += 1
+            logger.warning(
+                "LEAP reconcile: %s intent %s flipped to filled "
+                "(broker holds %g contracts; unmanaged orphan recovered)",
+                intent.symbol, intent.id[:8], leap_qty,
+            )
+
     return reconciled_count
 
 
@@ -918,11 +1004,14 @@ async def _evaluate_stock(
     except Exception as e:
         logger.debug("FMP signal init failed for %s: %s", intent.symbol, e)
 
-    # IV signal (8th exhaustion indicator). Daily snapshot is captured by
-    # _capture_iv_snapshot earlier in this tick; per-position eval reads
-    # today's IV + the underlying's realized vol from closes_for_iv.
+    # IV signal (8th exhaustion indicator) — front-month ATM IV percentile.
+    # This is a SHORT-DATED construct (30-day options); a LEAPS-only book
+    # doesn't trade front-month, so skip the probe entirely. Momentum
+    # exhaustion still fires on its price / RSI / volume / auction / insider /
+    # analyst inputs (all underlying-based and more appropriate for a LEAP).
     iv_signal_obj = None
-    try:
+    if not get_settings().LEAPS_ONLY:
+      try:
         from tradingagents.strategies.maintenance.iv_signal import (
             evaluate_iv_signal,
         )
@@ -955,7 +1044,7 @@ async def _evaluate_stock(
                 s, symbol=intent.symbol,
                 iv_today=iv_today_value, closes=closes_for_iv,
             )
-    except Exception as e:
+      except Exception as e:
         logger.debug("IV signal eval failed for %s: %s", intent.symbol, e)
 
     exhaustion = evaluate_momentum_exhaustion(

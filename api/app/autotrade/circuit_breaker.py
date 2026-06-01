@@ -62,15 +62,21 @@ async def check_entry_breaker(ib: Any) -> Optional[str]:
     reason: Optional[str] = None
     netliq: Optional[float] = None
     avail: Optional[float] = None
+    account_ok = False
     try:
         summary = await ib.get_account_summary()
         netliq = _f(summary, "NetLiquidation")
         avail = _f(summary, "AvailableFunds")
+        account_ok = True
     except Exception as e:
         reason = f"account read failed ({e}) — pausing new entries"
 
-    # Connection staleness — don't open new positions blind.
-    if reason is None:
+    # Connection staleness — don't open new positions blind. BUT a successful
+    # account read above already proves the socket is live THIS tick, so only
+    # consult the heartbeat snapshot when we have no independent confirmation.
+    # Otherwise a cold/stale startup snapshot (the heartbeat hasn't beaten yet)
+    # false-trips the breaker on every restart even though IBKR is connected.
+    if reason is None and not account_ok:
         try:
             from .heartbeat import is_connected_snapshot
             if not is_connected_snapshot():

@@ -1,0 +1,22 @@
+Agentic Edge
+Copyright 2026 smaan712gb
+
+This product is built on software derived from the TradingAgents framework
+(https://github.com/TauricResearch/TradingAgents), Copyright Tauric Research,
+licensed under the Apache License, Version 2.0.
+
+The agent + provider engine (the `tradingagents` Python package, installed via
+api/requirements.txt) is a fork that has been substantially extended and
+modified for Agentic Edge. That fork is published at:
+
+    https://github.com/smaan712gb/TradingAgents
+
+and carries the full Apache License 2.0 text in its repository.
+
+The Agentic Edge platform code in THIS repository (the FastAPI service, the
+Next.js frontend, the autotrade entry/maintenance loops, and the strategy
+layers) is licensed under the MIT License — see the LICENSE file.
+
+You may obtain a copy of the Apache License, Version 2.0 at:
+
+    http://www.apache.org/licenses/LICENSE-2.0

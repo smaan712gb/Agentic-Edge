@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -36,7 +36,7 @@ from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import select
 
 from .config import get_settings
-from .db import SystemState, Theme, get_session as db_session
+from .db import SystemState, Theme, Run, get_session as db_session
 from .repos import RunRepo, ThemeRepo
 
 logger = logging.getLogger("agentic_edge.scheduler")
@@ -61,6 +61,14 @@ _NEWS_JOB_ID = "chokepoint_news_sweep"
 # Hourly during US RTH + an hour either side, Mon-Fri. News flows during the
 # session; the sweep dedups so re-runs are cheap.
 _NEWS_CRON = "30 8-17 * * 1-5"
+
+_HEALTH_JOB_ID = "system_health_monitor"
+# Every 15 min across the extended trading day (4:00-20:00 ET), Mon-Fri.
+# The monitor never trades — it checks invariants (broker reachable,
+# kill-switch state, position<->intent parity, margin cushion, stuck
+# intents, signal freshness) and alerts on anomalies so nothing drifts
+# silently. Always-on, independent of the auto-fire flag.
+_HEALTH_CRON = "*/15 4-20 * * 1-5"
 
 _EDGAR_JOB_ID = "edgar_signal_sweep"
 # Every 15 min during extended hours, Mon-Fri. EDGAR filings post on a slow
@@ -120,11 +128,29 @@ async def start_scheduler() -> None:
             id=_ROTATION_JOB_ID, replace_existing=True,
             misfire_grace_time=300, max_instances=1, coalesce=True,
         )
+    # System health monitor — always-on 'no unknowns' guardrail. Never
+    # trades; alerts on any broken invariant every 15 min.
+    _SCHEDULER.add_job(
+        _run_health_monitor_job,
+        trigger=CronTrigger.from_crontab(_HEALTH_CRON, timezone="America/New_York"),
+        id=_HEALTH_JOB_ID, replace_existing=True,
+        misfire_grace_time=300, max_instances=1, coalesce=True,
+    )
     _SCHEDULER.start()
     logger.info(
         "scheduler started (enabled=%s, cron=%s)",
         state.scheduler_enabled, state.scheduler_cron,
     )
+    # Startup catch-up — if the 09:00 ET daily run was missed because the
+    # server wasn't running then, fire it shortly after boot (no-ops if
+    # today's run already exists). Decouples signal freshness from the
+    # server happening to be alive at exactly 09:00. One-shot, weekday-gated.
+    if state.scheduler_enabled:
+        _SCHEDULER.add_job(
+            _startup_catchup_job, trigger="date",
+            run_date=datetime.now(timezone.utc) + timedelta(seconds=45),
+            id="startup_catchup", replace_existing=True, misfire_grace_time=300,
+        )
     await _refresh_next_run_at()
 
 
@@ -296,6 +322,16 @@ async def _run_rotation_sweep_job() -> None:
         logger.exception("rotation sweep tick failed: %s", e)
 
 
+async def _run_health_monitor_job() -> None:
+    """Fire the system health monitor on its cron tick. Never trades."""
+    try:
+        from .autotrade.health_monitor import run_health_check
+        result = await run_health_check()
+        logger.info("health monitor tick: %s", result.get("summary", result.get("status")))
+    except Exception as e:
+        logger.exception("health monitor tick failed: %s", e)
+
+
 async def _run_news_sweep_job() -> None:
     """Fire the chokepoint news sweep on its cron tick. Idempotent (deduped)."""
     try:
@@ -420,3 +456,44 @@ async def _run_all_themes_job() -> None:
         elapsed_min, success, skipped, failed, status,
     )
     await _refresh_next_run_at()
+
+
+async def _startup_catchup_job() -> None:
+    """One-shot on boot: fire the daily theme run if today's is missing.
+
+    The 09:00 ET cron only fires while the process is alive at 09:00. If the
+    server starts later in the day (or after being down), today's scorecards
+    would be missing and the trading loops would act on STALE signals. This
+    catch-up closes that gap so signal freshness no longer depends on the
+    server being up at exactly 09:00.
+
+    Safe to always schedule: it is weekday-gated and idempotent — the daily
+    job is date-keyed (``scheduled-{theme}-{today}``), so if a run already
+    happened today (cron or manual) this no-ops.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        if now_et.weekday() >= 5:
+            logger.info("startup catch-up: weekend — skipping")
+            return
+        start_today = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        async with db_session() as s:
+            done = (
+                await s.execute(
+                    select(Run.id).where(Run.status == "done")
+                    .where(Run.finished_at >= start_today).limit(1)
+                )
+            ).first()
+        if done:
+            logger.info(
+                "startup catch-up: a completed run already exists today — "
+                "signals are fresh, skipping")
+            return
+        logger.warning(
+            "startup catch-up: no completed run today (missed 09:00 cron) — "
+            "firing the daily theme run now so signals are fresh")
+        await _run_all_themes_job()
+    except Exception as e:
+        logger.exception("startup catch-up failed: %s", e)

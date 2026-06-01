@@ -8,7 +8,11 @@ import { Stat } from "@/components/Stat";
 import { api, type EquityPoint, type Position, type TodayPerf } from "@/lib/api";
 import { fmtDateShort, fmtMoney, fmtMoneyDelta, fmtPct } from "@/lib/utils";
 
-const REFRESH_FAST_MS = 10_000;   // positions + today's P&L (live)
+// Each positions poll triggers a live IBKR reqMktData on the shared client-20
+// connection, so the dashboard competes with the trading loop for market-data
+// capacity. The loop needs the live data more than the human view does — poll
+// every 30s (was 10s). The dashboard is for monitoring, not execution.
+const REFRESH_FAST_MS = 30_000;   // positions + today's P&L (live)
 const REFRESH_SLOW_MS = 60_000;   // 90-day curve (changes daily)
 
 export default function PerformancePage() {
