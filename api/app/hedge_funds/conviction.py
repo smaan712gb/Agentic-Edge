@@ -47,19 +47,29 @@ async def manager_conviction(symbol: str) -> tuple[float, dict[str, Any]]:
         logger.debug("manager_conviction lookup failed for %s: %s", symbol, e)
         return 1.0, {"error": str(e)}
 
-    n = int(sm.get("manager_count") or 0)
-    if not sm.get("matched") or n < 2:
-        # No cross-fund confirmation → neutral. Single-fund holds get no boost.
-        return 1.0, {"matched": bool(sm.get("matched")), "manager_count": n, "factor": 1.0}
+    managers = sm.get("managers", []) if sm.get("matched") else []
+    tier1 = [m for m in managers if m.get("tier") == "tier1"]
+    tier2 = [m for m in managers if m.get("tier") == "tier2"]
+    # Activists (Elliott/Pershing) are an event watchlist, not holding
+    # conviction — excluded from sizing entirely.
+    n1, n2 = len(tier1), len(tier2)
 
-    boost = _STEP_PER_MANAGER * min(n - 1, 3)
+    # tier1 drives conviction; tier2 only cross-confirms (counts only when at
+    # least one tier1 also holds the name) at half weight. A single tier1 with
+    # no confirmation gets no boost (one fund isn't confirmation).
+    if n1 == 0:
+        return 1.0, {"matched": bool(managers), "tier1": 0, "tier2": n2, "factor": 1.0,
+                     "note": "no tier1 holder — tier2 cross-confirm only, no sizing boost"}
+
+    boost = _STEP_PER_MANAGER * (n1 - 1) + (_STEP_PER_MANAGER / 2.0) * n2
     factor = round(min(1.0 + boost, settings.MANAGER_CONVICTION_MAX_FACTOR), 3)
     meta = {
         "matched": True,
-        "manager_count": n,
-        "confirmation": bool(sm.get("confirmation")),
+        "tier1": n1, "tier2": n2,
+        "confirmation": (n1 >= 2) or (n1 >= 1 and n2 >= 1),
         "aggregate_value_usd": sm.get("aggregate_value_usd"),
-        "managers": [m.get("slug") for m in sm.get("managers", [])],
+        "tier1_managers": [m.get("slug") for m in tier1],
+        "tier2_managers": [m.get("slug") for m in tier2],
         "factor": factor,
     }
     return factor, meta

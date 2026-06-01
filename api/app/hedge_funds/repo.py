@@ -63,6 +63,7 @@ class HedgeFundRepo:
         ciks: list[tuple[str, Optional[str]]],
         macro_only: bool = False,
         active: bool = True,
+        tier: str = "tier1",
         primary_themes: Optional[list[str]] = None,
         weighting_profile: Optional[dict[str, float]] = None,
     ) -> HedgeFundManager:
@@ -76,6 +77,7 @@ class HedgeFundRepo:
         mgr.name = name
         mgr.macro_only = macro_only
         mgr.active = active
+        mgr.tier = tier
         mgr.primary_themes = primary_themes
         mgr.weighting_profile = weighting_profile
         await self.s.flush()
@@ -204,7 +206,8 @@ class HedgeFundRepo:
         by_mgr: dict[str, dict[str, Any]] = {}
         for holding, mgr in rows:
             m = by_mgr.setdefault(mgr.slug, {
-                "slug": mgr.slug, "name": mgr.name, "value_usd": 0.0, "shares": 0.0,
+                "slug": mgr.slug, "name": mgr.name, "tier": mgr.tier,
+                "value_usd": 0.0, "shares": 0.0,
                 "put_call_flag": holding.put_call_flag,
                 "pct_of_portfolio": holding.pct_of_portfolio,
                 "period_end": holding.period_end.isoformat() if holding.period_end else None,
@@ -253,6 +256,7 @@ class HedgeFundRepo:
         return {
             "slug": m.slug,
             "name": m.name,
+            "tier": m.tier,
             "macro_only": m.macro_only,
             "active": m.active,
             "primary_themes": m.primary_themes or [],

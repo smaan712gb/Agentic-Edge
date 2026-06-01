@@ -175,6 +175,7 @@ export type ManagerChange = {
 export type Manager = {
   slug: string;
   name: string;
+  tier: "tier1" | "tier2" | "activist" | string;
   macro_only: boolean;
   active: boolean;
   primary_themes: string[];

@@ -517,6 +517,12 @@ class HedgeFundManager(Base):
     id:                Mapped[int]    = mapped_column(Integer, primary_key=True, autoincrement=True)
     slug:              Mapped[str]    = mapped_column(String(64), nullable=False)
     name:              Mapped[str]    = mapped_column(String(200), nullable=False)
+    # Tier drives how the manager's positioning is weighted:
+    #   tier1    = primary conviction (full sizing weight)
+    #   tier2    = cross-confirmation only (half weight; never stands alone)
+    #   activist = event watchlist (Elliott/Pershing) — excluded from sizing;
+    #              their 13D filings fire Tier-1 instant alerts instead.
+    tier:              Mapped[str]    = mapped_column(String(12), nullable=False, default="tier1")
     # macro_only managers (e.g. D.E. Shaw) get tracked for context but never
     # produce a single-name conviction signal — their alpha decays too fast.
     macro_only:        Mapped[bool]   = mapped_column(Boolean, nullable=False, default=False)

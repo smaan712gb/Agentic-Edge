@@ -85,6 +85,7 @@ async def load_managers_from_config(path: Path | None = None) -> int:
                 slug=slug, name=name, ciks=ciks,
                 macro_only=bool(block.get("macro_only", False)),
                 active=active,
+                tier=str(block.get("tier", "tier1")),
                 primary_themes=block.get("themes") or [],
                 weighting_profile=block.get("weighting_profile") or {},
             )

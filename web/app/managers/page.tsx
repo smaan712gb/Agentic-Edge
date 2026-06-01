@@ -13,6 +13,12 @@ const SIGNAL_LABEL: Record<string, string> = {
   breadth_deterioration: "weak breadth",
 };
 
+const TIER_BADGE: Record<string, { label: string; cls: string }> = {
+  tier1: { label: "Tier 1 · conviction", cls: "border-[var(--color-accent)]/40 text-[var(--color-accent)]" },
+  tier2: { label: "Tier 2 · confirm", cls: "text-[var(--color-fg-muted)]" },
+  activist: { label: "Activist · 13D watch", cls: "border-[var(--color-down)]/40 text-[var(--color-down)]" },
+};
+
 const TILT_STYLE: Record<string, string> = {
   bullish: "border-[var(--color-up)]/30 text-[var(--color-up)]",
   bearish: "border-[var(--color-down)]/30 text-[var(--color-down)]",
@@ -157,7 +163,14 @@ export default function ManagersPage() {
                   </div>
                 </div>
               </div>
-              {!m.active && <span className="chip text-[10px] text-[var(--color-fg-dim)]">inactive</span>}
+              <div className="flex items-center gap-1.5">
+                {TIER_BADGE[m.tier] && (
+                  <span className={cn("chip text-[10px]", TIER_BADGE[m.tier].cls)}>
+                    {TIER_BADGE[m.tier].label}
+                  </span>
+                )}
+                {!m.active && <span className="chip text-[10px] text-[var(--color-fg-dim)]">inactive</span>}
+              </div>
             </div>
 
             {m.primary_themes.length > 0 && (

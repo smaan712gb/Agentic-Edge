@@ -40,6 +40,9 @@ async def cross_fund_overlap(
                   & (FundHolding.period_end == max_period.c.mp))
             .join(HedgeFundManager, HedgeFundManager.id == FundHolding.manager_id)
             .where(FundHolding.put_call_flag == "")
+            # Activists (Elliott/Pershing) are an event watchlist, not holding
+            # conviction — keep them out of the cross-fund overlap.
+            .where(HedgeFundManager.tier != "activist")
         )
 
         theme_tickers: Optional[set[str]] = None

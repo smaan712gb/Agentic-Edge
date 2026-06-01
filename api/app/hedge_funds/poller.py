@@ -101,11 +101,11 @@ async def run_edgar_sweep(
     async with db_session() as s:
         managers = await HedgeFundRepo(s).list_managers(active_only=True)
         manager_snap = [
-            (m.id, m.slug, m.name, m.macro_only, [c.cik for c in m.ciks])
+            (m.id, m.slug, m.name, m.macro_only, m.tier, [c.cik for c in m.ciks])
             for m in managers
         ]
 
-    for mgr_id, slug, name, macro_only, ciks in manager_snap:
+    for mgr_id, slug, name, macro_only, tier, ciks in manager_snap:
         if macro_only or not ciks:
             continue
         summary["managers_scanned"] += 1
@@ -126,7 +126,7 @@ async def run_edgar_sweep(
                 try:
                     n_hold = await _ingest_filing(
                         edgar, mgr_id=mgr_id, manager_name=name, cik=cik, ref=ref,
-                        emit_alerts=emit_alerts, summary=summary,
+                        emit_alerts=emit_alerts, summary=summary, tier=tier,
                     )
                     summary["new_filings"] += 1
                     summary["holdings_upserted"] += n_hold
@@ -164,7 +164,7 @@ async def run_edgar_sweep(
 
 async def _ingest_filing(
     edgar: Any, *, mgr_id: int, manager_name: str, cik: str, ref: Any,
-    emit_alerts: bool, summary: dict[str, Any],
+    emit_alerts: bool, summary: dict[str, Any], tier: str = "tier1",
 ) -> int:
     """Record one filing and its payload. Returns holdings stored."""
     form = ref.form.upper()
@@ -226,20 +226,32 @@ async def _ingest_filing(
 
     # Alerts (outside the write txn so a slow Slack post can't hold the row lock).
     if emit_alerts:
-        await _alert_for_filing(form, manager_name, ref, summary)
+        await _alert_for_filing(form, manager_name, ref, summary, tier=tier)
     return n_holdings
 
 
-async def _alert_for_filing(form: str, manager_name: str, ref: Any, summary: dict[str, Any]) -> None:
+async def _alert_for_filing(form: str, manager_name: str, ref: Any, summary: dict[str, Any],
+                            tier: str = "tier1") -> None:
     from ..autotrade.alerts import alert
     if form in _SC13_FORMS:
-        # Activist/large passive stake — Tier-1.
-        level = "warning" if form.startswith("SC 13D") else "info"
-        await alert(
-            level=level,
-            title=f"{manager_name}: {ref.form} filed",
-            body=f"Stake disclosure filed {ref.filed_at}. acc={ref.accession_no}",
-        )
+        is_13d = form.startswith("SC 13D")
+        if tier == "activist" and is_13d:
+            # Activist 13D from the watchlist (Elliott/Pershing) — Tier-1
+            # INSTANT. These two filing a 13D is the highest-urgency event the
+            # tracker watches: an activist taking a position in (almost always)
+            # a tech name, which moves the stock on disclosure.
+            await alert(
+                level="critical",
+                title=f"TIER-1 INSTANT — ACTIVIST 13D: {manager_name}",
+                body=(f"{manager_name} filed {ref.form} (activist stake). "
+                      f"Filed {ref.filed_at}. acc={ref.accession_no}. Review immediately."),
+            )
+        else:
+            await alert(
+                level="warning" if is_13d else "info",
+                title=f"{manager_name}: {ref.form} filed",
+                body=f"Stake disclosure filed {ref.filed_at}. acc={ref.accession_no}",
+            )
         summary["alerts"] += 1
     elif form in ("4", "4/A"):
         await alert(
