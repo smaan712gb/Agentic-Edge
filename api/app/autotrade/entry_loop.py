@@ -610,8 +610,11 @@ async def _process_leaps_only(
                      f"@ ~${leap_px:.2f} (LEAPS-only, long calls)")
 
     fvc = cand.leap.ask if (cand.leap.ask and cand.leap.ask > 0) else round(leap_px * 1.05, 2)
+    # Marketable entry: take the current offer (cap = ask) so a high-conviction
+    # LEAP actually fills at the live price, rather than resting below the ask
+    # and abandoning. For an 18-24mo hold the entry spread is noise vs thesis.
     exec_cfg = ExecutionConfig(initial_offset_cents=5, walk_increment_cents=5,
-                               walk_interval_sec=30, max_offset_pct_of_spread=0.30, timeout_sec=300)
+                               walk_interval_sec=5, max_offset_pct_of_spread=1.0, timeout_sec=90)
     try:
         result = await submit_single_leg_option(
             ibkr=ib, conid=cand.leap.conid, contracts=n_contracts,
