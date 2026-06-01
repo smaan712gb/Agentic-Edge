@@ -225,7 +225,10 @@ async def _tick() -> None:
                     ib, macro,
                     filing_thesis_break=filing_breaks_by_symbol.get(sym),
                 )
-            elif intent.structure in ("pmcc", "pmcc_sequenced"):
+            elif intent.structure in ("pmcc", "pmcc_sequenced", "leap_only"):
+                # leap_only (LEAPS-only strategy) shares the LEAP close +
+                # forward-roll logic; the short-call branches inside are guarded
+                # by short_call presence, so they no-op for a bare long LEAP.
                 await _evaluate_pmcc(intent, latest_decisions.get(sym), ib)
         except Exception as e:
             logger.exception("maint loop: %s evaluation failed: %s", sym, e)
@@ -1155,9 +1158,10 @@ async def _evaluate_pmcc(intent: TradeIntent, latest_decision: Optional[str], ib
         await _flag_pmcc_close(intent=intent, reason=close.reason, kind=close.exit_kind)
         return
 
-    # Earnings hedge check
+    # Earnings hedge check — only meaningful when there's a SHORT call to buy
+    # back. A bare long LEAP (LEAPS-only) has no short leg to hedge, so skip.
     days_to_e = await days_to_earnings(intent.symbol)
-    if days_to_e is not None and 0 <= days_to_e <= 2:
+    if intent.short_call_strike and days_to_e is not None and 0 <= days_to_e <= 2:
         await alert(
             level="warning",
             title=f"Earnings in {days_to_e}d for {intent.symbol}",

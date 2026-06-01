@@ -337,7 +337,8 @@ async def _process_one(
             kw in (elig.reason or "").lower()
             for kw in ("oi", "spread", "credit", "no leap candidate", "no short call")
         )
-        if composite >= 7.0 and is_liquidity_fail:
+        # LEAPS-only mode: long LEAP calls ONLY — no stock fallback.
+        if composite >= 7.0 and is_liquidity_fail and not get_settings().LEAPS_ONLY:
             logger.info(
                 "auto-entry: %s PMCC ineligible (%s) — falling back to stock",
                 symbol, elig.reason,
@@ -361,6 +362,14 @@ async def _process_one(
             )
         return False
     cand = elig.candidate
+
+    # LEAPS-only strategy: buy the long LEAP outright, no short call. Diverges
+    # here from the PMCC combo path below.
+    if get_settings().LEAPS_ONLY:
+        return await _process_leaps_only(
+            run_id=run_id, theme_id=theme_id, symbol=symbol, composite=composite,
+            cand=cand, gate=gate, ib=ib, sizing_factor=sizing_factor, macro_regime=macro_regime,
+        )
 
     # Manager-conviction tilt: names tracked legendary investors hold with
     # cross-fund confirmation get a bounded size boost (never a gate). Neutral
@@ -536,6 +545,119 @@ async def _process_one(
 PMCC_TARGET_PCT_NAV    = 0.07
 PMCC_MAX_DOLLARS       = 250_000
 STOCK_FALLBACK_NAV_PCT = 0.03
+
+
+async def _process_leaps_only(
+    *, run_id: str, theme_id: str, symbol: str, composite: float,
+    cand: Any, gate, ib: Any, sizing_factor: float = 1.0, macro_regime: str = "calm",
+) -> bool:
+    """LEAPS-only entry: buy the long LEAP call outright (no short call, no
+    combo). Sized on the full LEAP premium (no short-call credit offsets it),
+    boosted by manager conviction, capped by the same NAV/$ limits."""
+    from tradingagents.strategies.execution import ExecutionConfig, submit_single_leg_option
+
+    leap_px = cand.leap.mid
+    if not leap_px or leap_px <= 0:
+        async with db_session() as s:
+            await record_auto_action(
+                s, loop="entry", action_type="open_leap_ineligible", gate_result=gate,
+                symbol=symbol, payload={"run_id": run_id, "reason": "no LEAP price"},
+                outcome="ineligible")
+        return False
+
+    conviction_factor, conviction_meta = await _manager_conviction(symbol)
+    nav = await _fetch_nav(ib)
+    # Size on the LEAP's full per-share cost (×100 = per contract).
+    n_contracts = _size_pmcc_contracts(
+        net_debit_per_spread=leap_px, nav=nav,
+        sizing_factor=sizing_factor, conviction_factor=conviction_factor)
+    if n_contracts <= 0:
+        logger.info("auto-entry LEAPS: %s sized to 0 (macro=%s)", symbol, macro_regime)
+        return False
+    total_cost = round(leap_px * n_contracts * 100, 2)
+    logger.info(
+        "auto-entry LEAPS-only: %s BUY %d× LEAP $%.0f %s @ ~$%.2f "
+        "(NAV=$%.0f sf=%.2f conv=%.2f total=$%.0f)",
+        symbol, n_contracts, cand.leap.strike, cand.leap.expiry, leap_px,
+        nav, sizing_factor, conviction_factor, total_cost,
+    )
+
+    walking_cfg = {
+        "initial_offset_cents": 5, "walk_increment_cents": 5,
+        "walk_interval_sec": 30, "max_offset_pct_of_spread": 0.30, "timeout_sec": 300,
+        "leap_conid": cand.leap.conid, "spot_at_build": cand.spot,
+        "auto_origin": "entry_loop_leaps_only", "nav_at_build": nav,
+        "conviction_factor": conviction_factor, "manager_conviction": conviction_meta,
+    }
+    async with db_session() as s:
+        intent = TradeIntent(
+            run_id=run_id, symbol=symbol, side="BUY", qty=n_contracts,
+            order_type="LMT", status="submitting",
+            structure="leap_only", position_state="leap_pending",
+            entry_strategy="leaps_only",
+            leap_expiry=cand.leap.expiry, leap_strike=cand.leap.strike,
+            leap_delta_actual=cand.leap.delta, leap_iv=cand.leap.iv,
+            leap_open_interest=cand.leap.open_interest, leap_qty=n_contracts,
+            net_debit_target=leap_px, max_loss=total_cost,
+            walking_config=walking_cfg, rationale=cand.rationale,
+        )
+        s.add(intent)
+        await s.flush()
+        intent_id = intent.id
+
+    await alert(level="info", title=f"Auto-submit LEAP: {symbol}",
+                body=f"Long LEAP ${cand.leap.strike:.0f} {cand.leap.expiry} × {n_contracts} "
+                     f"@ ~${leap_px:.2f} (LEAPS-only, long calls)")
+
+    fvc = cand.leap.ask if (cand.leap.ask and cand.leap.ask > 0) else round(leap_px * 1.05, 2)
+    exec_cfg = ExecutionConfig(initial_offset_cents=5, walk_increment_cents=5,
+                               walk_interval_sec=30, max_offset_pct_of_spread=0.30, timeout_sec=300)
+    try:
+        result = await submit_single_leg_option(
+            ibkr=ib, conid=cand.leap.conid, contracts=n_contracts,
+            action="BUY", config=exec_cfg, fair_value_ceiling=fvc)
+    except Exception as e:
+        logger.exception("LEAP submit failed for %s: %s", symbol, e)
+        async with db_session() as s:
+            i = await s.get(TradeIntent, intent_id)
+            if i:
+                i.status = "error"; i.position_state = "error"
+            await record_auto_action(
+                s, loop="entry", action_type="open_leap", gate_result=gate, symbol=symbol,
+                intent_id=intent_id, payload={"run_id": run_id}, outcome="error", error=str(e))
+        return True
+
+    async with db_session() as s:
+        i = await s.get(TradeIntent, intent_id)
+        if result.status == "filled":
+            if i:
+                i.status = "filled"; i.position_state = "leap_open"
+                i.leap_fill_price = result.fill_price
+                i.leap_filled_at = datetime.now(timezone.utc)
+                i.net_debit_filled = result.fill_price
+            await record_auto_action(
+                s, loop="entry", action_type="open_leap", gate_result=gate, symbol=symbol,
+                intent_id=intent_id,
+                payload={"run_id": run_id, "fill_price": result.fill_price,
+                         "contracts": n_contracts, "walk_steps": result.walk_steps,
+                         "conviction": conviction_meta},
+                outcome="filled", ibkr_order_id=str(result.order_id or ""))
+        else:
+            if i:
+                i.status = "abandoned" if result.status == "abandoned" else "rejected"
+                i.position_state = "abandoned"
+            await record_auto_action(
+                s, loop="entry", action_type="open_leap", gate_result=gate, symbol=symbol,
+                intent_id=intent_id,
+                payload={"run_id": run_id, "status": result.status, "reason": result.error},
+                outcome=result.status)
+
+    if result.status == "filled":
+        await alert(level="info", title=f"LEAP filled: {symbol}",
+                    body=f"@${result.fill_price:.2f} × {n_contracts} after {result.walk_steps} steps")
+    else:
+        await alert(level="warning", title=f"LEAP {result.status}: {symbol}", body=result.error or "")
+    return True
 
 
 async def _manager_conviction(symbol: str) -> tuple[float, dict]:

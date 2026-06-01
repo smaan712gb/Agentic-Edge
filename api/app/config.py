@@ -128,6 +128,13 @@ class Settings(BaseSettings):
     FMP_API_KEY: Optional[str] = None
     ALPHA_VANTAGE_API_KEY: Optional[str] = None
 
+    # ----- Strategy mode ----------------------------------------------
+    # LEAPS_ONLY: long-dated CALL LEAPs only — long only, no short-call
+    # underwriting, no PMCC combos, no stock fallback, no multi-leg. A
+    # streamlined directional book. When False (default) the system runs the
+    # full PMCC (long LEAP + short call) + stock-fallback strategy.
+    LEAPS_ONLY: bool = False
+
     # ----- Manager conviction → entry sizing tilt ---------------------
     # Names that tracked legendary investors hold (cross-fund confirmed) get
     # a bounded size BOOST — never a gate, never a block (favor attempting).
