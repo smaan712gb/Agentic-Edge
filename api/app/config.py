@@ -134,6 +134,11 @@ class Settings(BaseSettings):
     # streamlined directional book. When False (default) the system runs the
     # full PMCC (long LEAP + short call) + stock-fallback strategy.
     LEAPS_ONLY: bool = False
+    # LEAP entry execution (institutional): IBKR Adaptive algo working the
+    # order toward mid, capped at mid + LEAP_ENTRY_CAP_PCT × half-spread
+    # (near mid — won't pay through). Priority: Patient|Normal|Urgent.
+    LEAP_ENTRY_CAP_PCT: float = 0.30
+    LEAP_ENTRY_ADAPTIVE_PRIORITY: str = "Normal"
 
     # ----- Manager conviction → entry sizing tilt ---------------------
     # Names that tracked legendary investors hold (cross-fund confirmed) get
