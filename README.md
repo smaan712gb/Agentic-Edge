@@ -2,7 +2,7 @@
 
 # Agentic Edge
 
-**An open-source agentic research platform for thematic, fundamental, and options-aware investing.**
+**The first open-source agentic hedge fund — it researches the chokepoints of the global supply chain, debates the winners, and writes the trade plan.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11+-3776ab.svg)](https://www.python.org/)
@@ -12,15 +12,17 @@
 ![Status](https://img.shields.io/badge/status-active-brightgreen.svg)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-ff69b4.svg)](CONTRIBUTING.md)
 
-*Give it a theme. Get back a ranked scorecard with the reasoning attached.*
+*Name a theme. The agents find the chokepoint winners, argue the case, and hand you a trade plan — every step of the reasoning on the page.*
 
 </div>
 
 ---
 
-You feed it a theme — *AI infrastructure*, *advanced memory*, *grid power*, *small modular reactors*, *optical networking*, anything else you're researching. A team of agents fans out, reads catalysts, pulls fundamentals, watches options flow, debates the bull and bear case, and ranks the names that fit best. The scorecard is the output. The reasoning is on the page, not behind a black box.
+Most quant tools start with a ticker. **Agentic Edge starts with a bottleneck.** The durable edge in markets sits at the **chokepoints of the global supply chain** — the single foundry behind the leading-edge node, the memory every AI accelerator depends on, the transformers the power grid can't scale without. You define the themes that map those chokepoints — *AI infrastructure, advanced memory, grid power, small modular reactors, optical networking, or your own* — and add, edit, or retire them anytime, straight from the dashboard.
 
-Connect a paper brokerage account and the system can attempt to act on its own conclusions — with NAV-aware sizing, a five-stage gate stack, and a kill switch one click away.
+For each theme a team of specialist agents fans out: they read the catalysts, pull the fundamentals, watch the options tape, and track what legendary investors are filing with the SEC. Then a **bull and a bear actually argue** the name, a research manager forges a conviction call, and a risk committee sizes it. What comes back isn't a black-box number — it's a **ranked scorecard and a complete trade plan, with every step of the agents' reasoning right there on the page.**
+
+Connect a paper brokerage account and Agentic Edge closes the loop — entering and managing positions on its own conclusions with NAV-aware sizing, a five-stage gate stack, an early-warning detector for institutional rotation, and a kill switch one click away. It's an entire discretionary desk — research, debate, decision, execution, and risk — running as cooperating agents you can open up and inspect. **Nothing is hidden behind a model you can't question.**
 
 > **This is research and decision-support software, not financial advice.** Live brokerage execution is disabled by default and the project actively refuses to run against a non-paper account. Markets do things no model has seen. Use at your own risk.
 
