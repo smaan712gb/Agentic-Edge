@@ -6,6 +6,45 @@ package and needs its own version-control trail.
 
 ## Unreleased
 
+### Strategy refocus — LEAPS-only, long-only
+
+- The platform now runs a **single long-only LEAPS playbook**. The
+  long-equity and covered-LEAPS (poor-man's-covered-call) strategies, the
+  short-call rolls/earnings hedges, multi-leg combo execution, and the
+  stock-fallback path are retired in favour of one disciplined book of
+  deep-ITM long calls. Execution is single-leg walking-limit near mid.
+- **Short-dated option probing removed** in LEAPS-only mode: the
+  front-month ATM-IV / momentum-exhaustion-by-IV signal no longer runs
+  (it was the wrong horizon for a long-dated hold and generated needless
+  option-chain churn). Exit pressure now runs on underlying-based signals.
+- Exits are **signal-driven only** — thesis break, confirmed theme
+  rotation, or momentum exhaustion — and never force-close on an ordinary
+  down day.
+
+### New signal layers
+
+- **Smart-money tracker** — polls a configurable watchlist of well-known
+  investors' SEC filings (13F / 13D / Form-4), stores holdings, computes
+  Q/Q deltas and cross-fund overlap on chokepoint names, and surfaces the
+  read (tilting conviction/sizing; activist 13D filings raise instant
+  alerts).
+- **Rotation detector** — catches institutions leaving a theme early
+  (relative strength / breadth / flow); on confirmation it halts new
+  entries into that theme and tightens exit sensitivity.
+- **Account-health monitor** — periodic invariant checks (broker
+  reachable, kill-switch/breaker state, position↔intent parity, margin
+  cushion, signal freshness) that alert on drift.
+
+### Reliability fixes
+
+- Maintenance loop now manages `leap_open` positions (a stale state filter
+  had excluded the entire LEAPS-only book).
+- Orphan reconciliation recovers "abandoned-but-filled" LEAP orders.
+- Provider cache switched to a lossless serializer (the prior one
+  corrupted DataFrames/dataclasses on cache hits).
+- Entry circuit breaker no longer false-trips on a cold startup snapshot
+  when the broker is actually reachable.
+
 ## 2026-05-09 — Production hardening pass
 
 Comprehensive maintenance-loop + entry-path overhaul to take the

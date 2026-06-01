@@ -37,7 +37,9 @@ The system is meant to be *legible*. Open the runs page, click any agent, and re
 - **Theme-first, not ticker-first.** You bring an investment thesis; the system finds and ranks the names that fit, not the other way around.
 - **Bull and bear actually argue.** Adversarial reasoning between two researcher agents, with a research-manager synthesis and a conviction gate that pulls you out of low-confidence names automatically.
 - **Options-aware.** Unusual flow, gamma exposure, and max-pain are first-class inputs to the bear case. Most agentic stacks ignore the options tape; this one doesn't.
-- **Two strategies in one platform.** Long equity for cleaner setups, covered-LEAPS (poor man's covered call) for capital efficiency on high-conviction names. Walking-limit combo execution and an autonomous maintenance loop handle rolls, defensive closes, and earnings hedges.
+- **Smart-money overlay.** A configurable watchlist of well-known investors is tracked straight from their public SEC filings (13F / 13D / Form-4). When two or more of them hold the same chokepoint name, that cross-fund confirmation surfaces on the name and can tilt conviction.
+- **Rotation- and momentum-aware.** A detector watches for institutions rotating *out* of a theme early — using relative strength, breadth, and flow — and, on confirmation, halts new entries into that theme and tightens exit sensitivity *without* dumping on a normal down day. Momentum drives how capital is allocated across the surviving names.
+- **LEAPS-only, long-only.** One disciplined playbook: deep-in-the-money long-dated calls (no short legs, no naked-leg risk, no multi-leg combos). Walking-limit execution near mid caps the worst price you'll pay, and an autonomous maintenance loop handles forward rolls and signal-driven exits.
 - **Paper-only by design.** Live brokerage is a manual code change, not a config toggle. The line stays bright.
 
 ---
@@ -126,20 +128,24 @@ The illustrations above are generated from the same components that ship with th
 
 ---
 
-## Strategies supported
+## Strategy
 
-Agentic Edge is built around two complementary playbooks for high-conviction theme names:
+Agentic Edge runs **one disciplined playbook: long-only LEAPS** on high-conviction theme names.
 
-**Long equity.** Straightforward stock entries with NAV-aware sizing, ATR-based stops, and exit on either a thesis break (the agent team flips the rating to *Avoid*) or a volatility-adjusted drawdown.
+- Long a deep-in-the-money LEAP call, typically 18–24 months out, around 0.80–0.85 delta — capital-efficient exposure to the underlying with a known, capped downside (the premium paid).
+- **No short legs, no diagonals, no multi-leg combos, no naked-leg risk.** Each position is a single long call.
+- **NAV-aware sizing** with a per-strategy budget, so the book stays roughly equal-weight and never over-deploys.
+- **Walking-limit execution near mid** caps the worst price you'll pay; if a quote stays wide the order is abandoned rather than crossing the full spread.
+- An autonomous **maintenance loop** forward-rolls a LEAP when its remaining tenor falls under ~six months, and **exits only on a signal** — a thesis break (the agent team flips the rating to *Avoid*), a confirmed theme rotation, or momentum exhaustion. It does **not** force-close on an ordinary down day.
 
-**Covered LEAPS (poor man's covered call).** A capital-efficient alternative to owning the underlying:
+### Signal layers feeding the book
 
-- Long a deep-in-the-money LEAP call, typically 18–24 months out, around 0.85 delta.
-- Short a near-dated call (21–35 days), typically around 0.25 delta, against it.
-- Position is built and closed atomically through a walking-limit combo executor — no naked-leg risk between fills.
-- Maintenance loop handles defensive rolls when the short call delta climbs, time-based rolls as the short approaches expiry, forward rolls of the LEAP when remaining tenor falls under six to nine months, and a close-only window two sessions before earnings.
+- **Scorecard** — the agent debate produces a Buy/Hold/Avoid per name; only *Buy* names are eligible to enter.
+- **Smart-money** — named investors' SEC filings (13F / 13D / Form-4) are tracked; cross-fund overlap on a chokepoint name tilts conviction (and sizing).
+- **Rotation detector** — flags institutions leaving a theme early (RS / breadth / flow); on confirmation it halts new entries into that theme and tightens exits.
+- **Momentum** — drives allocation across eligible names.
 
-The strategy honours the operator's decisions: there are tunable thresholds for delta bands, spread ceilings, roll cost guards, and momentum-aware short-call placement. Walking-limit execution caps the worst price you'll pay so wide quotes don't translate into wide fills. If a name's option market is too thin to honour the discipline, the system can fall back to a long equity attempt.
+Live brokerage execution is **disabled by default** and the system refuses to run against a non-paper account.
 
 ---
 
@@ -199,7 +205,7 @@ Start IB Gateway in paper mode, enable the API, and set `IBKR_PORT=4002` (paper)
 │   └── alembic/       Migrations
 ├── web/               Next.js 15 + Tailwind v4 + React Flow frontend
 │   ├── app/             Routes (themes, runs, performance)
-│   └── components/      Workflow diagram, kill switch, PMCC builder, etc.
+│   └── components/      Workflow diagram, kill switch, LEAP trade builder, etc.
 ├── docs/              Architecture, design notes, screenshots
 ├── scripts/           One-off admin utilities
 └── tests/             Provider smoke tests
@@ -218,8 +224,10 @@ The agent graph and provider SDK live under an `agents/` package the API imports
 | Theme + run persistence | Real (SQLAlchemy + Alembic; SQLite for dev, Postgres-ready) |
 | Provider clients (market data, options flow, fundamentals, macro, brokerage, reasoning models) | Real |
 | Agent scorecard graph | Working end-to-end |
-| Paper-brokerage execution | Working (combo + single-leg, walking-limit, atomic) |
-| Maintenance loop (rolls, closes, earnings hedge) | Working |
+| Smart-money tracker (13F / 13D / Form-4, cross-fund overlap) | Working |
+| Rotation detector + momentum allocation | Working |
+| Paper-brokerage execution (LEAPS, single-leg walking-limit near mid) | Working |
+| Maintenance loop (forward rolls + signal-driven exits) | Working |
 | Live-broker mode | Disabled by design — paper only |
 
 Treat anything not in the list as planned but unverified.
@@ -241,10 +249,10 @@ The service is configured entirely through environment variables — see `.env.e
 
 Things on the near horizon:
 
-- Per-symbol options flow staleness checks pre-trade.
-- Drawdown-aware kill-switch (auto-flip on intraday equity breach).
-- Sequenced legging for the diagonal — defer the short-call sale until the LEAP shows P&L or the underlying clears a volatility threshold.
-- Earnings-cycle short re-establishment after a hedged close.
+- Per-symbol options-flow staleness checks pre-trade.
+- A continuous account-health monitor that alerts on broker, margin, and position/intent drift.
+- Wiring the smart-money conviction read directly into the entry gate (today it surfaces and tilts sizing; next it gates).
+- A support-reclaim / mean-reversion signal so dip entries aren't missed by the trend-following setup score.
 - A library of saved themes you can fork.
 
 If any of those interest you, the contributing guide explains how to pick one up.

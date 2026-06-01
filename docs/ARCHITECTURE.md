@@ -62,7 +62,7 @@ Two structural design decisions worth knowing:
 │   │   ├── autotrade/                Automated entry + maintenance loops
 │   │   │   ├── auto_gate.py          5-stage gate stack
 │   │   │   ├── entry_loop.py         Opens positions on accepted intents
-│   │   │   ├── maint_loop.py         Rolls, closes, earnings hedge
+│   │   │   ├── maint_loop.py         Forward rolls + signal-driven exits
 │   │   │   ├── alerts.py             Operator notifications
 │   │   │   └── universe.py           Theme-scoped ticker enforcement
 │   │   ├── db/                       SQLAlchemy 2.x async models
@@ -77,7 +77,7 @@ Two structural design decisions worth knowing:
 │   └── components/
 │       ├── workflow-diagram.tsx      Live agent execution graph
 │       ├── KillSwitch.tsx            Emergency halt
-│       ├── PmccBuilder.tsx           Diagonal LEAPS trade builder
+│       ├── PmccBuilder.tsx           LEAP trade builder
 │       └── ...
 │
 ├── docs/                             Architecture + screenshots
@@ -158,8 +158,8 @@ file + a registration line + an env var entry — no changes to agents.
 
 ## 5. Execution layer
 
-When a run produces a Trade ("Buy" or "PMCC"), the autotrade loop carries
-it through five gates before any order is placed:
+When a run produces a *Buy*, the autotrade loop carries it through five
+gates before any order is placed:
 
 1. **Kill switch.** Both an environment flag and a database-backed
    system-state row. Either one being off blocks every trade.
@@ -174,35 +174,35 @@ it through five gates before any order is placed:
    data-quality rejections, and abandoned walks are excluded — those
    aren't bugs.
 
-### Walking-limit combo executor
+### Walking-limit executor (single-leg LEAP)
 
-Multi-leg combos (PMCC, rolls) submit as one atomic IBKR Bag order. The
-executor walks the limit from mid + 1¢ toward a cap derived from the spread
-(default: mid + 25 % of half-spread), abandoning cleanly if the book moves
-away. Both legs fill simultaneously at one net price or neither does — no
-naked-leg risk.
-
-For sells (closes, credit rolls) the same algorithm runs in reverse: start
-at mid − 1¢, walk DOWN toward bid, capped at mid − 25 % of half-spread.
+Each LEAP entry is a single long call submitted via a walking-limit order
+that starts near mid and walks toward a cap derived from the spread
+(default: mid + a configurable % of half-spread), abandoning cleanly if the
+book moves away rather than crossing the full spread. There are no combos
+and no naked-leg risk — every position is one long call. Sells (exits,
+forward rolls) run the same algorithm in reverse, starting near mid and
+walking down toward the bid.
 
 ### Maintenance loop
 
-Polls during regular trading hours and handles position lifecycle:
+Polls during regular trading hours and handles the LEAP lifecycle. It is
+deliberately **long-biased: it never force-closes on an ordinary down day**
+— exits are signal-driven only.
 
-- **Defensive short-call roll** when the short delta climbs into the
-  0.65–0.75 band. Roll out 2–4 weeks, up to a strike above the expected
-  move and recent high, only if the net debit is under 30 % of the
-  original credit.
-- **Time-based short-call roll** as the short approaches expiry.
-- **Forward roll** of the LEAP when remaining tenor falls under six to
-  nine months. Force-close at 90 days to avoid the gamma cliff.
-- **Earnings hedge.** Closes the short call two sessions before the
-  print so the position isn't pinned through binary risk. Re-establishes
-  on the open after results.
-- **PMCC close** on thesis break (agent rating flips to *Avoid*) or LEAP
-  delta deterioration below 0.65.
-- **Stock exit** on *Avoid* rating or volatility breach (ATR > 2.5×
-  trailing 30-day ATR).
+- **Forward roll** of the LEAP when remaining tenor falls under ~six
+  months, to stay ahead of the time-decay / gamma cliff.
+- **Thesis-break exit** when the agent rating flips to *Avoid*, or on a
+  high-severity 8-K.
+- **Rotation exit pressure.** When the rotation detector confirms
+  institutions leaving the theme, exit sensitivity tightens (and new
+  entries into that theme halt).
+- **Momentum-exhaustion exit** from a blended signal — trend vs moving
+  averages, RSI, volume, opening range, ATR, auction imbalance, insider
+  and analyst pressure (all underlying-based; no short-dated option data).
+- **Position/intent reconciliation** — adopts broker positions with no
+  intent, and recovers "abandoned-but-filled" orders so nothing sits
+  unmanaged.
 
 Every action records to `auto_actions` with gate state, payload, IBKR
 order ID (when applicable), and outcome. The runs page in the UI surfaces
