@@ -59,6 +59,8 @@ async def main() -> int:
     ap.add_argument("--execute", action="store_true", help="Actually send orders (default: dry-run)")
     ap.add_argument("--pre-market-stocks", action="store_true",
                     help="Flag stock orders outsideRth so they fill in ETH (options always RTH)")
+    ap.add_argument("--market", action="store_true",
+                    help="Use MARKET orders (guaranteed fill on a forced flatten) instead of limits")
     args = ap.parse_args()
 
     from datetime import datetime
@@ -96,6 +98,7 @@ async def main() -> int:
 
     print(f"\nPositions to flatten: {len(plan)}")
     sent = 0
+    trades: list = []
     for p, sec, side, qty in plan:
         sym = p.get("symbol"); cid = int(p.get("conid") or 0)
         label = f"{sym} {sec}" + (f" {p.get('right')}{p.get('strike')} {p.get('expiry')}" if sec == "OPT" else "")
@@ -109,23 +112,45 @@ async def main() -> int:
         if contract is None:
             print(f"  SKIP {label}: could not qualify"); continue
 
-        bid, ask, last = await _quote(ib, contract)
-        limit = _limit_for(side, bid, ask, last)
-        if limit is None:
-            print(f"  {side} {qty:g} {label}: NO QUOTE — skipped (will retry)"); continue
+        # Price off the last_price get_positions already fetched (it pays the
+        # 3s subscription wait); only fall back to a fresh quote if missing.
+        last = float(p.get("last_price") or 0)
+        if last <= 0:
+            bid, ask, q_last = await _quote(ib, contract)
+            last = q_last or bid or 0
+        if last <= 0:
+            print(f"  {side} {qty:g} {label}: NO PRICE — skipped (will retry)"); continue
+        # Marketable limit: 1% through last to guarantee a fill on the flatten.
+        limit = round(last * (0.99 if side == "SELL" else 1.01), 2)
 
         outside = bool(args.pre_market_stocks and sec == "STK")
-        print(f"  {side} {qty:g} {label} @ LMT {limit} (bid={bid} ask={ask} last={last})"
-              + (" [ETH]" if outside else ""))
+        kind = "MKT" if args.market else f"LMT {limit}"
+        print(f"  {side} {qty:g} {label} @ {kind} (last={last})" + (" [ETH]" if outside else ""))
         if args.execute:
             try:
-                order = LimitOrder(side, qty, limit, tif="DAY", outsideRth=outside)
-                ib.placeOrder(contract, order)
+                if args.market:
+                    from ib_insync import MarketOrder  # type: ignore
+                    order = MarketOrder(side, qty)
+                else:
+                    order = LimitOrder(side, qty, limit, tif="DAY", outsideRth=outside)
+                trades.append(ib.placeOrder(contract, order))
                 sent += 1
             except Exception as e:
                 print(f"     submit failed: {e}")
 
     print(f"\n{'SENT ' + str(sent) + ' orders.' if args.execute else 'DRY-RUN — nothing sent.'}")
+    # Hold the connection and poll fills (orders need the socket alive to
+    # transmit + we want to confirm the flatten before exiting).
+    if args.execute and trades:
+        for _ in range(12):
+            await asyncio.sleep(5)
+            filled = sum(1 for t in trades if t.orderStatus.status == "Filled")
+            print(f"  fills: {filled}/{len(trades)}")
+            if filled == len(trades):
+                break
+        unfilled = [t for t in trades if t.orderStatus.status != "Filled"]
+        for t in unfilled:
+            print(f"  UNFILLED: {t.contract.symbol} {t.contract.secType} status={t.orderStatus.status}")
     try: await prov.aclose()
     except Exception: pass
     return 0
