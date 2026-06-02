@@ -582,6 +582,33 @@ async def _process_leaps_only(
         nav, sizing_factor, conviction_factor, total_cost,
     )
 
+    # ---- Capped-pyramiding guardrails (option B) -----------------------
+    _scfg = get_settings()
+    # (a) Liquidity: skip illiquid LEAPs whose bid/ask spread is too wide —
+    #     they fill far from fair value (the CRDO overpay).
+    _bid = getattr(cand.leap, "bid", None)
+    _ask = getattr(cand.leap, "ask", None)
+    if _bid and _ask and float(_ask) > 0 and leap_px > 0:
+        _spr = (float(_ask) - float(_bid)) / leap_px
+        if _spr > _scfg.ENTRY_MAX_LEAP_SPREAD_PCT:
+            async with db_session() as s:
+                await record_auto_action(
+                    s, loop="entry", action_type="open_leap_capped", gate_result=gate,
+                    symbol=symbol, payload={"run_id": run_id,
+                        "reason": f"illiquid: spread {_spr:.0%} > {_scfg.ENTRY_MAX_LEAP_SPREAD_PCT:.0%} of mid"},
+                    outcome="capped")
+            logger.info("auto-entry LEAPS: %s skipped — wide spread %.0f%%", symbol, _spr * 100)
+            return False
+    # (b) Per-name concentration + (c) margin headroom.
+    _cap = await _check_entry_caps(ib=ib, symbol=symbol, new_cost=total_cost, nav=nav)
+    if _cap is not None:
+        async with db_session() as s:
+            await record_auto_action(
+                s, loop="entry", action_type="open_leap_capped", gate_result=gate,
+                symbol=symbol, payload={"run_id": run_id, "reason": _cap}, outcome="capped")
+        logger.info("auto-entry LEAPS: %s capped — %s", symbol, _cap)
+        return False
+
     walking_cfg = {
         "initial_offset_cents": 5, "walk_increment_cents": 5,
         "walk_interval_sec": 30, "max_offset_pct_of_spread": 0.30, "timeout_sec": 300,
@@ -692,6 +719,47 @@ async def _fetch_nav(ib: Any) -> float:
     except Exception as e:
         logger.warning("entry_loop: NAV fetch failed: %s", e)
     return 0.0
+
+
+async def _check_entry_caps(*, ib: Any, symbol: str, new_cost: float, nav: float) -> "str | None":
+    """Capped-pyramiding guardrails (option B). Returns a reason string to
+    BLOCK the entry, or None to allow.
+
+    Adds to an already-held name are permitted, but bounded:
+      1. Per-name exposure (held premium on this underlying + the proposed
+         premium) must stay under ENTRY_MAX_NAME_PCT_OF_NAV.
+      2. The free-funds cushion remaining after the buy must stay above
+         ENTRY_MIN_MARGIN_CUSHION (a buffer well above the breaker floor).
+
+    Fails CLOSED — if positions/account can't be read, the entry is blocked
+    rather than placed blind.
+    """
+    s = get_settings()
+    try:
+        positions = await ib.get_positions()
+    except Exception as e:
+        return f"cap check: positions unreadable ({e})"
+    name_cost = 0.0
+    for p in positions:
+        if (p.get("symbol") or "").upper() == symbol.upper() and float(p.get("qty") or 0) != 0:
+            name_cost += abs(float(p.get("qty") or 0)) * float(p.get("avg_price") or 0) * 100.0
+    if nav > 0:
+        pct = (name_cost + new_cost) / nav
+        if pct > s.ENTRY_MAX_NAME_PCT_OF_NAV:
+            return (f"per-name cap: {symbol} would be {pct:.0%} of NAV "
+                    f"(cap {s.ENTRY_MAX_NAME_PCT_OF_NAV:.0%}; held ${name_cost:,.0f} + new ${new_cost:,.0f})")
+    try:
+        acct = await ib.get_account_summary()
+        netliq = float(acct.get("NetLiquidation") or 0)
+        avail = float(acct.get("AvailableFunds") or 0)
+    except Exception as e:
+        return f"cap check: account unreadable ({e})"
+    if netliq > 0:
+        cushion_after = (avail - new_cost) / netliq
+        if cushion_after < s.ENTRY_MIN_MARGIN_CUSHION:
+            return (f"margin headroom: entry would leave {cushion_after:.1%} cushion "
+                    f"(min {s.ENTRY_MIN_MARGIN_CUSHION:.0%}; avail ${avail:,.0f} - cost ${new_cost:,.0f})")
+    return None
 
 
 def _size_pmcc_contracts(

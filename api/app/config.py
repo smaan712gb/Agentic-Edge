@@ -213,6 +213,26 @@ class Settings(BaseSettings):
     # tight. 0.10 = require at least 10% free.
     BREAKER_MIN_MARGIN_CUSHION_PCT: float = 0.10
 
+    # ----- Entry caps (capped momentum pyramiding) --------------------
+    # Adds to a name that keeps confirming are ALLOWED, but bounded so the
+    # book never over-concentrates or runs to the breaker's margin floor
+    # (both happened on the first autonomous open). All three are pre-submit
+    # checks in the LEAPS entry path; failing one records an `open_leap_capped`
+    # audit row and skips the entry (it does NOT trip the breaker).
+    #
+    # Max total exposure to a single underlying as a fraction of NAV — caps
+    # pyramiding (held + proposed premium). 0.15 ≈ allows ~one add on a
+    # normal ~7%-of-NAV starter before it's capped.
+    ENTRY_MAX_NAME_PCT_OF_NAV: float = 0.15
+    # Require this much free-funds cushion to REMAIN after an entry — keeps a
+    # buffer well above the 10% breaker floor so sizing stops before margin
+    # gets tight, not at the cliff. 0.20 = leave ≥20% free.
+    ENTRY_MIN_MARGIN_CUSHION: float = 0.20
+    # Reject LEAP entries whose bid/ask spread exceeds this fraction of mid —
+    # illiquid LEAPs fill far from fair value (the CRDO overpay). 0.15 = skip
+    # if the spread is wider than 15% of mid.
+    ENTRY_MAX_LEAP_SPREAD_PCT: float = 0.15
+
     # ----- Limits / governance ----------------------------------------
     # MAX_RUNS_PER_USER_PER_HOUR was sized for the slow LangGraph pipeline
     # (one run took 30+ min, so 5/hr made sense). FastThemeRunner runs
