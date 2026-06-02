@@ -91,7 +91,16 @@ async def start_scheduler() -> None:
 
     state = await _read_state_or_seed()
 
-    _SCHEDULER = AsyncIOScheduler(timezone="America/New_York")
+    # Pin the scheduler to the CURRENTLY RUNNING uvicorn loop. Without an
+    # explicit event_loop, AsyncIOScheduler falls back to asyncio.get_event_loop()
+    # at start(), which under uvicorn + Python 3.12/3.13 can resolve to a loop
+    # that isn't the one being driven — jobs then get scheduled (next_run
+    # computed, scheduler reports "running") but their coroutines never fire.
+    # This is the same loop-binding gotcha the IBKR provider hit.
+    _SCHEDULER = AsyncIOScheduler(
+        timezone="America/New_York",
+        event_loop=asyncio.get_running_loop(),
+    )
     if state.scheduler_enabled:
         _add_or_update_job(state.scheduler_cron)
     # Closing-Bell Accumulation sweep: hourly during RTH, always-on
