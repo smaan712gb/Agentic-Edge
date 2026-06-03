@@ -1716,6 +1716,13 @@ async def _compute_daily_signals(symbol: str) -> dict[str, Optional[float]]:
     return out
 
 
+# Filings we've already alerted on, keyed by SEC link. find_new_8k_events can
+# re-return the same filing every tick; without this we'd re-alert + re-audit
+# the same 8-K ~once per tick (~156/day) and spam Slack. Resets on restart
+# (so a filing re-alerts at most once per process), which is fine.
+_ALERTED_FILING_LINKS: set[str] = set()
+
+
 async def _watch_8k_filings(pos_by_symbol: dict[str, dict]) -> dict[str, str]:
     """Sweep recent 8-K filings, write alerts, return per-symbol
     thesis-break strings for the high-severity ones.
@@ -1773,9 +1780,17 @@ async def _watch_8k_filings(pos_by_symbol: dict[str, dict]) -> dict[str, str]:
     if not events:
         return {}
 
-    # Audit + alert per event
+    # Audit + alert per event — but only ONCE per filing (dedup by SEC link),
+    # so the same 8-K doesn't re-alert/re-audit every tick. The thesis-break
+    # computation below still runs over ALL events (it's a live exit signal,
+    # not an alert), so deduping the alert never suppresses an exit.
     breaks_by_sym: dict[str, str] = {}
     for ev in events:
+        ev_link = ev.final_link or ev.link or f"{ev.symbol}:{ev.accepted_date or ev.filing_date}"
+        if ev_link in _ALERTED_FILING_LINKS:
+            continue  # already flagged this filing — skip audit + alert
+        _ALERTED_FILING_LINKS.add(ev_link)
+
         async with db_session() as s:
             await record_auto_action(
                 s, loop="maintenance",

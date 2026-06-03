@@ -10,8 +10,8 @@ flying blind"), not a stop-loss.
 Triggers (any one latches the breaker):
   * intraday NetLiq down more than BREAKER_INTRADAY_NAV_DROP_PCT from the
     day's opening NAV,
-  * available-funds cushion (AvailableFunds / NetLiq) below
-    BREAKER_MIN_MARGIN_CUSHION_PCT,
+  * margin-risk cushion (ExcessLiquidity / NetLiq — the real distance to a
+    margin call, NOT free cash) below BREAKER_MIN_MARGIN_CUSHION_PCT,
   * can't read the account or IBKR is disconnected (don't trade blind).
 
 Once tripped it **latches** in system_state until an operator re-arms via
@@ -61,12 +61,21 @@ async def check_entry_breaker(ib: Any) -> Optional[str]:
     # 2) Read live account health (network — outside the DB session).
     reason: Optional[str] = None
     netliq: Optional[float] = None
-    avail: Optional[float] = None
+    excess: Optional[float] = None
+    maint: Optional[float] = None
     account_ok = False
     try:
         summary = await ib.get_account_summary()
         netliq = _f(summary, "NetLiquidation")
-        avail = _f(summary, "AvailableFunds")
+        # ExcessLiquidity is the TRUE distance-to-margin-call. For a long-only,
+        # fully-paid options book it ~= NetLiq (no leverage), so it stays high
+        # even when fully invested. We deliberately do NOT use AvailableFunds
+        # here — that's just remaining cash (deployment headroom), which is
+        # near-zero when fully invested yet carries ZERO margin-call risk;
+        # using it false-tripped this breaker. Deployment discipline lives in
+        # the entry caps; this EMERGENCY breaker fires only on real danger.
+        excess = _f(summary, "ExcessLiquidity")
+        maint = _f(summary, "MaintMarginReq")
         account_ok = True
     except Exception as e:
         reason = f"account read failed ({e}) — pausing new entries"
@@ -108,12 +117,19 @@ async def check_entry_breaker(ib: Any) -> Optional[str]:
                     f"{-settings.BREAKER_INTRADAY_NAV_DROP_PCT*100:.0f}%"
                 )
 
-        if reason is None and avail is not None:
-            cushion = avail / netliq
+        # Real margin-risk cushion: ExcessLiquidity / NetLiq (fall back to
+        # (NetLiq - MaintMargin)/NetLiq). If neither is readable, assume safe
+        # (1.0) rather than false-trip.
+        cushion = None
+        if excess is not None:
+            cushion = excess / netliq
+        elif maint is not None:
+            cushion = (netliq - maint) / netliq
+        if reason is None and cushion is not None:
             if cushion < settings.BREAKER_MIN_MARGIN_CUSHION_PCT:
                 reason = (
-                    f"margin cushion {cushion*100:.1f}% "
-                    f"(AvailableFunds ${avail:,.0f} / NetLiq ${netliq:,.0f}); "
+                    f"margin cushion {cushion*100:.1f}% (excess-liquidity basis); "
+                    f"NetLiq ${netliq:,.0f}; "
                     f"floor {settings.BREAKER_MIN_MARGIN_CUSHION_PCT*100:.0f}%"
                 )
 

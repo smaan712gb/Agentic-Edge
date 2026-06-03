@@ -644,7 +644,10 @@ async def _process_leaps_only(
     _s = get_settings()
     exec_cfg = ExecutionConfig(initial_offset_cents=5, walk_increment_cents=5,
                                walk_interval_sec=5,
-                               max_offset_pct_of_spread=_s.LEAP_ENTRY_CAP_PCT, timeout_sec=120)
+                               # 180s (was 120): the Adaptive algo works toward
+                               # mid over minutes; a short budget made us abandon
+                               # before the fill landed (then reconcile caught it).
+                               max_offset_pct_of_spread=_s.LEAP_ENTRY_CAP_PCT, timeout_sec=180)
     try:
         result = await submit_single_leg_option(
             ibkr=ib, conid=cand.leap.conid, contracts=n_contracts,
