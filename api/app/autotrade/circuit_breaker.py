@@ -117,19 +117,24 @@ async def check_entry_breaker(ib: Any) -> Optional[str]:
                     f"{-settings.BREAKER_INTRADAY_NAV_DROP_PCT*100:.0f}%"
                 )
 
-        # Real margin-risk cushion: ExcessLiquidity / NetLiq (fall back to
-        # (NetLiq - MaintMargin)/NetLiq). If neither is readable, assume safe
-        # (1.0) rather than false-trip.
+        # TRUE margin-risk cushion = (NetLiq - MaintMarginReq) / NetLiq.
+        # This uses NetLiq (which INCLUDES the option value) minus the actual
+        # maintenance requirement. For a long-only, fully-paid book MaintMargin
+        # is $0 -> cushion 100% -> no margin-call risk, correctly no trip.
+        # We deliberately do NOT use ExcessLiquidity/AvailableFunds: long
+        # options have no loan value, so those collapse to just the cash
+        # balance and badly understate the real cushion (they read ~6-10% on a
+        # 100%-safe book). Deployment discipline lives in the soft entry cap.
         cushion = None
-        if excess is not None:
-            cushion = excess / netliq
-        elif maint is not None:
+        if maint is not None:
             cushion = (netliq - maint) / netliq
+        elif excess is not None:
+            cushion = excess / netliq  # fallback only if MaintMarginReq missing
         if reason is None and cushion is not None:
             if cushion < settings.BREAKER_MIN_MARGIN_CUSHION_PCT:
                 reason = (
-                    f"margin cushion {cushion*100:.1f}% (excess-liquidity basis); "
-                    f"NetLiq ${netliq:,.0f}; "
+                    f"maintenance-margin cushion {cushion*100:.1f}%; "
+                    f"NetLiq ${netliq:,.0f}, MaintMargin ${maint or 0:,.0f}; "
                     f"floor {settings.BREAKER_MIN_MARGIN_CUSHION_PCT*100:.0f}%"
                 )
 
