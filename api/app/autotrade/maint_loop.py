@@ -1228,6 +1228,25 @@ async def _evaluate_stock(
                               exit_kind=decision.exit_kind, ib=ib)
 
 
+async def _live_intraday_change_pct(symbol: str) -> Optional[float]:
+    """Current intraday % change vs prior close from a LIVE quote (decimal,
+    e.g. -0.14). Daily-bar data lags a full day intraday, so any same-day
+    reactive logic (the earnings-miss detector) must use a live quote to see a
+    crash. None if unavailable."""
+    try:
+        from tradingagents.dataflows.providers.fmp import FmpProvider
+        p = FmpProvider()
+        body = await p._http.get_json(
+            "/stable/quote", params={"symbol": symbol, "apikey": p._api_key})
+        if isinstance(body, list) and body:
+            ch = body[0].get("changePercentage")
+            if ch is not None:
+                return float(ch) / 100.0
+    except Exception as e:
+        logger.debug("live intraday change fetch failed for %s: %s", symbol, e)
+    return None
+
+
 async def _evaluate_pmcc(intent: TradeIntent, latest_decision: Optional[str], ib: Any,
                          filing_thesis_break: Optional[str] = None) -> None:
     """Roll/exit decisions for a PMCC / LEAP position. Currently flags only;
@@ -1274,8 +1293,13 @@ async def _evaluate_pmcc(intent: TradeIntent, latest_decision: Optional[str], ib
         _cfg = get_settings()
         dse = await days_since_last_earnings(intent.symbol)
         if dse is not None and 0 <= dse <= _cfg.EARNINGS_BREAK_SESSIONS:
-            sig = await _compute_daily_signals(intent.symbol)
-            move = sig.get("pct_move_today")
+            # Use a LIVE intraday quote, NOT daily bars: provider daily bars lag
+            # a full day intraday, so they read yesterday's move and would miss
+            # a same-day earnings crash (this is exactly why AVGO's -14% wasn't
+            # seen). FMP /quote gives the live % change vs prior close.
+            move = await _live_intraday_change_pct(intent.symbol)
+            if move is None:  # fall back to daily bar only if live quote unavailable
+                move = (await _compute_daily_signals(intent.symbol)).get("pct_move_today")
             if move is not None and move <= -abs(_cfg.EARNINGS_BREAK_DROP_PCT):
                 await _flag_pmcc_close(
                     intent=intent,
