@@ -238,7 +238,8 @@ async def _tick() -> None:
                 # leap_only (LEAPS-only strategy) shares the LEAP close +
                 # forward-roll logic; the short-call branches inside are guarded
                 # by short_call presence, so they no-op for a bare long LEAP.
-                await _evaluate_pmcc(intent, latest_decisions.get(sym), ib)
+                await _evaluate_pmcc(intent, latest_decisions.get(sym), ib,
+                                     filing_thesis_break=filing_breaks_by_symbol.get(sym))
         except Exception as e:
             logger.exception("maint loop: %s evaluation failed: %s", sym, e)
 
@@ -1227,8 +1228,9 @@ async def _evaluate_stock(
                               exit_kind=decision.exit_kind, ib=ib)
 
 
-async def _evaluate_pmcc(intent: TradeIntent, latest_decision: Optional[str], ib: Any) -> None:
-    """Roll/exit decisions for a PMCC position. Currently flags only;
+async def _evaluate_pmcc(intent: TradeIntent, latest_decision: Optional[str], ib: Any,
+                         filing_thesis_break: Optional[str] = None) -> None:
+    """Roll/exit decisions for a PMCC / LEAP position. Currently flags only;
     actual roll execution requires the option-chain probe + combo build,
     same path as entries. For Phase D v1 we mark intent flags + alert
     the operator; v2 will auto-fire the rolls."""
@@ -1245,6 +1247,19 @@ async def _evaluate_pmcc(intent: TradeIntent, latest_decision: Optional[str], ib
     )
     if close.should_exit:
         await _flag_pmcc_close(intent=intent, reason=close.reason, kind=close.exit_kind)
+        return
+
+    # 8-K / earnings thesis-break (e.g. a guidance-cut or earnings-miss filing).
+    # LEAP positions previously NEVER received this signal — only stocks did —
+    # so a held LEAP could ride straight through a thesis-changing filing. Treat
+    # a high-severity filing break like an Avoid: flag the LEAP for close. (This
+    # is the EXISTING thesis-break mechanism, now correctly routed to LEAPs.)
+    if filing_thesis_break:
+        await _flag_pmcc_close(
+            intent=intent,
+            reason=f"filing thesis-break: {filing_thesis_break}",
+            kind="thesis_break",
+        )
         return
 
     # Earnings hedge check — only meaningful when there's a SHORT call to buy
