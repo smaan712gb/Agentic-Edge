@@ -233,6 +233,17 @@ class Settings(BaseSettings):
     # if the spread is wider than 15% of mid.
     ENTRY_MAX_LEAP_SPREAD_PCT: float = 0.15
 
+    # ----- Earnings-miss crash detector (high-beta-aware exit) ----------
+    # The ONE exit trigger that's allowed to fire on a sharp drop — but it is
+    # GATED on earnings proximity so it can NEVER trip on a normal high-beta
+    # down day (those have no earnings event attached). It arms only within
+    # EARNINGS_BREAK_SESSIONS sessions of a report AND only on a move worse
+    # than EARNINGS_BREAK_DROP_PCT. A routine -8% beta day → not near earnings
+    # → ignored. A -25% earnings-miss crash (the AVGO case) → flagged for close.
+    # It FLAGS + alerts (operator-confirmed close), not a naked auto-dump.
+    EARNINGS_BREAK_SESSIONS: int = 2
+    EARNINGS_BREAK_DROP_PCT: float = 0.12
+
     # ----- Limits / governance ----------------------------------------
     # MAX_RUNS_PER_USER_PER_HOUR was sized for the slow LangGraph pipeline
     # (one run took 30+ min, so 5/hr made sense). FastThemeRunner runs

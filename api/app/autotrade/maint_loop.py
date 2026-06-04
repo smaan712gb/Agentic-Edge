@@ -1262,6 +1262,32 @@ async def _evaluate_pmcc(intent: TradeIntent, latest_decision: Optional[str], ib
         )
         return
 
+    # Earnings-miss crash detector (high-beta-aware). This is the ONLY exit
+    # path allowed to fire on a sharp drop — and it is GATED ON EARNINGS
+    # PROXIMITY, never raw drawdown, so a normal high-beta down day (no earnings
+    # event) can't trip it. It arms only within EARNINGS_BREAK_SESSIONS of a
+    # report AND only on a move worse than EARNINGS_BREAK_DROP_PCT. The AVGO
+    # case (-25% the session after a miss) trips it; a routine -8% beta day does
+    # not. Flags + alerts (operator-confirmed close), not a naked auto-dump.
+    try:
+        from tradingagents.strategies.maintenance.earnings import days_since_last_earnings
+        _cfg = get_settings()
+        dse = await days_since_last_earnings(intent.symbol)
+        if dse is not None and 0 <= dse <= _cfg.EARNINGS_BREAK_SESSIONS:
+            sig = await _compute_daily_signals(intent.symbol)
+            move = sig.get("pct_move_today")
+            if move is not None and move <= -abs(_cfg.EARNINGS_BREAK_DROP_PCT):
+                await _flag_pmcc_close(
+                    intent=intent,
+                    reason=(f"earnings-miss crash: {intent.symbol} {move*100:.0f}% "
+                            f"{dse} session(s) after earnings — fundamental break, "
+                            f"not a normal drawdown"),
+                    kind="earnings_break",
+                )
+                return
+    except Exception as e:
+        logger.debug("earnings-break check failed for %s: %s", intent.symbol, e)
+
     # Earnings hedge check — only meaningful when there's a SHORT call to buy
     # back. A bare long LEAP (LEAPS-only) has no short leg to hedge, so skip.
     days_to_e = await days_to_earnings(intent.symbol)
