@@ -148,6 +148,13 @@ class Settings(BaseSettings):
     MANAGER_CONVICTION_ENABLED: bool = True
     MANAGER_CONVICTION_MAX_FACTOR: float = 1.30   # cap: 4+ confirming managers
 
+    # Clustered OPPORTUNISTIC insider BUYING (>=2 officers/directors/10%-owners
+    # making open-market 'P' purchases in 30d) is a high-conviction accumulation
+    # signal. Like manager conviction it's a bounded BOOST only, never a gate.
+    INSIDER_BUY_CONVICTION_ENABLED: bool = True
+    INSIDER_BUY_CONVICTION_FACTOR: float = 1.15   # applied when a cluster is present
+    INSIDER_BUY_MIN_USD: float = 200_000          # 30d cluster $ floor
+
     # ----- SEC EDGAR (Hedge Fund Signal Tracker) ----------------------
     # SEC requires a descriptive User-Agent with a contact email or it 403s
     # every request. With this unset the EDGAR poller no-ops (logs a warning)
@@ -172,6 +179,14 @@ class Settings(BaseSettings):
     # via the rotation subscore (25 -> max subscore, weight 0.15 ≈ +15 pts of
     # composite) — tightens the existing signal, never forces a drawdown exit.
     ROTATION_EXIT_PRESSURE_DELTA: float = 25.0
+
+    # ----- Quant Research Factory (decision-support, never a gate) -----
+    # Point-in-time feature store + IC/alpha-decay research harness. The
+    # nightly snapshot writes one feature row per theme symbol; the labeler
+    # backfills forward returns; the harness measures which signals predict
+    # returns and how fast their edge decays. Off-switch only — research-only,
+    # no entry/exit gate reads it. See research/quant_factory.md.
+    FEATURE_FACTORY_ENABLED: bool = True
 
     # ----- Execution (IBKR) -------------------------------------------
     IBKR_HOST: str = "127.0.0.1"

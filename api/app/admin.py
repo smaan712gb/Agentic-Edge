@@ -349,8 +349,8 @@ async def manual_exit_position(
                 i.position_state = "closing"
             s.add(TradeAuditLog(
                 intent_id=intent_id, action="manual_pmcc_close_outcome",
-                outcome=result.status, payload=result.to_dict(),
-                error=result.error,
+                outcome=result.status,
+                payload={**result.to_dict(), "error": result.error},
             ))
         return {"ok": True, "intent_id": intent_id, "execution": result.to_dict()}
 
@@ -486,3 +486,34 @@ async def closing_accumulation_today(
         })
     return {"date": today_dt.date().isoformat(), "count": len(out),
             "signals": out}
+
+
+# ---------------------------------------------------------------------------
+# Quant Research Factory — manual feature snapshot / label triggers
+# ---------------------------------------------------------------------------
+
+
+@router.post("/features/snapshot-now")
+async def features_snapshot_now(
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+    with_market: bool = True,
+    with_flow: bool = True,
+) -> dict[str, Any]:
+    """Compute + persist a point-in-time feature snapshot for the whole
+    universe right now. Graph + cross-theme features always populate; market /
+    flow are best-effort (toggle off to snapshot instantly without provider
+    calls). Idempotent per (symbol, today). Research-only — no gate reads it."""
+    _require_admin(x_admin_token)
+    from .research.features import build_snapshot
+    return await build_snapshot(with_market=with_market, with_flow=with_flow)
+
+
+@router.post("/features/label-now")
+async def features_label_now(
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    """Backfill realised forward-return labels onto every snapshot whose
+    forward window has elapsed. Idempotent."""
+    _require_admin(x_admin_token)
+    from .research.labeler import run_labeler
+    return await run_labeler()

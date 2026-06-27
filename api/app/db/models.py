@@ -634,6 +634,42 @@ class PositionChange(Base):
     computed_at:    Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
 
 
+class StakeFiling(Base):
+    """A Schedule 13D/13G (and amendments) filed ABOUT a subject company we
+    care about (a current holding or a theme-universe name) — the near-real-
+    time institutional-stake layer, keyed by SUBJECT, not by tracked manager.
+
+    The filer is recovered from the accession number's leading CIK (the SEC
+    assigns the accession under the submitting entity), so we can track one
+    filer's stake in one subject across amendments and detect an abrupt
+    REDUCTION or EXIT (the 13G/A signal). ``accession_no`` is the idempotency
+    key."""
+
+    __tablename__ = "stake_filings"
+    __table_args__ = (
+        UniqueConstraint("accession_no", name="uq_stake_accession"),
+        Index("ix_stake_subject_ticker", "subject_ticker"),
+        Index("ix_stake_subject_filer", "subject_cik", "filer_cik"),
+        Index("ix_stake_filed_at", "filed_at"),
+    )
+
+    id:               Mapped[int]    = mapped_column(Integer, primary_key=True, autoincrement=True)
+    subject_ticker:   Mapped[Optional[str]] = mapped_column(String(12), nullable=True)
+    subject_cik:      Mapped[str]    = mapped_column(String(10), nullable=False)
+    filer_cik:        Mapped[str]    = mapped_column(String(10), nullable=False)
+    form_type:        Mapped[str]    = mapped_column(String(24), nullable=False)   # SCHEDULE 13D / 13G / .../A
+    accession_no:     Mapped[str]    = mapped_column(String(32), nullable=False)
+    filed_at:         Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    percent_of_class: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    prior_percent:    Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # new | increase | reduce | exit | hold | initial
+    change_type:      Mapped[str]    = mapped_column(String(10), nullable=False, default="initial")
+    is_activist:      Mapped[bool]   = mapped_column(Boolean, nullable=False, default=False)   # 13D
+    is_holding:       Mapped[bool]   = mapped_column(Boolean, nullable=False, default=False)   # subject is in our book at ingest
+    raw_url:          Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    ingested_at:      Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
 class NewsMention(Base):
     """A chokepoint-relevant news item for a tracked ticker (Phase 3).
 
@@ -684,6 +720,40 @@ class ThemeRotation(Base):
     signals_tripped: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)   # list[str]
     evidence:        Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)   # per-signal detail
     computed_at:     Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+
+
+class SymbolFeatureSnapshot(Base):
+    """Point-in-time quant feature row — one per (symbol, as_of).
+
+    The keystone of the Quant Research Factory (see research/quant_factory.md).
+    Every value in ``features`` is known AS OF ``as_of`` (no lookahead), so the
+    validation harness can backtest honestly. ``labels`` (forward returns) are
+    NULL on insert and backfilled by ``research.labeler`` once the future is
+    known; ``label_status`` tracks that lifecycle (pending → partial → final).
+
+    Feature families live side-by-side in the JSON blob (graph, cross-theme,
+    market, flow, plus cross-sectional ``z_*`` standardizations) so adding a
+    family is a writer change, not a migration — same pattern as the rotation
+    and closing-accumulation evidence blobs. Research-only: never read by an
+    entry/exit gate."""
+
+    __tablename__ = "symbol_feature_snapshots"
+    __table_args__ = (
+        UniqueConstraint("symbol", "as_of", name="uq_symfeat_symbol_asof"),
+        Index("ix_symfeat_as_of", "as_of"),
+        Index("ix_symfeat_symbol_asof", "symbol", "as_of"),
+        Index("ix_symfeat_label_status", "label_status"),
+    )
+
+    id:           Mapped[int]      = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol:       Mapped[str]      = mapped_column(String(10), nullable=False)
+    as_of:        Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    features:     Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    labels:       Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    # pending = no forward window yet; partial = some horizons known; final = all known.
+    label_status: Mapped[str]      = mapped_column(String(12), nullable=False, default="pending")
+    created_at:   Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
+    updated_at:   Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False)
 
 
 class CusipTickerMap(Base):

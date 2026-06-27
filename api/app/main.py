@@ -294,6 +294,10 @@ app.include_router(_trade_intents_router)
 from .hedge_funds.routes import router as _hedge_funds_router  # noqa: E402
 app.include_router(_hedge_funds_router)
 
+# Quant Research Factory — universe-graph + point-in-time feature reads.
+from .research.routes import router as _research_router  # noqa: E402
+app.include_router(_research_router)
+
 
 # ---------------------------------------------------------------------------
 # Health + agents

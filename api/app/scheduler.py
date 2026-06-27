@@ -77,6 +77,23 @@ _EDGAR_JOB_ID = "edgar_signal_sweep"
 # catching a new 13D within minutes during the trading day.
 _EDGAR_CRON = "*/15 8-20 * * 1-5"
 
+_STAKE_JOB_ID = "stake_watch_sweep"
+# Subject-company 13D/13G watch over holdings + universe. Heavier than the
+# manager poller (one list_filings per subject), so every 30 min during
+# extended hours is a sane cadence — still catches a same-day 13D/13G/A while
+# staying well under SEC's fair-access limit (idempotent via accession_no).
+_STAKE_CRON = "5,35 8-20 * * 1-5"
+
+_FEATURE_SNAPSHOT_JOB_ID = "feature_snapshot"
+# Once daily after the close (16:30 ET, Mon-Fri) — capture each theme symbol's
+# point-in-time feature row on settled EOD data. Idempotent per (symbol, day).
+_FEATURE_SNAPSHOT_CRON = "30 16 * * 1-5"
+
+_FEATURE_LABEL_JOB_ID = "feature_label_backfill"
+# Daily at 17:00 ET — backfill realised forward returns onto snapshots whose
+# forward window has elapsed. Idempotent; only touches non-final rows.
+_FEATURE_LABEL_CRON = "0 17 * * 1-5"
+
 
 # ---------------------------------------------------------------------------
 # Public API — start / stop / fire
@@ -121,6 +138,14 @@ async def start_scheduler() -> None:
             id=_EDGAR_JOB_ID, replace_existing=True,
             misfire_grace_time=300, max_instances=1, coalesce=True,
         )
+        # Subject-company 13D/13G stake watch over holdings + universe —
+        # near-real-time institutional-stake + abrupt-exit signal.
+        _SCHEDULER.add_job(
+            _run_stake_watch_job,
+            trigger=CronTrigger.from_crontab(_STAKE_CRON, timezone="America/New_York"),
+            id=_STAKE_JOB_ID, replace_existing=True,
+            misfire_grace_time=300, max_instances=1, coalesce=True,
+        )
     # Phase 3 chokepoint news sweep — always-on (decision-support).
     if get_settings().NEWS_SWEEP_ENABLED:
         _SCHEDULER.add_job(
@@ -136,6 +161,21 @@ async def start_scheduler() -> None:
             trigger=CronTrigger.from_crontab(_ROTATION_CRON, timezone="America/New_York"),
             id=_ROTATION_JOB_ID, replace_existing=True,
             misfire_grace_time=300, max_instances=1, coalesce=True,
+        )
+    # Quant Research Factory — nightly feature snapshot + label backfill.
+    # Always-on decision-support; never trades, no gate reads its output.
+    if get_settings().FEATURE_FACTORY_ENABLED:
+        _SCHEDULER.add_job(
+            _run_feature_snapshot_job,
+            trigger=CronTrigger.from_crontab(_FEATURE_SNAPSHOT_CRON, timezone="America/New_York"),
+            id=_FEATURE_SNAPSHOT_JOB_ID, replace_existing=True,
+            misfire_grace_time=600, max_instances=1, coalesce=True,
+        )
+        _SCHEDULER.add_job(
+            _run_feature_label_job,
+            trigger=CronTrigger.from_crontab(_FEATURE_LABEL_CRON, timezone="America/New_York"),
+            id=_FEATURE_LABEL_JOB_ID, replace_existing=True,
+            misfire_grace_time=600, max_instances=1, coalesce=True,
         )
     # System health monitor — always-on 'no unknowns' guardrail. Never
     # trades; alerts on any broken invariant every 15 min.
@@ -355,6 +395,30 @@ async def _run_news_sweep_job() -> None:
         logger.exception("news sweep tick failed: %s", e)
 
 
+async def _run_feature_snapshot_job() -> None:
+    """Nightly quant-feature snapshot across the theme universe. Idempotent
+    per (symbol, day). Research-only — never trades, no gate reads it."""
+    try:
+        from .research.features import build_snapshot
+        result = await build_snapshot()
+        logger.info("feature snapshot tick: %d symbols, %d written",
+                    result.get("symbols", 0), result.get("written", 0))
+    except Exception as e:
+        logger.exception("feature snapshot tick failed: %s", e)
+
+
+async def _run_feature_label_job() -> None:
+    """Backfill realised forward returns onto elapsed snapshots. Idempotent."""
+    try:
+        from .research.labeler import run_labeler
+        result = await run_labeler()
+        logger.info("feature label tick: %d symbols, %d rows updated, %d finalised",
+                    result.get("symbols", 0), result.get("rows_updated", 0),
+                    result.get("finalised", 0))
+    except Exception as e:
+        logger.exception("feature label tick failed: %s", e)
+
+
 async def _run_edgar_sweep_job() -> None:
     """Fire the Hedge Fund Signal Tracker EDGAR sweep on its 15-min tick.
 
@@ -374,6 +438,27 @@ async def _run_edgar_sweep_job() -> None:
             )
     except Exception as e:
         logger.exception("EDGAR sweep tick failed: %s", e)
+
+
+async def _run_stake_watch_job() -> None:
+    """Fire the subject-company 13D/13G stake watch on its 30-min tick.
+
+    Idempotent (accession-keyed). Surfaces activist 13Ds, new/added passive
+    stakes, and — the key signal — abrupt institutional reductions/exits on
+    names we hold (flag-only, never auto-closes)."""
+    try:
+        from .hedge_funds.stake_watch import run_stake_watch
+        result = await run_stake_watch()
+        if result.get("skipped_reason"):
+            logger.info("stake watch tick skipped: %s", result["skipped_reason"])
+        else:
+            logger.info(
+                "stake watch tick: %d subjects, %d new 13D/G, %d reductions, %d activist",
+                result.get("subjects_scanned", 0), result.get("new_filings", 0),
+                result.get("reductions_flagged", 0), result.get("activist_flagged", 0),
+            )
+    except Exception as e:
+        logger.exception("stake watch tick failed: %s", e)
 
 
 # ---------------------------------------------------------------------------
