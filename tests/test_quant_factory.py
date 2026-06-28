@@ -25,6 +25,7 @@ from api.app.research import montecarlo as mc
 from api.app.research import event_study as es
 from api.app.research import impact_graph as ig
 from api.app.research import ner
+from api.app.research import overlay as ov
 
 
 # ---------------------------------------------------------------------------
@@ -352,3 +353,57 @@ def test_ner_word_boundary_no_false_ticker():
     # 'MUSEUM' must not surface ticker 'MU'.
     ents = ner.extract_entities("the MUSEUM opened", universe_symbols={"MU"})
     assert ents["tickers"] == []
+
+
+# ---------------------------------------------------------------------------
+# Quant overlay — autonomous wiring (pure cores)
+# ---------------------------------------------------------------------------
+
+
+def test_blended_weights_cold_start_is_prior():
+    # No labels (n=0) -> weight stays at the theory prior, for every signal.
+    prior = {"z_theme_centrality": 1.0, "z_momentum_60d": 0.4}
+    ic = {"z_theme_centrality": 0.2, "z_momentum_60d": 0.1}
+    n0 = {"z_theme_centrality": 0, "z_momentum_60d": 0}
+    assert ov.blended_weights(prior, ic, n0) == prior
+
+
+def test_blended_weights_shifts_toward_measured_ic():
+    # With lots of labelled data, a strong positive IC pulls the weight UP off a
+    # small prior; NaN IC stays on prior regardless of n.
+    prior = {"a": 0.2, "b": 0.5}
+    ic = {"a": 0.3, "b": float("nan")}
+    n = {"a": 100000, "b": 100000}
+    w = ov.blended_weights(prior, ic, n, k=ov.SHRINKAGE_K)
+    assert w["a"] > prior["a"]            # strong IC lifts it
+    assert w["b"] == 0.5                  # NaN IC -> untouched prior
+
+
+def test_blended_weights_negative_ic_floors_at_zero():
+    # A signal that anti-predicts gets driven toward 0, never negative.
+    w = ov.blended_weights({"a": 0.5}, {"a": -0.3}, {"a": 100000})
+    assert 0.0 <= w["a"] < 0.5
+
+
+def test_quant_edge_strong_weak_neutral():
+    weights = {"z_theme_centrality": 1.0, "z_smartmoney_theme_confirm": 0.8}
+    strong = ov.quant_edge({"z_theme_centrality": 2.5, "z_smartmoney_theme_confirm": 2.0}, weights)
+    weak = ov.quant_edge({"z_theme_centrality": -2.5, "z_smartmoney_theme_confirm": -2.0}, weights)
+    empty = ov.quant_edge({}, weights)
+    assert strong["label"] == "STRONG" and strong["score"] > 64
+    assert weak["label"] == "WEAK" and weak["score"] < 36
+    assert empty["label"] == "NEUTRAL" and empty["score"] == 50.0
+
+
+def test_quant_edge_normalizes_persona_scale():
+    # persona_* is 0..100; 75 should read as a clear positive (~+1 z).
+    e_hi = ov.quant_edge({"persona_aschenbrenner": 90.0}, {"persona_aschenbrenner": 1.0})
+    e_lo = ov.quant_edge({"persona_aschenbrenner": 10.0}, {"persona_aschenbrenner": 1.0})
+    assert e_hi["score"] > 50.0 > e_lo["score"]
+
+
+def test_format_block_is_human_readable():
+    block = ov.format_block("ETN", {"z_theme_centrality": 2.0}, {"z_theme_centrality": 1.0}, "prior")
+    assert "QUANT EDGE" in block
+    assert "chokepoint centrality" in block
+    assert "theory-prior" in block       # cold-start confidence note

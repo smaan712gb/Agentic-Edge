@@ -94,6 +94,12 @@ _FEATURE_LABEL_JOB_ID = "feature_label_backfill"
 # forward window has elapsed. Idempotent; only touches non-final rows.
 _FEATURE_LABEL_CRON = "0 17 * * 1-5"
 
+_OVERLAY_RECAL_JOB_ID = "quant_overlay_recalibrate"
+# Daily at 17:15 ET — AFTER the label backfill, so the IC harness sees the
+# freshest forward returns. Re-blends each quant signal's weight off its theory
+# prior toward measured predictiveness. Fully autonomous self-tuning.
+_OVERLAY_RECAL_CRON = "15 17 * * 1-5"
+
 
 # ---------------------------------------------------------------------------
 # Public API — start / stop / fire
@@ -177,6 +183,13 @@ async def start_scheduler() -> None:
             id=_FEATURE_LABEL_JOB_ID, replace_existing=True,
             misfire_grace_time=600, max_instances=1, coalesce=True,
         )
+        if get_settings().QUANT_OVERLAY_ENABLED:
+            _SCHEDULER.add_job(
+                _run_overlay_recalibrate_job,
+                trigger=CronTrigger.from_crontab(_OVERLAY_RECAL_CRON, timezone="America/New_York"),
+                id=_OVERLAY_RECAL_JOB_ID, replace_existing=True,
+                misfire_grace_time=600, max_instances=1, coalesce=True,
+            )
     # System health monitor — always-on 'no unknowns' guardrail. Never
     # trades; alerts on any broken invariant every 15 min.
     _SCHEDULER.add_job(
@@ -419,6 +432,18 @@ async def _run_feature_label_job() -> None:
         logger.exception("feature label tick failed: %s", e)
 
 
+async def _run_overlay_recalibrate_job() -> None:
+    """Autonomously re-tune the quant-overlay signal weights toward measured IC.
+    Runs after the label backfill so the harness sees the freshest returns."""
+    try:
+        from .research.overlay import recalibrate_weights
+        rec = await asyncio.to_thread(recalibrate_weights, None)
+        logger.info("overlay recalibrate tick: source=%s n_labelled=%s",
+                    rec.get("source"), rec.get("n_labelled"))
+    except Exception as e:
+        logger.exception("overlay recalibrate tick failed: %s", e)
+
+
 async def _run_edgar_sweep_job() -> None:
     """Fire the Hedge Fund Signal Tracker EDGAR sweep on its 15-min tick.
 
@@ -483,6 +508,17 @@ async def _run_all_themes_job() -> None:
              [sy.symbol for sy in sorted(t.symbols, key=lambda x: x.position)])
             for t in themes
         ]
+
+    # Quant overlay: build TODAY's feature snapshot before scoring so the
+    # scorecard reads same-day signals. Idempotent + best-effort — a failure
+    # must not block signal generation.
+    if get_settings().QUANT_OVERLAY_ENABLED:
+        try:
+            from .research.features import ensure_todays_snapshot
+            snap = await ensure_todays_snapshot()
+            logger.info("scheduled run: feature snapshot ready (%s)", snap.get("reason", "built"))
+        except Exception as e:
+            logger.warning("scheduled run: feature snapshot pre-build failed: %s", e)
 
     success = 0
     skipped = 0

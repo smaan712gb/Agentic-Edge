@@ -188,6 +188,14 @@ class Settings(BaseSettings):
     # no entry/exit gate reads it. See research/quant_factory.md.
     FEATURE_FACTORY_ENABLED: bool = True
 
+    # Quant overlay: autonomously inject the research factory's per-symbol
+    # signals into the scorecard's per-ticker LLM context so the AI's own
+    # Buy/Hold/Avoid + conviction (which drive entry ranking and sizing) factor
+    # in centrality, smart-money, dark-pool, momentum, flow, and personas. Signal
+    # weights self-tune from a theory prior toward measured IC — no human gate.
+    # Off-switch only.
+    QUANT_OVERLAY_ENABLED: bool = True
+
     # ----- Execution (IBKR) -------------------------------------------
     IBKR_HOST: str = "127.0.0.1"
     IBKR_PORT: int = 7497

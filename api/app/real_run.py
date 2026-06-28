@@ -16,6 +16,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any
 
+from .config import get_settings
 from .db import get_session as db_session
 from .main import AgentEvent, RUN_QUEUES, SymbolScore  # type: ignore[attr-defined]
 from .repos import EventRepo, RunRepo
@@ -67,10 +68,26 @@ async def real_run(run_id: str, theme: dict[str, Any]) -> None:
         await q.put({"type": "done", "run": {"id": run_id, "status": "error"}})
         return
 
+    # Quant overlay — autonomously fold the research factory into the decision.
+    # Ensure today's feature snapshot exists (same-day freshness), then build the
+    # per-ticker quant-signal block the scorer weighs. Best-effort: a failure
+    # here must never block a run — the scorer simply scores without the block.
+    extra_context: dict[str, str] = {}
+    if get_settings().QUANT_OVERLAY_ENABLED:
+        try:
+            from .research.features import ensure_todays_snapshot
+            from .research.overlay import build_extra_context
+            await ensure_todays_snapshot()
+            extra_context = await build_extra_context(list(theme["symbols"]))
+        except Exception as e:
+            logger.warning("quant overlay unavailable for run %s (%s) — scoring without it",
+                           run_id, e)
+
     theme_in = ThemeInput(
         id=theme["id"], name=theme["name"],
         thesis=theme["thesis"], chokepoint=theme.get("chokepoint", ""),
         tickers=list(theme["symbols"]),
+        extra_context=extra_context,
     )
 
     # Per-ticker finished-event count differs by runner:

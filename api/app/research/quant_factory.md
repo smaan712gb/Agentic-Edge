@@ -1,10 +1,14 @@
 # Quant Research Factory — design
 
-> Status: **decision-support / research layer.** Like the Hedge Fund Tracker and
-> Rotation Detector, nothing here is wired to a live entry/exit gate. Promotion
-> of any signal to a gate stays human-gated through the validation harness
-> (`feature_research.py`), exactly as exit-pressure weights are promoted through
-> `exit_pressure_replay.py`.
+> Status: **autonomously wired into the trade decision.** The factory's signals
+> are injected into the scorecard's per-ticker LLM context via the **quant
+> overlay** (`overlay.py`), so the AI's own Buy/Hold/Avoid + conviction — which
+> drive entry ranking AND sizing — factor in the research. NO human approves
+> anything. "Not reckless" is preserved without a human: each signal's weight is
+> a Bayesian blend of a theory prior and its **measured IC** (`feature_research`),
+> recalibrated daily by an autonomous job. The IC harness is the arbiter, not a
+> person — cold-start uses the prior; weight shifts to what actually predicts
+> returns as labels accrue.
 
 ## The idea
 

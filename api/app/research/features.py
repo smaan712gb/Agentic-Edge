@@ -293,6 +293,27 @@ async def build_snapshot(
     return summary
 
 
+async def ensure_todays_snapshot() -> dict[str, Any]:
+    """Guarantee a feature snapshot exists for today before the scorecard reads
+    it — closes the freshness gap between the 09:00 theme run and the 16:30
+    snapshot cron. Idempotent: if today's snapshot already exists, it's a no-op.
+
+    Called at the head of the theme run so the quant overlay injects *same-day*
+    features into the scorecard's decision. Best-effort: on any failure the run
+    proceeds without fresh features (the overlay just uses the last snapshot or
+    none)."""
+    as_of = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    async with db_session() as s:
+        existing = (await s.execute(
+            select(SymbolFeatureSnapshot.id)
+            .where(SymbolFeatureSnapshot.as_of == as_of)
+            .limit(1)
+        )).first()
+    if existing is not None:
+        return {"as_of": as_of.isoformat(), "built": False, "reason": "already exists"}
+    return await build_snapshot(as_of=as_of)
+
+
 async def _gather_bounded(coros: list, *, limit: int) -> list:
     """Run coroutines with bounded concurrency; failures become None."""
     sem = asyncio.Semaphore(limit)
