@@ -263,6 +263,13 @@ async def build_snapshot(
     # Cross-sectional standardisation across the universe (history-free rank).
     cross_sectional_z(rows)
 
+    # Manager-archetype persona scores — deterministic functions of the same-day
+    # z-features (no lookahead). Folded in as their own persona_* family.
+    from .personas import score_all
+    for sym in symbols:
+        for persona, scr in score_all(rows[sym]).items():
+            rows[sym][f"persona_{persona}"] = scr
+
     # Upsert one row per symbol for this as_of.
     written = 0
     async with db_session() as s:

@@ -177,12 +177,17 @@ switch ($Action) {
         if ($l) { $l | Format-List }
     }
     'research' {
-        # Offline IC / alpha-decay report — reads the sqlite DB directly, no
-        # backend required. Run from the api/ dir so `app.config` is importable.
+        # Offline research reports — read the sqlite DB directly, no backend
+        # required. Run from repo root so `api.app...` imports resolve.
+        $env:PYTHONUTF8 = '1'
         Write-Host 'Feature research — IC + alpha-decay profiler...' -ForegroundColor Cyan
-        Push-Location (Join-Path $root 'api')
-        try { $env:PYTHONUTF8 = '1'; python -m app.research.feature_research }
-        finally { Pop-Location }
+        python -m api.app.research.feature_research
+        Write-Host ''
+        Write-Host 'ML ranker — pooled cross-sectional forward-return ranking...' -ForegroundColor Cyan
+        python -m api.app.research.ml_ranker
+        Write-Host ''
+        Write-Host 'Event study — market-adjusted CAR by catalyst...' -ForegroundColor Cyan
+        python -m api.app.research.event_study
     }
 
     'install-autostart' {

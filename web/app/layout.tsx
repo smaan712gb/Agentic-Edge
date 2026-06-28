@@ -1,7 +1,7 @@
 import "./globals.css";
 import type { Metadata } from "next";
 import Link from "next/link";
-import { Activity, Building2, Home, Layers, LineChart, Sparkles } from "lucide-react";
+import { Activity, Building2, FlaskConical, Home, Layers, LineChart, Sparkles } from "lucide-react";
 import { KillSwitch } from "@/components/KillSwitch";
 
 export const metadata: Metadata = {
@@ -29,6 +29,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               <NavLink href="/performance" icon={<LineChart className="h-4 w-4" />}>Performance</NavLink>
               <NavLink href="/themes" icon={<Layers className="h-4 w-4" />}>Themes</NavLink>
               <NavLink href="/managers" icon={<Building2 className="h-4 w-4" />}>Managers</NavLink>
+              <NavLink href="/research" icon={<FlaskConical className="h-4 w-4" />}>Research</NavLink>
               <NavLink href="/runs" icon={<Activity className="h-4 w-4" />}>Runs</NavLink>
             </nav>
             <div className="mt-auto pt-6 border-t border-[var(--color-border)]">

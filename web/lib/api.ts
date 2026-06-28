@@ -248,6 +248,77 @@ export type SmartMoney = {
   managers: { slug: string; name: string; value_usd: number; shares: number; put_call_flag: string; pct_of_portfolio: number | null; period_end: string | null }[];
 };
 
+// --- Quant Research Factory ----------------------------------------------
+
+export type UniverseGraphNode = {
+  symbol: string;
+  theme_count: number;
+  theme_centrality: number;
+  co_membership_degree: number;
+  avg_theme_size: number;
+  themes: string[];
+};
+
+export type FeatureSnapshot = {
+  symbol: string;
+  as_of: string | null;
+  features: Record<string, number | null | string[]>;
+  labels: Record<string, number>;
+  label_status: "pending" | "partial" | "final" | string;
+};
+
+export type RankRow = {
+  symbol: string;
+  predicted_return: number;
+  rank: number;
+  percentile: number;
+};
+
+export type RankReport = {
+  model: "ridge" | "gbm" | "heuristic" | string;
+  horizon_days: number;
+  n_train_rows: number;
+  n_ranked: number;
+  as_of: string | null;
+  features_used: string[];
+  top_drivers: string[];
+  ranking: RankRow[];
+  warnings: string[];
+};
+
+export type EventStudyReport = {
+  n_events: number;
+  n_symbols: number;
+  windows: number[];
+  by_event_type: Record<string, Record<string, { n: number; mean_car: number; median_car: number; win_rate: number; stdev: number }>>;
+  events: { event_type: string; count: number }[];
+  warnings: string[];
+};
+
+export type MonteCarloReport = {
+  symbol: string;
+  horizon_days: number;
+  n_paths: number;
+  spot: number | null;
+  mu_daily: number;
+  sigma_daily: number;
+  annualised_vol: number;
+  terminal: Record<string, number>;
+  max_drawdown: Record<string, number>;
+  sizing: Record<string, number>;
+  exit_stress: Record<string, number>;
+  warnings: string[];
+};
+
+export type ImpactGraph = {
+  nodes: { symbol: string; impact: number; seed: number; theme_count: number }[];
+  edges: { source: string; target: string; weight: number }[];
+  seeded_from: string;
+};
+
+export type PersonaMeta = { key: string; label: string; description: string };
+export type PersonaScores = { symbol: string; as_of: string | null; archetypes: Record<string, number> };
+
 async function jfetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...init,
@@ -322,6 +393,24 @@ export const api = {
     mentions: (symbol?: string) =>
       jfetch<Mention[]>(`/api/mentions${symbol ? `?symbol=${encodeURIComponent(symbol)}` : ""}`),
     rotation: () => jfetch<RotationRow[]>("/api/rotation"),
+  },
+  research: {
+    universeGraph: (limit = 100) =>
+      jfetch<UniverseGraphNode[]>(`/api/research/universe-graph?limit=${limit}`),
+    featuresLatest: (symbols?: string[]) =>
+      jfetch<FeatureSnapshot[]>(`/api/research/features/latest${symbols?.length ? `?symbols=${encodeURIComponent(symbols.join(","))}` : ""}`),
+    featureHistory: (symbol: string) =>
+      jfetch<FeatureSnapshot[]>(`/api/research/features/${encodeURIComponent(symbol)}`),
+    ranking: (horizon = 20, model: "ridge" | "gbm" = "ridge") =>
+      jfetch<RankReport>(`/api/research/ranking?horizon=${horizon}&model=${model}`),
+    eventStudy: () => jfetch<EventStudyReport>("/api/research/event-study"),
+    monteCarlo: (symbol: string, horizon = 20) =>
+      jfetch<MonteCarloReport>(`/api/research/montecarlo/${encodeURIComponent(symbol)}?horizon=${horizon}`),
+    impactGraph: (lookbackDays = 14) =>
+      jfetch<ImpactGraph>(`/api/research/impact-graph?lookback_days=${lookbackDays}`),
+    personasMeta: () => jfetch<PersonaMeta[]>("/api/research/personas"),
+    personas: (symbol: string) =>
+      jfetch<PersonaScores>(`/api/research/personas/${encodeURIComponent(symbol)}`),
   },
   admin: {
     autotradeStatus: (token: string) =>

@@ -96,20 +96,33 @@ Offline, read-only — the exact discipline of `exit_pressure_replay.py`:
 
 It recommends; it never writes config and never trades.
 
-## Build sequence (this PR delivers 1–4)
+## Build status — ALL layers shipped (no deferrals)
 
-1. Feature store schema + snapshot orchestrator (graph + cross-theme always on;
-   market + flow best-effort).
-2. Forward-return labeler.
-3. IC + alpha-decay harness.
-4. Scheduler jobs (nightly snapshot + label backfill), read API, admin triggers.
+1. ✅ Feature store schema + snapshot orchestrator (graph + cross-theme always
+   on; market + flow best-effort) — `features.py`, Alembic 0014.
+2. ✅ Forward-return labeler — `labeler.py`.
+3. ✅ IC + alpha-decay harness — `feature_research.py`.
+4. ✅ Scheduler jobs (nightly snapshot + label backfill), read API, admin
+   triggers, `start-all.ps1` verbs.
+5. ✅ Pooled cross-sectional ML ranker — `ml_ranker.py` (pure-numpy ridge +
+   sklearn GBM option; cold-start heuristic until labels accrue).
+6. ✅ Event-study engine — `event_study.py` (market-adjusted CAR around
+   13D / news / 13F-change events already in the DB).
+7. ✅ Monte-Carlo sizing & exit-path stress — `montecarlo.py` (seeded GBM,
+   quarter-Kelly ∧ vol-target sizing capped at 10% NAV, drawdown stress).
+8. ✅ NER + impact-mapping supply-chain graph — `ner.py` + `impact_graph.py`
+   (deterministic entity core + LLM relation enrichment; heat-diffusion of a
+   news shock across the membership graph). Manager-archetype personas —
+   `personas.py` (Aschenbrenner + 3 more, folded into the snapshot as a
+   `persona_*` feature family).
 
-Future (separate PRs, each gated by the harness before any gate wiring):
-5. Pooled cross-sectional ML ranker (gradient-boosted / elastic net).
-6. Event-study engine (CAR around 8-K / 13D / gov award / capex guidance).
-7. Monte-Carlo position-sizing & exit-path stress.
-8. NER + impact-mapping supply-chain graph (enriches the membership skeleton);
-   manager-archetype personas (e.g. Aschenbrenner playbook emulation).
+Every layer is decision-support: ML predictions, CARs, MC sizes, impact scores,
+and persona scores are all surfaced and never read by an entry/exit gate.
+Promotion of any signal to a gate remains human-gated through the harnesses.
+
+Dashboard: a `/research` tab surfaces the ranking, centrality, event-study, and
+impact views; `/research/[symbol]` drills into features, personas, and the
+Monte-Carlo distribution.
 
 ## Consistency with the existing system
 
