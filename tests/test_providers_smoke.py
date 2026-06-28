@@ -70,12 +70,33 @@ def test_unknown_macro_series_raises():
         asyncio.run(p.get_macro_signal("NOT_A_REAL_SERIES"))
 
 
-def test_ibkr_refuses_non_paper_mode():
-    from tradingagents.dataflows.providers.base import LiveTradingDisabledError
+def test_ibkr_rejects_invalid_account_mode():
+    """Construction only accepts 'paper' or 'live'; anything else is a config
+    typo and must fail loudly rather than connect in an undefined mode."""
     from tradingagents.dataflows.providers.ibkr import IbkrProvider
 
-    with pytest.raises(LiveTradingDisabledError):
-        IbkrProvider(account_mode="live")
+    with pytest.raises(ValueError):
+        IbkrProvider(account_mode="margin")
+
+
+def test_ibkr_account_mode_prefix_guard():
+    """The real-money safety invariant: the connected account's prefix must
+    match the declared mode. This is what lets the live execution path run
+    safely against an IB Gateway PAPER account (DU-prefix, port 4002) — and
+    guarantees a real-money (U) account can never be hit while in paper mode.
+    """
+    from tradingagents.dataflows.providers.base import ProviderError
+    from tradingagents.dataflows.providers.ibkr import verify_account_mode
+
+    # Paper mode: accept the IB Gateway paper account, reject a real-money one.
+    verify_account_mode("paper", "DU1234567")            # ok — no raise
+    with pytest.raises(ProviderError):
+        verify_account_mode("paper", "U1234567")          # real money — blocked
+
+    # Live mode: accept a real-money account, reject a paper one.
+    verify_account_mode("live", "U7654321")              # ok — no raise
+    with pytest.raises(ProviderError):
+        verify_account_mode("live", "DU7654321")          # paper acct — blocked
 
 
 def test_registry_extends_interface():
