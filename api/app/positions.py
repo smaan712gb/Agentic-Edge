@@ -58,6 +58,45 @@ async def _ibkr() -> Any:
         return _ib_provider
 
 
+async def snapshot_positions(rows: list[dict[str, Any]]) -> int:
+    """Upsert STOCK positions into the Position table from already-fetched rows.
+
+    Lets the maintenance loop keep the snapshot fresh every tick (it reads IBKR
+    directly and otherwise never persists), so the research replay harness and
+    dashboard don't rely on a stale 28-day-old snapshot. Stocks only — the
+    table's UNIQUE(user_id, account_id, symbol) collides for two options on one
+    underlying (PMCC), and an option premium isn't an underlying price. Returns
+    the number of stock rows written. Best-effort caller; safe to ignore errors.
+    """
+    now = datetime.now(timezone.utc)
+    written = 0
+    async with db_session() as s:
+        for r in rows:
+            symbol = r.get("symbol")
+            qty = float(r.get("qty") or 0)
+            if not symbol or qty == 0:
+                continue
+            if str(r.get("secType") or "").upper() not in ("", "STK"):
+                continue
+            avg_price = float(r.get("avg_price") or 0)
+            last_price = float(r.get("last_price") or 0)
+            pnl = float(r.get("pnl") or (last_price - avg_price) * qty)
+            account_id = str(r.get("account_id") or "default")
+            await s.execute(
+                sqlite_upsert(Position).values(
+                    user_id=None, account_id=account_id, symbol=symbol,
+                    qty=qty, avg_price=avg_price, last_price=last_price,
+                    pnl=pnl, captured_at=now,
+                ).on_conflict_do_update(
+                    index_elements=["user_id", "account_id", "symbol"],
+                    set_={"qty": qty, "avg_price": avg_price,
+                          "last_price": last_price, "pnl": pnl, "captured_at": now},
+                )
+            )
+            written += 1
+    return written
+
+
 async def positions_real() -> list[dict[str, Any]]:
     """Read open positions from IBKR paper, snapshot to DB, return DTOs."""
     try:

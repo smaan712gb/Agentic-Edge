@@ -111,6 +111,15 @@ async def _tick() -> None:
 
     pos_by_symbol = {(p.get("symbol") or "").upper(): p for p in positions}
 
+    # Keep the Position snapshot table fresh (stocks only) so the research
+    # replay harness + dashboard don't read a stale snapshot. Best-effort —
+    # the maint loop reads IBKR live and never depends on this table itself.
+    try:
+        from api.app.positions import snapshot_positions
+        await snapshot_positions(positions)
+    except Exception as e:
+        logger.debug("maint loop: position snapshot failed: %s", e)
+
     # Adopt any IBKR position that doesn't have a TradeIntent yet — gives
     # the maintenance loop ownership of "orphan" positions (existing
     # holdings imported into the system, manual fills, etc.) so they get
@@ -569,7 +578,7 @@ async def _execute_off_theme_close(*, sym: str, qty: float, pos: dict, ib: Any,
         async with db_session() as s:
             s.add(TradeAuditLog(
                 intent_id=intent_id, action="off_theme_close_outcome",
-                outcome="error", error=str(e),
+                outcome="error", payload={"error": str(e)},
             ))
         return
 
@@ -942,6 +951,8 @@ async def _evaluate_stock(
         find_rotation_candidate,
     )
     from tradingagents.strategies.maintenance.exit_pressure import (
+        DEFAULT_WEIGHTS,
+        LEAPS_WEIGHTS,
         compute_exit_pressure,
     )
 
@@ -1134,12 +1145,30 @@ async def _evaluate_stock(
     _name_rot = rotation_candidate.score_delta if rotation_candidate else 0.0
     _theme_rot = get_settings().ROTATION_EXIT_PRESSURE_DELTA if rotation_active else 0.0
     _rotation_delta = max(_name_rot or 0.0, _theme_rot) or None
+    # LEAPS-only book: drop the structurally-dead options_risk weight and
+    # renormalise the surviving four (see exit_pressure.LEAPS_WEIGHTS). Keeping
+    # options_risk at 15% would deflate every score by ~15% and make positions
+    # under-fire across the trim/exit bands.
+    _pressure_weights = LEAPS_WEIGHTS if get_settings().LEAPS_ONLY else DEFAULT_WEIGHTS
+    # Quant overlay in the EXIT decision: the research factory's per-symbol edge
+    # nudges exit pressure — a structurally strong name (centrality + smart
+    # money + momentum) holds longer; a weak one trims sooner. Bounded by
+    # QUANT_EXIT_MAX_DELTA (< rotation's 25) so it never forces a drawdown exit.
+    _quant_exit_delta = None
+    if get_settings().QUANT_OVERLAY_ENABLED:
+        try:
+            from api.app.research.overlay import symbol_exit_delta
+            _quant_exit_delta = await symbol_exit_delta(intent.symbol) or None
+        except Exception as e:
+            logger.debug("maint loop: quant exit delta failed for %s: %s", intent.symbol, e)
     pressure = compute_exit_pressure(
         theme_composite=(best_theme.composite if best_theme else None),
         theme_streak_days=(best_theme.streak_days_below_floor if best_theme else 0),
         trim_band=trim.band,
         exhaustion_score=exhaustion.score,
         rotation_score_delta=_rotation_delta,
+        quant_edge_delta=_quant_exit_delta,
+        weights=_pressure_weights,
     )
 
     # Per-tick observability row — captures the full picture even when
@@ -1155,6 +1184,7 @@ async def _evaluate_stock(
                 "band": pressure.band,
                 "rationale": pressure.rationale,
                 "sub_scores": pressure.sub_scores,
+                "quant_exit_delta": _quant_exit_delta,
                 "trim_fired": trim.should_trim,
                 "trim_band": trim.band,
                 "exhaustion": {
@@ -1515,7 +1545,7 @@ async def _execute_stock_exit(*, intent: TradeIntent, qty: float, reason: str, e
         async with db_session() as s:
             s.add(TradeAuditLog(
                 intent_id=intent.id, action="maint_exit_outcome",
-                outcome="error", error=str(e),
+                outcome="error", payload={"error": str(e)},
             ))
         return
 
@@ -1544,56 +1574,59 @@ async def _execute_stock_exit(*, intent: TradeIntent, qty: float, reason: str, e
     )
 
 
-async def _flag_pmcc_close(*, intent: TradeIntent, reason: str, kind: str) -> None:
-    """Auto-fire PMCC close: SELL LEAP + BUY-TO-CLOSE short, walked at
-    net credit through the existing combo executor.
+async def _flag_pmcc_close(*, intent: TradeIntent, reason: str, kind: str,
+                           auto_execute: Optional[bool] = None) -> None:
+    """Close a LEAP: SELL-TO-CLOSE the long call outright, walked toward the bid
+    through the single-leg executor.
 
-    Falls back to flag+alert if auto-fire pre-conditions fail (missing
-    conids, daily cap hit, IBKR unreachable) — operator still gets the
-    signal in Slack and via the auto_actions audit row.
+    LEAPS-only book — there is no short leg to buy back, so this is a single
+    SELL on the LEAP conid (the legacy two-leg combo close was removed when we
+    dropped diagonals). The LEAP conid is resolved from ``walking_config`` and,
+    as a fallback, from the live IBKR option position for this symbol.
+
+    Whether this AUTO-EXECUTES vs FLAGS-for-operator is driven by ``kind``:
+    genuine fundamental/structural breaks (earnings crash, filing thesis-break,
+    DTE cliff — see ``_AUTO_CLOSE_KINDS``) auto-execute; price-drawdown proxies
+    (delta decay, scorecard Avoid) flag only, so a normal high-beta down day is
+    never auto-dumped. Callers may override via ``auto_execute``.
+
+    The auto-execute path also falls back to flag+alert if pre-conditions fail
+    (no conid resolvable, daily cap hit, IBKR unreachable).
     """
-    cfg = dict((intent.walking_config or {}))
-    leap_conid = int(cfg.get("leap_conid", 0))
-    short_conid = int(cfg.get("short_call_conid", 0))
-    if not leap_conid or not short_conid:
+    if auto_execute is None:
+        auto_execute = kind in _AUTO_CLOSE_KINDS
+
+    # FLAG-ONLY path: record + alert once per (intent, kind), then leave the
+    # position open for the operator to close. Deduped so a signal that stays
+    # true every tick doesn't spam (the AVGO 46x pattern).
+    if not auto_execute:
+        dedup_key = f"{intent.id}:{kind}"
+        if dedup_key in _CLOSE_FLAG_ALERTED:
+            return
+        _CLOSE_FLAG_ALERTED.add(dedup_key)
         async with db_session() as s:
             await record_auto_action(
                 s, loop="maintenance", action_type="pmcc_close_flagged",
                 gate_result=_synthetic_passed_gate(),
                 symbol=intent.symbol, intent_id=intent.id,
-                payload={"reason": reason, "kind": kind, "manual_required": "missing leg conids"},
+                payload={"reason": reason, "kind": kind,
+                         "disposition": "flag_only_operator_confirms"},
                 outcome="flagged",
             )
         await alert(
             level="warning",
-            title=f"PMCC close — manual: {intent.symbol}",
-            body=f"{reason}. Missing leg conids; close via /api/admin/positions/exit/{intent.id}.",
+            title=f"LEAP close suggested — confirm: {intent.symbol}",
+            body=(f"{reason}. Price-driven (not auto-dumped on this high-beta book); "
+                  f"close via /api/admin/positions/exit/{intent.id} if you agree."),
         )
         return
 
-    if await _maintenance_cap_hit("close"):
-        await alert(level="warning",
-                    title=f"PMCC close skipped (daily cap): {intent.symbol}",
-                    body=reason)
-        async with db_session() as s:
-            await record_auto_action(
-                s, loop="maintenance", action_type="pmcc_close_skipped_cap",
-                gate_result=_synthetic_passed_gate(),
-                symbol=intent.symbol, intent_id=intent.id,
-                payload={"reason": reason, "kind": kind},
-                outcome="cap_hit",
-            )
-        return
-
-    legs = [
-        {"conid": leap_conid,  "ratio": 1, "action": "SELL"},
-        {"conid": short_conid, "ratio": 1, "action": "BUY"},
-    ]
-    qty = int(intent.qty or 1)
+    cfg = dict((intent.walking_config or {}))
+    leap_conid = int(cfg.get("leap_conid", 0))
 
     from api.app.positions import _ibkr
     from tradingagents.strategies.execution import (
-        ExecutionConfig, submit_pmcc_combo,
+        ExecutionConfig, submit_single_leg_option,
     )
     try:
         ib = await _ibkr()
@@ -1607,21 +1640,75 @@ async def _flag_pmcc_close(*, intent: TradeIntent, reason: str, kind: str) -> No
             )
         return
 
+    # Resolve the LEAP conid from the live long-call position if walking_config
+    # didn't carry it (e.g. adopted orphan). Pick the long call (qty > 0) for
+    # this underlying — the LEAPS-only book holds exactly one per name.
+    if not leap_conid:
+        try:
+            positions = await ib.get_positions()
+            for p in positions:
+                if (str(p.get("symbol", "")).upper() == intent.symbol.upper()
+                        and str(p.get("sec_type", p.get("secType", ""))).upper() in ("OPT", "FOP")
+                        and (p.get("right") in (None, "C", "CALL"))
+                        and float(p.get("qty") or 0) > 0):
+                    leap_conid = int(p.get("conid") or 0)
+                    if leap_conid:
+                        break
+        except Exception as e:
+            logger.debug("leap conid resolve via positions failed for %s: %s", intent.symbol, e)
+
+    if not leap_conid:
+        dedup_key = f"{intent.id}:noconid"
+        if dedup_key in _CLOSE_FLAG_ALERTED:
+            return
+        _CLOSE_FLAG_ALERTED.add(dedup_key)
+        async with db_session() as s:
+            await record_auto_action(
+                s, loop="maintenance", action_type="pmcc_close_flagged",
+                gate_result=_synthetic_passed_gate(),
+                symbol=intent.symbol, intent_id=intent.id,
+                payload={"reason": reason, "kind": kind, "manual_required": "no LEAP conid"},
+                outcome="flagged",
+            )
+        await alert(
+            level="warning",
+            title=f"LEAP close — manual: {intent.symbol}",
+            body=f"{reason}. No LEAP conid resolvable; close via /api/admin/positions/exit/{intent.id}.",
+        )
+        return
+
+    if await _maintenance_cap_hit("close"):
+        await alert(level="warning",
+                    title=f"LEAP close skipped (daily cap): {intent.symbol}",
+                    body=reason)
+        async with db_session() as s:
+            await record_auto_action(
+                s, loop="maintenance", action_type="pmcc_close_skipped_cap",
+                gate_result=_synthetic_passed_gate(),
+                symbol=intent.symbol, intent_id=intent.id,
+                payload={"reason": reason, "kind": kind},
+                outcome="cap_hit",
+            )
+        return
+
+    qty = int(intent.qty or 1)
+
     async with db_session() as s:
         s.add(TradeAuditLog(
             intent_id=intent.id, action="auto_pmcc_close_attempt",
-            payload={"symbol": intent.symbol, "legs": legs, "qty": qty,
+            payload={"symbol": intent.symbol, "leap_conid": leap_conid, "qty": qty,
                      "reason": reason, "kind": kind},
         ))
 
-    result = await submit_pmcc_combo(
-        ibkr=ib, symbol=intent.symbol, legs=legs, contracts=qty,
-        action="SELL",   # close = receive net credit
+    result = await submit_single_leg_option(
+        ibkr=ib, conid=leap_conid, contracts=qty,
+        action="SELL",   # sell-to-close the long LEAP
         config=ExecutionConfig(
             initial_offset_cents=1, walk_increment_cents=1,
             walk_interval_sec=20, max_offset_pct_of_spread=0.50,
             timeout_sec=180,
         ),
+        adaptive_priority="Urgent",   # earnings/thesis break — exit decisively
     )
 
     async with db_session() as s:
@@ -1634,8 +1721,10 @@ async def _flag_pmcc_close(*, intent: TradeIntent, reason: str, kind: str) -> No
                 i.status = "error"
         s.add(TradeAuditLog(
             intent_id=intent.id, action="auto_pmcc_close_outcome",
-            outcome=result.status, payload=result.to_dict(),
-            error=result.error,
+            outcome=result.status,
+            # TradeAuditLog has no `error` column — fold it into payload
+            # (result.to_dict() already carries it, but be explicit).
+            payload={**result.to_dict(), "error": result.error},
         ))
         await record_auto_action(
             s, loop="maintenance", action_type=f"pmcc_close_{result.status}",
@@ -1646,10 +1735,10 @@ async def _flag_pmcc_close(*, intent: TradeIntent, reason: str, kind: str) -> No
         )
 
     if result.status == "filled":
-        await alert(level="warning", title=f"PMCC CLOSED: {intent.symbol}",
-                    body=f"@ ${result.fill_price:.2f} net credit. Reason: {reason}")
+        await alert(level="warning", title=f"LEAP CLOSED: {intent.symbol}",
+                    body=f"@ ${result.fill_price:.2f}. Reason: {reason}")
     elif result.status == "abandoned":
-        await alert(level="warning", title=f"PMCC close abandoned: {intent.symbol}",
+        await alert(level="warning", title=f"LEAP close abandoned: {intent.symbol}",
                     body=f"walked to floor; will retry next tick. {reason}")
 
 
@@ -1787,6 +1876,17 @@ async def _compute_daily_signals(symbol: str) -> dict[str, Optional[float]]:
 # (so a filing re-alerts at most once per process), which is fine.
 _ALERTED_FILING_LINKS: set[str] = set()
 
+# Exit kinds that represent a genuine fundamental or structural break and may
+# AUTO-EXECUTE the close. Everything else (delta decay, scorecard "Avoid") is a
+# price-drawdown proxy and stays FLAG-ONLY so a normal high-beta down day never
+# auto-dumps a position (operator policy on this book).
+_AUTO_CLOSE_KINDS = {"earnings_break", "thesis_break", "dte_cliff"}
+
+# Intents we've already flagged-for-manual-close, keyed by f"{intent_id}:{kind}".
+# A flag-only close re-evaluates true every tick; without this it would re-alert
+# + re-audit ~once per tick (the AVGO 46x pattern). Resets on restart.
+_CLOSE_FLAG_ALERTED: set[str] = set()
+
 
 async def _watch_8k_filings(pos_by_symbol: dict[str, dict]) -> dict[str, str]:
     """Sweep recent 8-K filings, write alerts, return per-symbol
@@ -1797,7 +1897,8 @@ async def _watch_8k_filings(pos_by_symbol: dict[str, dict]) -> dict[str, str]:
     folds this into its existing thesis-break check.
     """
     from tradingagents.strategies.maintenance.sec_filings_watch import (
-        FilingEvent, find_new_8k_events, thesis_break_signal_from_filings,
+        FilingEvent, find_new_8k_events, find_new_edgar_breaks,
+        thesis_break_signal_from_filings,
     )
     from api.app.db import ThemeSymbol
 
@@ -1842,6 +1943,21 @@ async def _watch_8k_filings(pos_by_symbol: dict[str, dict]) -> dict[str, str]:
         except Exception as e:
             logger.warning("filings watcher: sweep failed: %s", e)
 
+    # EDGAR-direct, CONTENT-gated sweep for HELD names (8-K + 6-K/20-F). This is
+    # the authoritative, low-latency path — the FMP feed above lagged a real WDC
+    # 8-K by ~25h, and its timing-only severity false-positived a benign convert
+    # exchange. Only these EDGAR events (body keyword-scored) may drive an
+    # auto-close; the FMP feed is alert/research-only from here on.
+    try:
+        from tradingagents.dataflows.providers.registry import get_provider
+        edgar = get_provider("edgar")
+        edgar_events = await find_new_edgar_breaks(
+            edgar_provider=edgar, held_symbols=held,
+        )
+        events = (events or []) + edgar_events
+    except Exception as e:
+        logger.debug("filings watcher: EDGAR held-name sweep skipped: %s", e)
+
     if not events:
         return {}
 
@@ -1880,26 +1996,26 @@ async def _watch_8k_filings(pos_by_symbol: dict[str, dict]) -> dict[str, str]:
         # universe-only filings stay at info.
         await alert(
             level=("warning" if ev.symbol in held else "info"),
-            title=f"8-K {ev.severity}: {ev.symbol}"
+            title=f"{ev.form_type} {ev.severity}: {ev.symbol}"
                   + (" (held)" if ev.symbol in held else " (theme universe)"),
             body=f"{ev.rationale} · {ev.final_link or ev.link or ''}",
         )
 
-    # Per-symbol thesis-break strings for the guidance/after-hours ones —
-    # only on held positions (theme universe filings inform research, not
-    # exit logic).
-    held_events = [e for e in events if e.symbol in held]
-    composed = thesis_break_signal_from_filings(held_events)
-    if composed:
-        # Spread the composite across the affected symbols so the per-stock
-        # evaluator picks up only its own filings.
-        for ev in held_events:
-            if ev.severity in ("guidance", "after_hours"):
-                breaks_by_sym[ev.symbol] = (
-                    breaks_by_sym.get(ev.symbol, "")
-                    + ("; " if ev.symbol in breaks_by_sym else "")
-                    + f"{ev.severity} 8-K: {ev.rationale}"
-                )
+    # Auto-close thesis-breaks fire ONLY from EDGAR body-CONTENT-confirmed events
+    # on held names (severity "guidance" = keyword severity >= break threshold).
+    # The FMP universe feed is alert/research-only: its severity is a content-
+    # blind TIMING heuristic (an after-hours 8-K), which false-positived a benign
+    # WDC convertible-notes exchange. We never auto-close on timing alone — a real
+    # break must be confirmed by reading the filing body.
+    for ev in events:
+        if (ev.symbol in held
+                and ev.detail.get("source") == "edgar"
+                and ev.severity == "guidance"):
+            breaks_by_sym[ev.symbol] = (
+                breaks_by_sym.get(ev.symbol, "")
+                + ("; " if ev.symbol in breaks_by_sym else "")
+                + f"{ev.form_type} content break: {ev.rationale}"
+            )
     return breaks_by_sym
 
 
@@ -2111,7 +2227,7 @@ async def _watch_insider_universe() -> int:
     """
     from api.app.db import AutoAction, ThemeSymbol
     from tradingagents.dataflows.providers.fmp import (
-        FmpProvider, _is_insider_sale,
+        FmpProvider, _is_insider_sale, _is_insider_buy,
     )
 
     async with db_session() as s:
@@ -2135,45 +2251,50 @@ async def _watch_insider_universe() -> int:
         logger.debug("insider universe sweep failed: %s", e)
         return 0
 
-    # Filter to theme-universe symbols + sales only (P-Purchase rows go
-    # through a different signal — buy-side accumulation, future work).
-    matches: list[dict[str, Any]] = []
+    # Filter to theme-universe symbols + officer/director/10%-owner. We now
+    # surface BOTH directions: sells (defensive / distribution warning) and
+    # opportunistic BUYS (the bullish accumulation signal). Each row is tagged
+    # 'sale' or 'buy'; awards/exercises pass neither filter.
+    matches: list[tuple[str, dict[str, Any]]] = []   # (direction, row)
     for r in rows:
         sym = str(r.get("symbol") or "").upper()
         if sym not in universe:
             continue
-        if not _is_insider_sale(r):
-            continue
         owner = (r.get("typeOfOwner") or "").lower()
         if not any(k in owner for k in ("officer", "director", "10")):
             continue
-        matches.append(r)
+        if _is_insider_sale(r):
+            matches.append(("sale", r))
+        elif _is_insider_buy(r):
+            matches.append(("buy", r))
     if not matches:
         return 0
 
-    # Dedup against existing insider_alert rows from the last 7 days
+    # Dedup against existing insider_alert / insider_buy_alert rows from the
+    # last 7 days, keyed on (symbol, filing_date, direction).
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     seven_days_ago = today - timedelta(days=7)
     async with db_session() as s:
         prior = (
             await s.execute(
-                select(AutoAction.symbol, AutoAction.payload)
-                .where(AutoAction.action_type == "insider_alert")
+                select(AutoAction.symbol, AutoAction.action_type, AutoAction.payload)
+                .where(AutoAction.action_type.in_(["insider_alert", "insider_buy_alert"]))
                 .where(AutoAction.timestamp >= seven_days_ago)
             )
         ).all()
-    seen_keys: set[tuple[str, str]] = set()
-    for sym, payload in prior:
+    seen_keys: set[tuple[str, str, str]] = set()
+    for sym, atype, payload in prior:
         if isinstance(payload, dict):
+            direction = "buy" if atype == "insider_buy_alert" else "sale"
             seen_keys.add(
-                ((sym or "").upper(), str(payload.get("filing_date") or ""))
+                ((sym or "").upper(), str(payload.get("filing_date") or ""), direction)
             )
 
     new_count = 0
-    for r in matches:
+    for direction, r in matches:
         sym = str(r.get("symbol") or "").upper()
         filing_date = str(r.get("filingDate") or r.get("transactionDate") or "")
-        if (sym, filing_date) in seen_keys:
+        if (sym, filing_date, direction) in seen_keys:
             continue
         owner = r.get("typeOfOwner") or ""
         reporter = r.get("reportingName") or "?"
@@ -2184,12 +2305,15 @@ async def _watch_insider_universe() -> int:
         except (TypeError, ValueError):
             usd = 0.0
 
+        is_buy = direction == "buy"
+        action_type = "insider_buy_alert" if is_buy else "insider_alert"
         async with db_session() as s:
             await record_auto_action(
-                s, loop="maintenance", action_type="insider_alert",
+                s, loop="maintenance", action_type=action_type,
                 gate_result=_synthetic_passed_gate(),
                 symbol=sym,
                 payload={
+                    "direction": direction,
                     "filing_date": filing_date,
                     "transaction_date": str(r.get("transactionDate") or ""),
                     "reporting_name": reporter,
@@ -2202,15 +2326,33 @@ async def _watch_insider_universe() -> int:
                 },
                 outcome="flagged",
             )
-        await alert(
-            level="info",
-            title=f"Insider sale: {sym} ({owner})",
-            body=f"{reporter} sold {r.get('securitiesTransacted')} sh @ ${r.get('price')} ({filing_date})",
-        )
+        if is_buy:
+            # Confirm whether this is a CLUSTER (>=2 opportunistic buyers /30d)
+            # — the high-conviction shape worth a louder alert.
+            try:
+                bp = await fmp.get_insider_buy_pressure(sym)
+            except Exception:
+                bp = {}
+            clustered = bool(bp.get("clustered"))
+            await alert(
+                level="warning" if clustered else "info",
+                title=(f"INSIDER BUY CLUSTER: {sym}" if clustered
+                       else f"Insider buy: {sym} ({owner})"),
+                body=(f"{reporter} bought {r.get('securitiesTransacted')} sh @ "
+                      f"${r.get('price')} ({filing_date})."
+                      + (f" Cluster: {bp.get('n_buyers_30d')} buyers / 30d, "
+                         f"{bp.get('detail')}. Accumulation candidate." if clustered else "")),
+            )
+        else:
+            await alert(
+                level="info",
+                title=f"Insider sale: {sym} ({owner})",
+                body=f"{reporter} sold {r.get('securitiesTransacted')} sh @ ${r.get('price')} ({filing_date})",
+            )
         new_count += 1
 
     if new_count:
-        logger.info("maint loop: %d new insider alerts (theme-universe filtered)", new_count)
+        logger.info("maint loop: %d new insider alerts (theme-universe, buy+sell)", new_count)
     return new_count
 
 
@@ -2343,7 +2485,7 @@ async def _execute_stock_trim(
         async with db_session() as s:
             s.add(TradeAuditLog(
                 intent_id=intent.id, action="stock_trim_outcome",
-                outcome="error", error=str(e),
+                outcome="error", payload={"error": str(e)},
             ))
         return
 
@@ -2466,7 +2608,7 @@ async def _execute_auto_short_call_close(intent: TradeIntent, ib: Any, reason: s
             i.walking_config = cfg
         s.add(TradeAuditLog(
             intent_id=intent.id, action="auto_short_close_outcome",
-            outcome=result.status, payload=result.to_dict(), error=result.error,
+            outcome=result.status, payload={**result.to_dict(), "error": result.error},
         ))
         await record_auto_action(
             s, loop="maintenance", action_type=f"pmcc_close_{result.status}",
@@ -2549,7 +2691,7 @@ async def _execute_auto_short_call_roll(intent: TradeIntent, decision, ib: Any) 
             i.walking_config = cfg
         s.add(TradeAuditLog(
             intent_id=intent.id, action="auto_short_roll_outcome",
-            outcome=result.status, payload=result.to_dict(), error=result.error,
+            outcome=result.status, payload={**result.to_dict(), "error": result.error},
         ))
         await record_auto_action(
             s, loop="maintenance", action_type=f"pmcc_roll_{result.status}",
@@ -2625,7 +2767,7 @@ async def _execute_auto_leap_forward_roll(intent: TradeIntent, decision, ib: Any
             i.walking_config = cfg
         s.add(TradeAuditLog(
             intent_id=intent.id, action="auto_leap_roll_outcome",
-            outcome=result.status, payload=result.to_dict(), error=result.error,
+            outcome=result.status, payload={**result.to_dict(), "error": result.error},
         ))
         await record_auto_action(
             s, loop="maintenance", action_type=f"pmcc_roll_{result.status}",

@@ -195,6 +195,29 @@ class Settings(BaseSettings):
     # weights self-tune from a theory prior toward measured IC — no human gate.
     # Off-switch only.
     QUANT_OVERLAY_ENABLED: bool = True
+    # Max magnitude (exit-pressure points) the quant overlay may shift an open
+    # position's exit pressure: a strong name holds longer (−), a weak one
+    # trims sooner (+). Kept small (< the rotation delta of 25) so the quant
+    # signal informs but never single-handedly forces a drawdown exit.
+    QUANT_EXIT_MAX_DELTA: float = 10.0
+
+    # ----- Observability ----------------------------------------------
+    # Persist logs to a rotating file (in addition to the console). Without
+    # this, backend logs live only in the uvicorn console window and vanish on
+    # restart — making post-hoc audits of what the autonomous loops did
+    # impossible. Off by setting LOG_DIR="".
+    LOG_DIR: str = "logs"
+    LOG_LEVEL: str = "INFO"
+    LOG_MAX_BYTES: int = 10_000_000      # 10 MB per file
+    LOG_BACKUP_COUNT: int = 14           # ~2 weeks of rotated history
+
+    # ----- Entry-loop signal freshness --------------------------------
+    # The entry loop acts on the LATEST completed theme run per theme within
+    # this lookback window (not strictly "today"), so a late or recovered daily
+    # run still yields actionable candidates instead of a zero-entry day. Recent
+    # per-symbol attempts/intents within the window still de-dup, so widening it
+    # does not cause re-entry churn.
+    ENTRY_RUN_LOOKBACK_HOURS: int = 30
 
     # ----- Execution (IBKR) -------------------------------------------
     IBKR_HOST: str = "127.0.0.1"

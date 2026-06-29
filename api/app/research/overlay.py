@@ -207,6 +207,43 @@ def format_block(symbol: str, features: Mapping[str, Any], weights: Mapping[str,
     return "\n".join(lines)
 
 
+def edge_to_exit_delta(edge: float, max_delta: float) -> float:
+    """Map a 0-100 quant edge to a bounded, bidirectional exit-pressure delta.
+
+    edge 100 (structurally strong) -> -max_delta (hold winners longer);
+    edge 0   (weak)                -> +max_delta (lean toward trimming);
+    edge 50  (neutral)             ->  0. Pure + testable.
+    """
+    return round((50.0 - edge) / 50.0 * max_delta, 2)
+
+
+async def symbol_exit_delta(symbol: str) -> float:
+    """Quant exit-pressure delta for one held symbol from its latest snapshot.
+
+    0.0 when there's no snapshot or the overlay is unusable — so the exit
+    decision degrades to its non-quant behaviour, never erroring."""
+    try:
+        from sqlalchemy import select
+        from ..config import get_settings
+        from ..db import SymbolFeatureSnapshot, get_session as db_session
+        max_delta = float(getattr(get_settings(), "QUANT_EXIT_MAX_DELTA", 10.0))
+        wrec = load_weights()
+        async with db_session() as s:
+            row = (await s.execute(
+                select(SymbolFeatureSnapshot)
+                .where(SymbolFeatureSnapshot.symbol == symbol.strip().upper())
+                .order_by(SymbolFeatureSnapshot.as_of.desc())
+                .limit(1)
+            )).scalar_one_or_none()
+        if row is None:
+            return 0.0
+        edge = quant_edge(row.features or {}, wrec["weights"])["score"]
+        return edge_to_exit_delta(edge, max_delta)
+    except Exception as e:  # pragma: no cover - never break the exit path
+        logger.debug("overlay: exit-delta failed for %s: %s", symbol, e)
+        return 0.0
+
+
 async def build_extra_context(symbols: list[str]) -> dict[str, str]:
     """{ticker: QUANT-SIGNALS block} for the scorer, from each symbol's latest
     feature snapshot. Symbols without a snapshot are omitted (the scorer simply

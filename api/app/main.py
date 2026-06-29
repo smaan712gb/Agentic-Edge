@@ -77,6 +77,46 @@ from .repos import EventRepo, RunRepo, ThemeRepo
 logger = logging.getLogger(__name__)
 
 
+def _setup_file_logging() -> None:
+    """Persist logs to a rotating file alongside the console.
+
+    Backend logs otherwise live only in the uvicorn console window and are lost
+    on restart, which makes auditing what the autonomous loops did impossible
+    (the gap surfaced in the 2026-06-29 system audit). Attaches a
+    RotatingFileHandler to the root logger so every ``agentic_edge.*`` line is
+    durably captured. Idempotent + best-effort: a filesystem failure must never
+    block API startup.
+    """
+    try:
+        s = get_settings()
+        if not s.LOG_DIR:
+            return
+        import os
+        from logging.handlers import RotatingFileHandler
+        root = logging.getLogger()
+        # Don't double-attach across reloads.
+        if any(isinstance(h, RotatingFileHandler) for h in root.handlers):
+            return
+        os.makedirs(s.LOG_DIR, exist_ok=True)
+        handler = RotatingFileHandler(
+            os.path.join(s.LOG_DIR, "agentic_edge.log"),
+            maxBytes=s.LOG_MAX_BYTES, backupCount=s.LOG_BACKUP_COUNT, encoding="utf-8",
+        )
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+        level = getattr(logging, str(s.LOG_LEVEL).upper(), logging.INFO)
+        handler.setLevel(level)
+        root.addHandler(handler)
+        if root.level > level or root.level == logging.NOTSET:
+            root.setLevel(level)
+        logger.info("file logging enabled -> %s/agentic_edge.log (level=%s)", s.LOG_DIR, s.LOG_LEVEL)
+    except Exception as e:  # pragma: no cover - never block startup on logging
+        logger.warning("file logging setup failed: %s", e)
+
+
+_setup_file_logging()
+
+
 # ---------------------------------------------------------------------------
 # Friendly agent catalog — names + plain-English descriptions surfaced in
 # the UI. Vendor names (Polygon, FMP, Unusual Whales) intentionally never

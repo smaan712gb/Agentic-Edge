@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import select
@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from api.app.config import get_settings
 from api.app.db import (
+    AutoAction,
     Run,
     SystemState,
     TickerScore,
@@ -182,59 +183,83 @@ async def _tick() -> None:
                 return
 
 
-async def _find_unprocessed_buys() -> list[tuple[str, str, str, float]]:
-    """Return (run_id, theme_id, symbol, composite) tuples for un-traded Buy
-    decisions on runs that finished today. Sorted by composite desc.
+def _latest_run_per_theme(
+    runs: list[tuple[str, str]],
+) -> dict[str, str]:
+    """{theme_id: run_id} keeping only the FIRST run seen per theme.
 
-    Skips symbols where:
-      * a TradeIntent already exists for (run_id, symbol) — already routed
-      * the loop already attempted any open_* on this symbol today
+    Pure + testable. ``runs`` must be pre-sorted newest-first (finished_at
+    desc), so the first occurrence of each theme is its latest completed run.
+    Ensures we score off ONE (the freshest) run per theme, never a stale one
+    or duplicate candidates across two runs of the same theme.
+    """
+    latest: dict[str, str] = {}
+    for run_id, theme_id in runs:
+        latest.setdefault(theme_id, run_id)
+    return latest
+
+
+async def _find_unprocessed_buys() -> list[tuple[str, str, str, float]]:
+    """Return (run_id, theme_id, symbol, composite) for un-traded Buy decisions
+    on the LATEST completed run per theme within ENTRY_RUN_LOOKBACK_HOURS.
+    Sorted by composite desc.
+
+    Using a lookback window (not strictly "today") means a late or recovered
+    daily run still yields candidates instead of a zero-entry day — the gap that
+    left 2026-06-29 with no entries. De-dup still prevents re-entry churn:
+      * skip (run_id, symbol) that already has a TradeIntent — already routed
+      * skip any symbol attempted (open_*) anywhere in the window
 
     Does NOT skip names already held in the IBKR account: the operator
-    explicitly wants the system to *stack* PMCC + existing stock when the
-    thesis is working (momentum amplification — long stock + long LEAP +
-    short call = bigger participation when right, defined risk on the
-    LEAP leg).
+    explicitly wants the system to *stack* into a working thesis.
     """
-    from api.app.db import AutoAction
-
-    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    lookback_h = get_settings().ENTRY_RUN_LOOKBACK_HOURS
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_h)
 
     async with db_session() as s:
+        # Latest completed run per theme within the window.
+        run_rows = (
+            await s.execute(
+                select(Run.id, Run.theme_id)
+                .where(Run.status == "done")
+                .where(Run.finished_at >= cutoff)
+                .order_by(Run.finished_at.desc())
+            )
+        ).all()
+        latest_by_theme = _latest_run_per_theme([(r[0], r[1]) for r in run_rows])
+        run_to_theme = {rid: tid for tid, rid in latest_by_theme.items()}
+        run_ids = set(run_to_theme.keys())
+        if not run_ids:
+            return []
+
         rows = (
             await s.execute(
-                select(
-                    TickerScore.run_id, Run.theme_id, TickerScore.symbol,
-                    TickerScore.composite,
-                )
-                .join(Run, Run.id == TickerScore.run_id)
-                .where(Run.status == "done")
-                .where(Run.finished_at >= today)
+                select(TickerScore.run_id, TickerScore.symbol, TickerScore.composite)
+                .where(TickerScore.run_id.in_(run_ids))
                 .where(TickerScore.decision == "Buy")
                 .order_by(TickerScore.composite.desc())
             )
         ).all()
 
-        # Already submitted (any TradeIntent for this run+symbol).
+        # Already submitted (any TradeIntent for one of these runs + symbol).
         existing = {
             (i.run_id, i.symbol)
             for i in (
                 await s.execute(
-                    select(TradeIntent).where(TradeIntent.run_id.in_({r[0] for r in rows}))
+                    select(TradeIntent).where(TradeIntent.run_id.in_(run_ids))
                 )
             ).scalars().all()
         }
 
-        # Already-attempted-today symbols (any outcome from today's loop runs).
-        # We treat any ``open_*`` action as "we processed this symbol today"
-        # so a symbol that hit stock-fallback or filled doesn't get re-tried
-        # the next tick. Bound to today so tomorrow's run starts fresh.
-        attempted_today = {
+        # Already-attempted within the window (any open_* on this symbol). Bound
+        # to the same lookback so a name entered yesterday isn't re-tried today,
+        # while a genuinely new Buy still routes.
+        attempted = {
             r[0]
             for r in (
                 await s.execute(
                     select(AutoAction.symbol)
-                    .where(AutoAction.timestamp >= today)
+                    .where(AutoAction.timestamp >= cutoff)
                     .where(AutoAction.symbol.is_not(None))
                     .where(AutoAction.action_type.like("open_%"))
                     .where(AutoAction.gate_status.in_(["passed", "error"]))
@@ -243,9 +268,9 @@ async def _find_unprocessed_buys() -> list[tuple[str, str, str, float]]:
         }
 
         return [
-            (r[0], r[1], r[2], float(r[3] or 0))
+            (r[0], run_to_theme[r[0]], r[1], float(r[2] or 0))
             for r in rows
-            if (r[0], r[2]) not in existing and r[2] not in attempted_today
+            if (r[0], r[1]) not in existing and r[1] not in attempted
         ]
 
 
@@ -263,14 +288,27 @@ async def _process_one(
         rotating, score, signals = await is_theme_rotating(theme_id)
         if rotating:
             logger.info("auto-entry: %s skipped — theme %s rotating out %s", symbol, theme_id, signals)
+            # De-dup the audit row: the loop re-evaluates the same blocked
+            # candidate every 60s, which previously wrote one row per tick
+            # (~800/week of pure noise). Record at most one block per
+            # (symbol, day); subsequent ticks just skip silently.
+            today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
             async with db_session() as s:
-                await record_auto_action(
-                    s, loop="entry", action_type="entry_blocked_rotation",
-                    gate_result=None, symbol=symbol,
-                    payload={"run_id": run_id, "theme_id": theme_id,
-                             "rotation_score": score, "signals": signals},
-                    outcome="blocked_rotation",
-                )
+                already = (await s.execute(
+                    select(AutoAction.id)
+                    .where(AutoAction.action_type == "entry_blocked_rotation")
+                    .where(AutoAction.symbol == symbol)
+                    .where(AutoAction.timestamp >= today)
+                    .limit(1)
+                )).first()
+                if already is None:
+                    await record_auto_action(
+                        s, loop="entry", action_type="entry_blocked_rotation",
+                        gate_result=None, symbol=symbol,
+                        payload={"run_id": run_id, "theme_id": theme_id,
+                                 "rotation_score": score, "signals": signals},
+                        outcome="blocked_rotation",
+                    )
             return False
     except Exception as e:
         logger.debug("rotation gate check failed for %s: %s", symbol, e)
@@ -698,11 +736,12 @@ async def _process_leaps_only(
 
 
 async def _manager_conviction(symbol: str) -> tuple[float, dict]:
-    """Bounded smart-money sizing tilt for a symbol (1.0 = neutral). Lazy
+    """Bounded smart-money sizing tilt for a symbol (1.0 = neutral) — combines
+    13F manager conviction with clustered opportunistic insider buying. Lazy
     import + fail-open so the tracker never blocks an entry."""
     try:
-        from api.app.hedge_funds.conviction import manager_conviction
-        return await manager_conviction(symbol)
+        from api.app.hedge_funds.conviction import accumulation_conviction
+        return await accumulation_conviction(symbol)
     except Exception as e:
         logger.debug("conviction unavailable for %s: %s", symbol, e)
         return 1.0, {}
@@ -919,7 +958,7 @@ async def _try_stock_fallback(
                 i.position_state = "abandoned"
             s.add(TradeAuditLog(
                 intent_id=intent_id, action="stock_submit_outcome",
-                outcome="error", error=str(e),
+                outcome="error", payload={"error": str(e)},
             ))
             await record_auto_action(
                 s, loop="entry", action_type="open_stock_error",

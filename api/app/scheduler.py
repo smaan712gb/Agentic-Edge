@@ -100,6 +100,14 @@ _OVERLAY_RECAL_JOB_ID = "quant_overlay_recalibrate"
 # prior toward measured predictiveness. Fully autonomous self-tuning.
 _OVERLAY_RECAL_CRON = "15 17 * * 1-5"
 
+_MISSED_RUN_JOB_ID = "missed_run_watchdog"
+# Every 30 min, 09:00-15:30 ET weekdays. Recovers the daily theme run if it was
+# missed (process down at 09:00, or scheduler enabled AFTER 09:00) — the gap
+# that left 2026-06-29 with zero signals. Idempotent: no-ops if a completed run
+# already exists today. Registered unconditionally; checks scheduler_enabled
+# itself, so it recovers even when the scheduler was enabled after boot.
+_MISSED_RUN_CRON = "*/30 9-15 * * 1-5"
+
 
 # ---------------------------------------------------------------------------
 # Public API — start / stop / fire
@@ -198,21 +206,31 @@ async def start_scheduler() -> None:
         id=_HEALTH_JOB_ID, replace_existing=True,
         misfire_grace_time=300, max_instances=1, coalesce=True,
     )
+    # Missed-run watchdog — always-on safety net that recovers the daily theme
+    # run if it was skipped (process down at 09:00, or scheduler enabled after
+    # 09:00). Registered unconditionally; _ensure_todays_run checks the enabled
+    # flag itself. Idempotent.
+    _SCHEDULER.add_job(
+        _run_missed_run_watchdog,
+        trigger=CronTrigger.from_crontab(_MISSED_RUN_CRON, timezone="America/New_York"),
+        id=_MISSED_RUN_JOB_ID, replace_existing=True,
+        misfire_grace_time=300, max_instances=1, coalesce=True,
+    )
     _SCHEDULER.start()
     logger.info(
         "scheduler started (enabled=%s, cron=%s)",
         state.scheduler_enabled, state.scheduler_cron,
     )
     # Startup catch-up — if the 09:00 ET daily run was missed because the
-    # server wasn't running then, fire it shortly after boot (no-ops if
-    # today's run already exists). Decouples signal freshness from the
-    # server happening to be alive at exactly 09:00. One-shot, weekday-gated.
-    if state.scheduler_enabled:
-        _SCHEDULER.add_job(
-            _startup_catchup_job, trigger="date",
-            run_date=datetime.now(timezone.utc) + timedelta(seconds=45),
-            id="startup_catchup", replace_existing=True, misfire_grace_time=300,
-        )
+    # server wasn't running then, fire it shortly after boot (no-ops if today's
+    # run already exists). Registered UNCONDITIONALLY now — _ensure_todays_run
+    # checks scheduler_enabled itself, so a server that boots with the scheduler
+    # off and has it enabled moments later still recovers today's signals.
+    _SCHEDULER.add_job(
+        _startup_catchup_job, trigger="date",
+        run_date=datetime.now(timezone.utc) + timedelta(seconds=45),
+        id="startup_catchup", replace_existing=True, misfire_grace_time=300,
+    )
     await _refresh_next_run_at()
 
 
@@ -239,6 +257,14 @@ async def enable_scheduler(actor: str = "operator") -> dict:
     if _SCHEDULER is not None:
         _add_or_update_job(cron)
         await _refresh_next_run_at()
+        # Same-day catch-up: if enabled after 09:00 ET with no run yet today,
+        # recover it now (background one-shot so this call returns immediately).
+        _SCHEDULER.add_job(
+            _run_missed_run_watchdog,
+            trigger="date", run_date=datetime.now(timezone.utc) + timedelta(seconds=5),
+            id=f"enable-catchup-{int(datetime.now(timezone.utc).timestamp())}",
+            replace_existing=False, misfire_grace_time=120,
+        )
     logger.info("scheduler enabled by %s", actor)
     return await scheduler_status()
 
@@ -588,25 +614,28 @@ async def _run_all_themes_job() -> None:
     await _refresh_next_run_at()
 
 
-async def _startup_catchup_job() -> None:
-    """One-shot on boot: fire the daily theme run if today's is missing.
+async def _ensure_todays_run(reason: str) -> bool:
+    """Fire the daily theme run if it's a weekday, at/after the 09:00 ET run
+    hour, the scheduler is enabled, and no completed run exists today.
 
-    The 09:00 ET cron only fires while the process is alive at 09:00. If the
-    server starts later in the day (or after being down), today's scorecards
-    would be missing and the trading loops would act on STALE signals. This
-    catch-up closes that gap so signal freshness no longer depends on the
-    server being up at exactly 09:00.
-
-    Safe to always schedule: it is weekday-gated and idempotent — the daily
-    job is date-keyed (``scheduled-{theme}-{today}``), so if a run already
-    happened today (cron or manual) this no-ops.
+    The single recovery primitive shared by the boot catch-up, the missed-run
+    watchdog, and the enable path. Idempotent — the daily job is date-keyed
+    (``scheduled-{theme}-{today}``), so concurrent/duplicate calls no-op. Returns
+    True iff it fired the run. Checks ``scheduler_enabled`` itself so it stays
+    safe when called after the scheduler was enabled post-boot.
     """
     try:
+        async with db_session() as s:
+            state = await s.get(SystemState, 1)
+        if not (state and state.scheduler_enabled):
+            return False
         from zoneinfo import ZoneInfo
         now_et = datetime.now(ZoneInfo("America/New_York"))
         if now_et.weekday() >= 5:
-            logger.info("startup catch-up: weekend — skipping")
-            return
+            return False
+        if now_et.hour < 9:
+            # Before the scheduled hour — let the normal 09:00 cron handle it.
+            return False
         start_today = datetime.now(timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0)
         async with db_session() as s:
@@ -617,13 +646,23 @@ async def _startup_catchup_job() -> None:
                 )
             ).first()
         if done:
-            logger.info(
-                "startup catch-up: a completed run already exists today — "
-                "signals are fresh, skipping")
-            return
+            return False
         logger.warning(
-            "startup catch-up: no completed run today (missed 09:00 cron) — "
-            "firing the daily theme run now so signals are fresh")
+            "run recovery (%s): no completed run today (missed 09:00 cron) — "
+            "firing the daily theme run now so signals are fresh", reason)
         await _run_all_themes_job()
+        return True
     except Exception as e:
-        logger.exception("startup catch-up failed: %s", e)
+        logger.exception("run recovery (%s) failed: %s", reason, e)
+        return False
+
+
+async def _startup_catchup_job() -> None:
+    """One-shot on boot: recover today's run if missing (see _ensure_todays_run)."""
+    await _ensure_todays_run("startup")
+
+
+async def _run_missed_run_watchdog() -> None:
+    """Recurring safety net (every 30 min, 09:00-15:30 ET): recover the daily
+    run if it was missed — the gap that left 2026-06-29 with zero signals."""
+    await _ensure_todays_run("watchdog")

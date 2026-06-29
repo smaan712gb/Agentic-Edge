@@ -407,3 +407,42 @@ def test_format_block_is_human_readable():
     assert "QUANT EDGE" in block
     assert "chokepoint centrality" in block
     assert "theory-prior" in block       # cold-start confidence note
+
+
+def test_edge_to_exit_delta_direction_and_bounds():
+    # Strong edge -> negative (hold longer); weak -> positive (trim sooner);
+    # neutral -> 0; always within [-max, +max].
+    assert ov.edge_to_exit_delta(100.0, 10.0) == -10.0
+    assert ov.edge_to_exit_delta(0.0, 10.0) == 10.0
+    assert ov.edge_to_exit_delta(50.0, 10.0) == 0.0
+    for e in (0, 25, 50, 75, 100):
+        assert -10.0 <= ov.edge_to_exit_delta(float(e), 10.0) <= 10.0
+
+
+# ---------------------------------------------------------------------------
+# Entry loop — latest-run-per-theme selection (pure)
+# ---------------------------------------------------------------------------
+
+
+def test_latest_run_per_theme_keeps_freshest():
+    from api.app.autotrade.entry_loop import _latest_run_per_theme
+    # Pre-sorted newest-first; first run seen per theme wins, others dropped.
+    runs = [
+        ("r3", "themeA"),   # newest A
+        ("r2", "themeB"),   # newest B
+        ("r1", "themeA"),   # older A -> ignored
+    ]
+    out = _latest_run_per_theme(runs)
+    assert out == {"themeA": "r3", "themeB": "r2"}
+
+
+def test_exit_pressure_accepts_quant_delta():
+    # The exit-pressure score must move by the quant delta and re-band.
+    from tradingagents.strategies.maintenance.exit_pressure import compute_exit_pressure
+    base = compute_exit_pressure(theme_composite=5.0, trim_band="none", exhaustion_score=50.0)
+    lifted = compute_exit_pressure(theme_composite=5.0, trim_band="none", exhaustion_score=50.0,
+                                   quant_edge_delta=+15.0)
+    held = compute_exit_pressure(theme_composite=5.0, trim_band="none", exhaustion_score=50.0,
+                                 quant_edge_delta=-15.0)
+    assert lifted.score > base.score >= held.score
+    assert 0.0 <= held.score <= 100.0 and 0.0 <= lifted.score <= 100.0
