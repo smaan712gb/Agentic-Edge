@@ -284,6 +284,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
             from .positions import _ibkr
             await _ibkr()
+            # Make the fallback data chain use this live, paid IBKR connection as
+            # the PRIMARY bar source everywhere (snapshot/scorecard included),
+            # without opening a second socket. Demotes Polygon out of the hot path.
+            try:
+                from tradingagents.dataflows.fallback import set_ibkr_provider_getter
+                set_ibkr_provider_getter(_ibkr)
+                logger.info("IBKR registered as primary bar source for the data fallback chain")
+            except Exception as e:
+                logger.warning("could not register IBKR as primary bar source: %s", e)
             logger.info("IBKR provider bound to main loop")
         except Exception as e:
             logger.warning(
