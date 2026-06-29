@@ -438,7 +438,16 @@ async def record_auto_action(
       rejected — at least one gate failed (no broker call)
       error    — exception during gate evaluation OR broker call
     """
-    if error and gate_result.passed:
+    # gate_result may be None for actions that aren't gate evaluations (e.g. a
+    # rotation entry-block, a maintenance action). Treat None as a non-pass:
+    # 'error' if an error was supplied, else 'rejected'. Previously this crashed
+    # on gate_result.passed/.failures (AttributeError), and for the rotation
+    # entry-halt that crash was swallowed by the caller's try/except — so the
+    # halt FAILED OPEN and the entry went through (e.g. ABBNY into a flagged
+    # 'grid-bottleneck' rotation). Be defensive here.
+    if gate_result is None:
+        status = "error" if error else "rejected"
+    elif error and gate_result.passed:
         status = "error"
     elif gate_result.passed:
         status = "passed"
@@ -447,7 +456,8 @@ async def record_auto_action(
 
     failures_payload = (
         [{"gate": f.gate, "reason": f.reason, "detail": f.detail} for f in gate_result.failures]
-        or None
+        if gate_result is not None and gate_result.failures
+        else None
     )
     row = AutoAction(
         loop=loop, action_type=action_type, symbol=symbol, intent_id=intent_id,
@@ -459,7 +469,7 @@ async def record_auto_action(
     await session.flush()
 
     if status == "rejected":
-        rej = gate_result.first_reject()
+        rej = gate_result.first_reject() if gate_result is not None else None
         logger.info(
             "auto_action %s/%s on %s rejected: %s",
             loop, action_type, symbol or "-", rej.reason if rej else "(unknown)",
