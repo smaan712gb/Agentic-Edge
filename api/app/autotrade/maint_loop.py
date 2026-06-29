@@ -1364,6 +1364,15 @@ async def _evaluate_pmcc(intent: TradeIntent, latest_decision: Optional[str], ib
             )
         return
 
+    # ---- Graded exit-pressure score (incl. the quant overlay) -------
+    # Runs only when no hard exit trigger above fired. Gives the LEAP the
+    # unified Exit Pressure Score + per-tick observability, and folds in the
+    # quant researcher's edge. Flags (never auto-dumps) on the top band.
+    try:
+        await _record_leap_exit_pressure(intent, ib)
+    except Exception as e:
+        logger.debug("leap exit-pressure eval failed for %s: %s", intent.symbol, e)
+
     # ---- Short-call roll: full operator-spec evaluation -------------
     # We invoke the rolls module which applies all the rules:
     #   * defensive (delta ≥ 0.70)
@@ -1380,6 +1389,116 @@ async def _evaluate_pmcc(intent: TradeIntent, latest_decision: Optional[str], ib
     # ---- LEAP forward roll evaluation -------------------------------
     if intent.leap_expiry and leap_dte_days is not None and leap_dte_days <= 180:
         await _evaluate_leap_forward_roll(intent, ib, leap_dte_days)
+
+
+async def _record_leap_exit_pressure(intent: TradeIntent, ib: Any) -> None:
+    """Graded Exit Pressure Score for a LEAP position — incl. the quant overlay.
+
+    Restores the unified Exit Pressure Score + per-tick ``position_pressure``
+    observability that only the stock path had (so the LEAPS-only book has had
+    no graded exit scoring since 2026-05-12), and is what puts the quant
+    researcher into the EXIT decision. Sub-signals: theme deterioration +
+    technical exhaustion (on the UNDERLYING) + rotation + quant edge, scored
+    with LEAPS_WEIGHTS (profit_preservation left neutral here — a LEAP-premium
+    trim ladder is the documented next step).
+
+    Records the row every tick. On the top ``aggressive`` band (strong
+    multi-signal agreement) it FLAGS the LEAP for close — alert + operator
+    confirm, NEVER an auto-dump: ``kind='exit_pressure'`` is deliberately not in
+    ``_AUTO_CLOSE_KINDS``, so a normal high-beta down day can't trigger a sale.
+    """
+    if not get_settings().LEAP_GRADED_EXIT_ENABLED:
+        return
+    from tradingagents.strategies.maintenance.theme_health import is_theme_hot_for_symbol
+    from tradingagents.strategies.maintenance.momentum_exhaustion import (
+        evaluate_momentum_exhaustion,
+    )
+    from tradingagents.strategies.maintenance.exit_pressure import (
+        LEAPS_WEIGHTS, compute_exit_pressure,
+    )
+    sym = (intent.symbol or "").upper()
+
+    # Theme deterioration inputs.
+    async with db_session() as s:
+        _hot, best_theme = await is_theme_hot_for_symbol(s, sym)
+
+    # Technical exhaustion on the UNDERLYING (not the option premium).
+    exhaustion_score: Optional[float] = None
+    try:
+        signals = await _compute_daily_signals(sym)
+        spot = await _get_spot(ib, sym)
+        if spot is None and signals.get("prior_close") and signals.get("pct_move_today") is not None:
+            spot = signals["prior_close"] * (1 + signals["pct_move_today"])
+        if spot:
+            exh = evaluate_momentum_exhaustion(
+                symbol=sym, current_price=spot,
+                ma_20d=signals.get("ma_20d"), rsi_14=signals.get("rsi_14"),
+                volume_ratio=signals.get("volume_ratio"),
+                open_today=signals.get("open_today"),
+                prior_close=signals.get("prior_close"),
+                atr_30d=await _compute_atr_30d(sym),
+            )
+            exhaustion_score = exh.score
+    except Exception as e:
+        logger.debug("leap exit-pressure: exhaustion calc failed for %s: %s", sym, e)
+
+    # Rotation: tighten if any theme this name lives in is rotating out.
+    rotation_delta: Optional[float] = None
+    try:
+        from .rotation_detector import any_theme_rotating
+        from api.app.db import ThemeSymbol as _TS
+        async with db_session() as s:
+            theme_ids = [r[0] for r in (await s.execute(
+                select(_TS.theme_id).where(_TS.symbol == sym))).all() if r[0]]
+        rot_active, _themes = await any_theme_rotating(theme_ids)
+        if rot_active:
+            rotation_delta = get_settings().ROTATION_EXIT_PRESSURE_DELTA
+    except Exception as e:
+        logger.debug("leap exit-pressure: rotation check failed for %s: %s", sym, e)
+
+    # Quant overlay — the researcher's edge in the exit decision.
+    quant_delta: Optional[float] = None
+    if get_settings().QUANT_OVERLAY_ENABLED:
+        try:
+            from api.app.research.overlay import symbol_exit_delta
+            quant_delta = await symbol_exit_delta(sym) or None
+        except Exception as e:
+            logger.debug("leap exit-pressure: quant delta failed for %s: %s", sym, e)
+
+    pressure = compute_exit_pressure(
+        theme_composite=(best_theme.composite if best_theme else None),
+        theme_streak_days=(best_theme.streak_days_below_floor if best_theme else 0),
+        trim_band="none",
+        exhaustion_score=exhaustion_score,
+        rotation_score_delta=rotation_delta,
+        quant_edge_delta=quant_delta,
+        weights=LEAPS_WEIGHTS,
+    )
+
+    async with db_session() as s:
+        await record_auto_action(
+            s, loop="maintenance", action_type=f"position_pressure_{pressure.band}",
+            gate_result=_synthetic_passed_gate(), symbol=sym, intent_id=intent.id,
+            payload={
+                "score": pressure.score, "band": pressure.band,
+                "rationale": pressure.rationale, "sub_scores": pressure.sub_scores,
+                "quant_exit_delta": quant_delta, "rotation_delta": rotation_delta,
+                "exhaustion_score": exhaustion_score,
+                "theme": ({"composite": best_theme.composite,
+                           "streak": best_theme.streak_days_below_floor}
+                          if best_theme else None),
+                "structure": "leap_only",
+            },
+            outcome=pressure.band,
+        )
+
+    # Top band only → FLAG for close (operator-confirm; never auto-dump here).
+    if pressure.band == "aggressive":
+        await _flag_pmcc_close(
+            intent=intent,
+            reason=f"exit pressure {pressure.score:.0f}/100 (graded): {pressure.rationale}",
+            kind="exit_pressure", auto_execute=False,
+        )
 
 
 async def _evaluate_short_call_roll(intent: TradeIntent, ib: Any, days_to_e: Optional[int]) -> None:

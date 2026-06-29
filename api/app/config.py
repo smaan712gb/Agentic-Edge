@@ -201,6 +201,14 @@ class Settings(BaseSettings):
     # signal informs but never single-handedly forces a drawdown exit.
     QUANT_EXIT_MAX_DELTA: float = 10.0
 
+    # Give the LEAP book the graded unified Exit Pressure Score (theme
+    # deterioration + technical exhaustion + rotation + quant edge) the stock
+    # path has — restoring per-tick position_pressure observability and putting
+    # the quant signal into the EXIT decision. Records every tick; on the top
+    # 'aggressive' band it FLAGS the LEAP for close (alert + operator-confirm,
+    # never an auto-dump — kind 'exit_pressure' is not an auto-close kind).
+    LEAP_GRADED_EXIT_ENABLED: bool = True
+
     # ----- Observability ----------------------------------------------
     # Persist logs to a rotating file (in addition to the console). Without
     # this, backend logs live only in the uvicorn console window and vanish on
