@@ -101,12 +101,35 @@ def blended_weights(
     return out
 
 
-def quant_edge(features: Mapping[str, Any], weights: Mapping[str, float]) -> dict[str, Any]:
+def effective_weights(
+    weights: Mapping[str, float], universe_rows: list[Mapping[str, Any]],
+) -> dict[str, float]:
+    """Drop weights for signals carrying NO information across the universe.
+
+    A signal whose value is constant (zero variance) over every symbol — e.g.
+    ``z_dark_pool_notional`` / ``z_flow_imbalance`` when the UW feed is empty —
+    contributes nothing to any name's edge yet still sits in the denominator,
+    diluting the live signals toward neutral. We drop such dead signals so the
+    surviving weights actually shape the edge. Falls back to the full set if
+    everything looks dead (defensive — centrality always varies on a real
+    multi-theme universe)."""
+    active: dict[str, float] = {}
+    for feat, w in weights.items():
+        vals = [r.get(feat) for r in universe_rows
+                if isinstance(r.get(feat), (int, float)) and not isinstance(r.get(feat), bool)]
+        if len(vals) >= 2 and (max(vals) - min(vals)) > 1e-9:
+            active[feat] = w
+    return active or dict(weights)
+
+
+def quant_edge(features: Mapping[str, Any], weights: Mapping[str, float],
+               shrink: float = 1.0) -> dict[str, Any]:
     """0..100 edge for one symbol from its feature dict + signal weights.
 
     Weighted average of the present, normalised signals through a logistic so a
-    universe-average name scores ~50. Returns score, label, and per-signal
-    contributions (sorted, for the LLM block).
+    universe-average name scores ~50. ``shrink`` (0..1) scales the z-advantage
+    before the logistic — < 1 pulls the edge toward 50, used to down-weight the
+    cold-start prior. Returns score, label, and per-signal contributions.
     """
     num = 0.0
     wabs = 0.0
@@ -121,7 +144,7 @@ def quant_edge(features: Mapping[str, Any], weights: Mapping[str, float]) -> dic
         contribs.append((feat, round(w * nv, 3)))
     if wabs == 0.0:
         return {"score": 50.0, "label": "NEUTRAL", "contributions": []}
-    score = round(100.0 / (1.0 + math.exp(-(num / wabs))), 1)
+    score = round(100.0 / (1.0 + math.exp(-(num / wabs) * shrink)), 1)
     label = "STRONG" if score >= 64 else ("WEAK" if score <= 36 else "NEUTRAL")
     contribs.sort(key=lambda kv: abs(kv[1]), reverse=True)
     return {"score": score, "label": label, "contributions": contribs}
@@ -188,9 +211,9 @@ def recalibrate_weights(db_path: Optional[str] = None) -> dict[str, Any]:
 
 
 def format_block(symbol: str, features: Mapping[str, Any], weights: Mapping[str, float],
-                 source: str) -> str:
+                 source: str, shrink: float = 1.0) -> str:
     """The compact QUANT SIGNALS text injected into the scorer's prompt."""
-    edge = quant_edge(features, weights)
+    edge = quant_edge(features, weights, shrink=shrink)
     lines = [f"QUANT EDGE: {edge['label']} ({edge['score']}/100)"]
     # Top contributing signals in plain language.
     for feat, contrib in edge["contributions"][:5]:
@@ -200,11 +223,53 @@ def format_block(symbol: str, features: Mapping[str, Any], weights: Mapping[str,
         direction = "+" if contrib >= 0 else "-"
         lines.append(f"  {direction} {SIGNAL_LABELS.get(feat, feat)}: "
                      f"{raw:.2f} (contribution {contrib:+.2f})")
-    conf = ("weights are theory-priors (no forward-return history yet - weigh "
-            "modestly)" if source == "prior" else
-            "weights are auto-calibrated to measured forward-return predictiveness")
+    if source == "prior":
+        conf = (f"weights are theory-priors (no forward-return history yet); "
+                f"influence shrunk to {shrink:.0%} until measured IC exists")
+    else:
+        conf = "weights are auto-calibrated to measured forward-return predictiveness"
     lines.append(f"  [{conf}]")
     return "\n".join(lines)
+
+
+# Cache the de-diluted, shrink-adjusted weights per (snapshot-day, source) so the
+# exit path doesn't reload the universe on every held position every tick.
+_ACTIVE_WEIGHTS_CACHE: dict[tuple, tuple] = {}
+
+
+async def _resolve_active_weights() -> tuple[dict[str, float], str, float]:
+    """(effective_weights, source, shrink) for the current universe.
+
+    Loads the latest snapshot day once (cached), drops dead/zero-variance
+    signals, and computes the cold-start shrink (< 1 while the weights are still
+    the un-calibrated prior). Shared by the entry block and the exit delta so
+    both use one honest, de-diluted weight set."""
+    from sqlalchemy import select
+    from ..config import get_settings
+    from ..db import SymbolFeatureSnapshot, get_session as db_session
+
+    wrec = load_weights()
+    weights, source = wrec["weights"], wrec.get("source", "prior")
+    async with db_session() as s:
+        day = (await s.execute(
+            select(SymbolFeatureSnapshot.as_of)
+            .order_by(SymbolFeatureSnapshot.as_of.desc()).limit(1)
+        )).scalar()
+        key = (str(day), source)
+        if key in _ACTIVE_WEIGHTS_CACHE:
+            return _ACTIVE_WEIGHTS_CACHE[key]
+        rows: list[dict] = []
+        if day is not None:
+            rows = [r[0] or {} for r in (await s.execute(
+                select(SymbolFeatureSnapshot.features)
+                .where(SymbolFeatureSnapshot.as_of == day)
+            )).all()]
+
+    eff = effective_weights(weights, rows) if rows else dict(weights)
+    shrink = float(get_settings().QUANT_PRIOR_SHRINK) if source == "prior" else 1.0
+    result = (eff, source, shrink)
+    _ACTIVE_WEIGHTS_CACHE[key] = result
+    return result
 
 
 def edge_to_exit_delta(edge: float, max_delta: float) -> float:
@@ -227,7 +292,7 @@ async def symbol_exit_delta(symbol: str) -> float:
         from ..config import get_settings
         from ..db import SymbolFeatureSnapshot, get_session as db_session
         max_delta = float(getattr(get_settings(), "QUANT_EXIT_MAX_DELTA", 10.0))
-        wrec = load_weights()
+        eff_weights, _source, shrink = await _resolve_active_weights()
         async with db_session() as s:
             row = (await s.execute(
                 select(SymbolFeatureSnapshot)
@@ -237,7 +302,7 @@ async def symbol_exit_delta(symbol: str) -> float:
             )).scalar_one_or_none()
         if row is None:
             return 0.0
-        edge = quant_edge(row.features or {}, wrec["weights"])["score"]
+        edge = quant_edge(row.features or {}, eff_weights, shrink=shrink)["score"]
         return edge_to_exit_delta(edge, max_delta)
     except Exception as e:  # pragma: no cover - never break the exit path
         logger.debug("overlay: exit-delta failed for %s: %s", symbol, e)
@@ -251,8 +316,7 @@ async def build_extra_context(symbols: list[str]) -> dict[str, str]:
     from sqlalchemy import select
     from ..db import SymbolFeatureSnapshot, get_session as db_session
 
-    wrec = load_weights()
-    weights, source = wrec["weights"], wrec.get("source", "prior")
+    eff_weights, source, shrink = await _resolve_active_weights()
     wanted = {s.strip().upper() for s in symbols}
 
     async with db_session() as s:
@@ -265,5 +329,5 @@ async def build_extra_context(symbols: list[str]) -> dict[str, str]:
     for r in rows:
         if r.symbol not in wanted or r.symbol in out:
             continue
-        out[r.symbol] = format_block(r.symbol, r.features or {}, weights, source)
+        out[r.symbol] = format_block(r.symbol, r.features or {}, eff_weights, source, shrink)
     return out

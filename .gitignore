@@ -83,3 +83,6 @@ yarn-error.log*
 # Alembic-generated artifacts you might run locally
 # ---------------------------------------------------------------------------
 alembic.ini.local
+
+# Quant overlay runtime artifact (recalibrated weights)
+overlay_weights.json

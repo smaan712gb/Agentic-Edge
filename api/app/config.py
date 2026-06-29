@@ -200,6 +200,12 @@ class Settings(BaseSettings):
     # trims sooner (+). Kept small (< the rotation delta of 25) so the quant
     # signal informs but never single-handedly forces a drawdown exit.
     QUANT_EXIT_MAX_DELTA: float = 10.0
+    # While the overlay weights are still the cold-start theory PRIOR (no
+    # forward-return labels matured yet → IC un-measured), scale the quant
+    # edge's influence by this factor so 100%-prior weights don't drive entry
+    # ranking / exit nudges with the same authority as measured edge. Returns to
+    # full strength (1.0) automatically once the weights become 'ic_blended'.
+    QUANT_PRIOR_SHRINK: float = 0.5
 
     # Give the LEAP book the graded unified Exit Pressure Score (theme
     # deterioration + technical exhaustion + rotation + quant edge) the stock

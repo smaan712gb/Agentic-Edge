@@ -409,6 +409,44 @@ def test_format_block_is_human_readable():
     assert "theory-prior" in block       # cold-start confidence note
 
 
+def test_effective_weights_drops_dead_signals():
+    # z_dark_pool/z_flow are constant (zero) across the universe -> dropped;
+    # centrality varies -> kept. This is the de-dilution fix.
+    weights = {"z_theme_centrality": 1.0, "z_dark_pool_notional": 0.5, "z_flow_imbalance": 0.4}
+    universe = [
+        {"z_theme_centrality": 2.0, "z_dark_pool_notional": 0.0, "z_flow_imbalance": 0.0},
+        {"z_theme_centrality": -1.0, "z_dark_pool_notional": 0.0, "z_flow_imbalance": 0.0},
+        {"z_theme_centrality": 0.5, "z_dark_pool_notional": 0.0, "z_flow_imbalance": 0.0},
+    ]
+    eff = ov.effective_weights(weights, universe)
+    assert set(eff) == {"z_theme_centrality"}        # dead signals removed
+    assert eff["z_theme_centrality"] == 1.0
+
+
+def test_effective_weights_falls_back_if_all_dead():
+    weights = {"a": 1.0}
+    universe = [{"a": 0.0}, {"a": 0.0}]
+    assert ov.effective_weights(weights, universe) == weights   # defensive fallback
+
+
+def test_de_dilution_sharpens_edge():
+    # With a dead 0.9 of weight in the denominator the edge is pulled toward 50;
+    # dropping it sharpens a strong name.
+    full = {"z_theme_centrality": 1.0, "z_dark_pool_notional": 0.5, "z_flow_imbalance": 0.4}
+    feats = {"z_theme_centrality": 2.5, "z_dark_pool_notional": 0.0, "z_flow_imbalance": 0.0}
+    diluted = ov.quant_edge(feats, full)["score"]
+    sharp = ov.quant_edge(feats, {"z_theme_centrality": 1.0})["score"]
+    assert sharp > diluted > 50.0
+
+
+def test_quant_edge_shrink_pulls_toward_neutral():
+    feats = {"z_theme_centrality": 2.5}
+    weights = {"z_theme_centrality": 1.0}
+    full = ov.quant_edge(feats, weights, shrink=1.0)["score"]
+    shrunk = ov.quant_edge(feats, weights, shrink=0.5)["score"]
+    assert 50.0 < shrunk < full          # cold-start prior weighs less, not zero
+
+
 def test_edge_to_exit_delta_direction_and_bounds():
     # Strong edge -> negative (hold longer); weak -> positive (trim sooner);
     # neutral -> 0; always within [-max, +max].
