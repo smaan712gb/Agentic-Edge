@@ -311,10 +311,14 @@ class Settings(BaseSettings):
     # pyramiding (held + proposed premium). 0.15 ≈ allows ~one add on a
     # normal ~7%-of-NAV starter before it's capped.
     ENTRY_MAX_NAME_PCT_OF_NAV: float = 0.15
-    # Require this much free-funds cushion to REMAIN after an entry — keeps a
-    # buffer well above the 10% breaker floor so sizing stops before margin
-    # gets tight, not at the cliff. 0.20 = leave ≥20% free.
-    ENTRY_MIN_MARGIN_CUSHION: float = 0.20
+    # Free-funds (dry-powder) cushion to REMAIN after an entry. For a fully-paid
+    # LONG-options book this is a deployment/reserve policy, NOT a margin-safety
+    # line — long calls can't be margin-called, and the real safety floor is the
+    # circuit breaker's MAINTENANCE-margin cushion (BREAKER_MIN_MARGIN_CUSHION_PCT,
+    # a different metric that stays ~100% here). Operator set 0.10 (max deploy,
+    # 2026-07-01) — total premium-at-risk is still bounded by the aggregate
+    # (AUTO_MAX_GROSS_PREMIUM_PCT_NAV), per-theme, and per-name caps.
+    ENTRY_MIN_MARGIN_CUSHION: float = 0.10
     # AGGREGATE exposure ceiling: total open LEAP premium (= total max-loss for a
     # long-call book) across ALL names as a fraction of NAV. The per-name cap
     # bounds single-name blowups; THIS bounds the whole correlated book so a

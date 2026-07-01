@@ -731,6 +731,25 @@ async def _process_leaps_only(
                     outcome="capped")
             logger.info("auto-entry LEAPS: %s skipped — wide spread %.0f%%", symbol, _spr * 100)
             return False
+    # Size-to-fit the free-funds cushion: rather than block all-or-nothing when a
+    # full-size entry would dip below the cushion floor, buy the LARGEST size that
+    # still leaves the floor. (Concentration caps below still block, not resize —
+    # you don't shrink into an over-concentrated name; that's a real limit.)
+    try:
+        _acct = await ib.get_account_summary()
+        _avail = float(_acct.get("AvailableFunds") or 0)
+        _netliq = float(_acct.get("NetLiquidation") or nav)
+        _room = _avail - get_settings().ENTRY_MIN_MARGIN_CUSHION * _netliq
+        _max_by_margin = int(_room / (leap_px * 100)) if leap_px > 0 else 0
+        if 0 < _max_by_margin < n_contracts:
+            logger.info("auto-entry LEAPS: %s size-to-fit margin room: %d -> %d contracts "
+                        "(avail $%.0f, floor %.0f%%)", symbol, n_contracts, _max_by_margin,
+                        _avail, get_settings().ENTRY_MIN_MARGIN_CUSHION * 100)
+            n_contracts = _max_by_margin
+            total_cost = round(leap_px * n_contracts * 100, 2)
+    except Exception as e:
+        logger.debug("size-to-fit failed for %s: %s", symbol, e)
+
     # (b) Per-name + aggregate + per-theme concentration, daily capital, margin.
     _cap = await _check_entry_caps(ib=ib, symbol=symbol, new_cost=total_cost, nav=nav,
                                    theme_id=theme_id)
