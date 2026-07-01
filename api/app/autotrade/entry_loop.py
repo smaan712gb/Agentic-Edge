@@ -56,6 +56,10 @@ _POLL_INTERVAL_SEC = 60
 # 2026-06-29 (17h silent outage). On timeout the tick is cancelled and the
 # loop continues at the next poll.
 _TICK_TIMEOUT_SEC = 300
+# The pullback scan does per-symbol daily-bar fetches across the theme universe,
+# so throttle it to every ~5 min rather than every 60s entry tick.
+_LAST_PULLBACK_SCAN: float = 0.0
+_PULLBACK_SCAN_INTERVAL_SEC = 300
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +228,11 @@ async def _tick() -> None:
     # orderly volume with RSI holding — gated on theme in-contact + no hedge-fund
     # rotation-out, and routed through the SAME capped entry path (per-name /
     # aggregate / margin / daily caps all still apply). One add/name/day.
-    if get_settings().PULLBACK_ADD_ENABLED and sizing_factor > 0:
+    global _LAST_PULLBACK_SCAN
+    import time as _time
+    if (get_settings().PULLBACK_ADD_ENABLED and sizing_factor > 0
+            and _time.monotonic() - _LAST_PULLBACK_SCAN >= _PULLBACK_SCAN_INTERVAL_SEC):
+        _LAST_PULLBACK_SCAN = _time.monotonic()
         try:
             from api.app.positions import _ibkr as _ibkr_pb
             ib_pb = await _ibkr_pb()
@@ -999,27 +1007,36 @@ async def _find_pullback_adds(ib: Any, exclude: set) -> list:
     if not s.PULLBACK_ADD_ENABLED:
         return []
     from tradingagents.strategies.maintenance.theme_health import is_theme_hot_for_symbol
-    # Held leap_only names.
+    from api.app.db import ThemeSymbol
+    # UNIVERSE-WIDE: watch EVERY theme symbol (held or not) that carries a recent
+    # favorable thesis (latest decision != Avoid, composite >= floor) — not just
+    # names we already hold, and nothing symbol-hardcoded. The pullback gates
+    # below then pick the ones actually AT support with favorable RSI/volume, so
+    # the system acts on a dip opportunity anywhere in the themes.
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=s.ENTRY_RUN_LOOKBACK_HOURS)
     async with db_session() as sess:
-        held = {(r[0] or "").upper() for r in (await sess.execute(
-            select(TradeIntent.symbol).where(TradeIntent.status == "filled")
-            .where(TradeIntent.structure == "leap_only")
-            .where(TradeIntent.position_state.in_(["leap_open", "leap_open_naked"])))).all()}
+        rows = (await sess.execute(
+            select(TickerScore.symbol, TickerScore.composite, TickerScore.run_id, Run.theme_id)
+            .join(Run, Run.id == TickerScore.run_id)
+            .join(ThemeSymbol, ThemeSymbol.symbol == TickerScore.symbol)
+            .where(Run.status == "done").where(Run.finished_at >= cutoff)
+            .where(TickerScore.decision != "Avoid")
+            .where(TickerScore.composite >= s.ENTRY_MIN_COMPOSITE)
+            .order_by(Run.finished_at.desc()))).all()
+    seen: set = set()
+    universe: list = []
+    excl = {x.upper() for x in exclude}
+    for sym, comp, run_id, theme_id in rows:
+        u = (sym or "").upper()
+        if u in seen or u in excl:
+            continue
+        seen.add(u)
+        universe.append((u, float(comp or 0), run_id, theme_id))
     out: list = []
-    for sym in sorted(held - {x.upper() for x in exclude}):
+    for sym, composite, run_id, theme_id in universe:
         try:
             if await _pullback_added_today(sym):
                 continue
-            # Thesis + theme + hedge-fund gates.
-            async with db_session() as sess:
-                dec = (await sess.execute(
-                    select(TickerScore.decision, TickerScore.composite, TickerScore.run_id, Run.theme_id)
-                    .join(Run, Run.id == TickerScore.run_id)
-                    .where(Run.status == "done").where(TickerScore.symbol == sym)
-                    .order_by(Run.finished_at.desc()).limit(1))).first()
-            if not dec or (dec[0] or "") == "Avoid":
-                continue
-            decision, composite, run_id, theme_id = dec[0], float(dec[1] or 0), dec[2], dec[3]
             async with db_session() as sess:
                 hot, _bt = await is_theme_hot_for_symbol(sess, sym)
             if not hot:                                   # theme not in-contact
