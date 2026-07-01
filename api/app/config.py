@@ -155,6 +155,17 @@ class Settings(BaseSettings):
     # signal. Like manager conviction it's a bounded BOOST only, never a gate.
     INSIDER_BUY_CONVICTION_ENABLED: bool = True
     INSIDER_BUY_CONVICTION_FACTOR: float = 1.15   # applied when a cluster is present
+
+    # ----- Bearish institutional overlay (notable-short detection) ----
+    # Symmetric to the bullish conviction layer: a notable short-seller short a
+    # name (or an ETF covering its theme, e.g. Burry short SOXX) BLOCKS new
+    # pullback-adds on it and BUMPS its exit pressure. Sources: a news/operator
+    # registry (bearish.NOTABLE_SHORTS) + tier="bear" managers' 13F put positions.
+    NOTABLE_SHORT_TRACKING_ENABLED: bool = True
+    # Exit-pressure points added when a notable bear is short the name (bounded so
+    # it tightens exits but can't single-handedly force a drawdown dump — the
+    # multi-signal guardrail still applies).
+    NOTABLE_SHORT_EXIT_DELTA: float = 20.0
     INSIDER_BUY_MIN_USD: float = 200_000          # 30d cluster $ floor
 
     # ----- SEC EDGAR (Hedge Fund Signal Tracker) ----------------------

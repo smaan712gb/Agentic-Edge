@@ -180,3 +180,43 @@ def test_pullback_blocks_when_not_a_real_dip():
 def test_pullback_blocks_when_extended_above_ma():
     # Spot 10% above the MA → not at support.
     assert not _pullback_ok(spot=110, sma20=100, sma50=95, rsi=45, vol_ratio=1.2, high20=118, cfg=_CFG)
+
+
+# ---------------------------------------------------------------------------
+# Bearish overlay — notable-short registry matching (pure logic)
+# ---------------------------------------------------------------------------
+
+def _short_hit(sym, themes, registry):
+    """Mirror of bearish.notable_short_pressure registry matching (pure)."""
+    sym = sym.upper()
+    tset = set(themes or [])
+    for e in registry:
+        if str(e["target"]).upper() == sym:
+            return True
+        if e.get("kind") == "etf" and (tset & set(e.get("themes", []))):
+            return True
+    return False
+
+_REG = [
+    {"target": "AMAT", "kind": "stock", "themes": ["advanced-packaging"]},
+    {"target": "SOXX", "kind": "etf",
+     "themes": ["ai-memory-wall", "custom-silicon-supply", "advanced-packaging", "ai-interconnect"]},
+]
+
+def test_notable_short_direct_ticker():
+    assert _short_hit("AMAT", ["advanced-packaging"], _REG)      # Burry short AMAT directly
+
+def test_notable_short_via_etf_theme():
+    # A semi name inherits the SOXX short through its theme.
+    assert _short_hit("MU", ["ai-memory-wall"], _REG)
+    assert _short_hit("TSM", ["custom-silicon-supply"], _REG)
+
+def test_notable_short_ignores_non_covered_theme():
+    # A power/cooling name is NOT covered by a semiconductor-ETF short.
+    assert not _short_hit("VRT", ["data-center-power-wall", "liquid-cooling"], _REG)
+
+def test_notable_short_exit_delta_config():
+    from api.app.config import get_settings
+    s = get_settings()
+    assert s.NOTABLE_SHORT_TRACKING_ENABLED is True
+    assert s.NOTABLE_SHORT_EXIT_DELTA > 0

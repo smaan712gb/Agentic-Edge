@@ -1706,13 +1706,31 @@ async def _record_leap_exit_pressure(intent: TradeIntent, ib: Any) -> None:
         except Exception as e:
             logger.debug("leap exit-pressure: quant delta failed for %s: %s", sym, e)
 
+    # Bearish overlay — a notable short-seller short this name (or its theme via
+    # an ETF short) BUMPS exit pressure, tightening exits on a shorted holding.
+    short_delta = 0.0
+    try:
+        from api.app.hedge_funds.bearish import notable_short_pressure, notable_short_exit_delta
+        from api.app.db import ThemeSymbol as _TSb
+        async with db_session() as _s2:
+            _tids = [r[0] for r in (await _s2.execute(
+                select(_TSb.theme_id).where(_TSb.symbol == sym))).all() if r[0]]
+        _is_short, _sm = await notable_short_pressure(sym, _tids)
+        short_delta = notable_short_exit_delta(_is_short)
+        if short_delta:
+            logger.info("exit-pressure: %s carries notable-bear short (+%.0f) — %s",
+                        sym, short_delta,
+                        "; ".join(str(h.get("manager", "")) for h in _sm.get("hits", [])[:2]))
+    except Exception as e:
+        logger.debug("leap exit-pressure: notable-short check failed for %s: %s", sym, e)
+
     pressure = compute_exit_pressure(
         theme_composite=(best_theme.composite if best_theme else None),
         theme_streak_days=(best_theme.streak_days_below_floor if best_theme else 0),
         trim_band="none",
         exhaustion_score=exhaustion_score,
         rotation_score_delta=rotation_delta,
-        quant_edge_delta=quant_delta,
+        quant_edge_delta=((quant_delta or 0.0) + short_delta) or None,
         weights=LEAPS_WEIGHTS,
     )
 
@@ -1744,7 +1762,7 @@ async def _record_leap_exit_pressure(intent: TradeIntent, ib: Any) -> None:
         contributing = sum(
             1 for k in ("theme_deterioration", "tech_exhaustion", "rotation_pressure")
             if (pressure.sub_scores.get(k) or 0) > 0
-        ) + (1 if (quant_delta or 0) > 0 else 0)
+        ) + (1 if (quant_delta or 0) > 0 else 0) + (1 if short_delta > 0 else 0)
         auto_ok = get_settings().LEAP_AUTO_EXIT_ENABLED and contributing >= 2
         reason = (f"exit pressure {pressure.score:.0f}/100 (graded, {contributing} "
                   f"signal(s)): {pressure.rationale}")

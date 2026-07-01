@@ -133,3 +133,16 @@ tier = "tier1"
 ciks = ["0001009207"]
 macro_only = true   # book is futures/swaps-heavy; no single-name signal
 themes = []
+
+# ===================== Bears — notable short-sellers ===================
+# tier="bear": these funds' 13F PUT positions (put_call_flag='P') are read as
+# BEARISH signals — they BLOCK new pullback-adds on the shorted name and BUMP
+# its exit pressure (never counted as bullish conviction). Known-now shorts
+# (ahead of the ~45-day 13F lag) live in hedge_funds/bearish.py NOTABLE_SHORTS.
+
+[[manager]]
+slug = "scion-burry"
+name = "Michael Burry — Scion Asset Management"
+tier = "bear"
+ciks = ["0001649339"]
+themes = []

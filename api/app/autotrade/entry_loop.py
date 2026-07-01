@@ -1043,6 +1043,18 @@ async def _find_pullback_adds(ib: Any, exclude: set) -> list:
                 continue
             if await _hedge_funds_rotating_out(sym):      # institutions exiting
                 continue
+            # Notable-bear short: don't add into a name (or theme) a famous
+            # short-seller is short — a direct bearish institutional signal.
+            try:
+                from api.app.hedge_funds.bearish import notable_short_pressure
+                short_active, short_meta = await notable_short_pressure(
+                    sym, [theme_id] if theme_id else None)
+                if short_active:
+                    logger.info("pullback-add BLOCKED: %s — notable bear short (%s)", sym,
+                                "; ".join(str(h.get("manager", "")) for h in short_meta.get("hits", [])[:2]))
+                    continue
+            except Exception as e:
+                logger.debug("notable-short check failed for %s: %s", sym, e)
             sig = await _pullback_add_signals(sym, ib)
             if not sig or not sig["at_support"]:
                 continue
