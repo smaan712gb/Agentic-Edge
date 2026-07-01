@@ -81,7 +81,11 @@ def _load_env_file() -> None:
             continue
         try:
             from dotenv import load_dotenv  # type: ignore
-            load_dotenv(path, override=False)
+            # override=True: the local .env is the source of truth. A stale
+            # OS/Machine-scope var (e.g. a rotated-out API key) must NOT shadow
+            # the freshly-edited .env — that footgun silently kept a burned FMP
+            # key alive. .env wins.
+            load_dotenv(path, override=True)
             return
         except ImportError:
             for line in path.read_text(encoding="utf-8").splitlines():
@@ -91,7 +95,7 @@ def _load_env_file() -> None:
                 k, _, v = line.partition("=")
                 k = k.strip().upper()
                 v = v.strip().strip('"').strip("'")
-                if k and k not in os.environ:
+                if k:                       # .env authoritative — override OS env
                     os.environ[k] = v
             return
 
