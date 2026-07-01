@@ -132,3 +132,51 @@ def test_live_mode_requires_explicit_ack():
     from api.app.config import Settings
     with pytest.raises(Exception):
         Settings(IBKR_MODE="live")   # no I_UNDERSTAND_LIVE_AUTONOMOUS_TRADING
+
+
+# ---------------------------------------------------------------------------
+# Pullback-add ("buy support") — RSI + the gate logic
+# ---------------------------------------------------------------------------
+
+def test_rsi_14():
+    from api.app.autotrade.entry_loop import _rsi_14
+    assert _rsi_14([float(i) for i in range(1, 30)]) == 100.0        # only gains
+    assert _rsi_14([float(30 - i) for i in range(1, 30)]) == 0.0     # only losses
+    assert _rsi_14([10, 11] * 8) == pytest.approx(50.0, abs=1)        # choppy
+    assert _rsi_14([1, 2, 3]) is None                                # too short
+
+
+def _pullback_ok(*, spot, sma20, sma50, rsi, vol_ratio, high20, cfg):
+    """Mirror of the _find_pullback_adds gate stack (pure)."""
+    prox = cfg["prox"]
+    near20 = sma20 > 0 and abs(spot - sma20) / sma20 <= prox and spot >= sma20 * (1 - prox)
+    near50 = sma50 > 0 and abs(spot - sma50) / sma50 <= prox and spot >= sma50 * (1 - prox)
+    if not (near20 or near50):
+        return False
+    if (high20 - spot) / high20 < cfg["min_dip"]:
+        return False
+    if not (cfg["rsi_min"] <= rsi <= cfg["rsi_max"]):
+        return False
+    if vol_ratio is not None and vol_ratio > cfg["max_vol"]:
+        return False
+    return True
+
+_CFG = {"prox": 0.03, "min_dip": 0.05, "rsi_min": 38.0, "rsi_max": 58.0, "max_vol": 1.6}
+
+def test_pullback_add_fires_at_support_with_favorable_signals():
+    # At SMA20 (100), spot 101 (within 3%), 9% off the 110 high, RSI 45, vol 1.2x → ADD.
+    assert _pullback_ok(spot=101, sma20=100, sma50=95, rsi=45, vol_ratio=1.2, high20=110, cfg=_CFG)
+
+def test_pullback_blocks_on_rsi_breakdown():
+    assert not _pullback_ok(spot=101, sma20=100, sma50=95, rsi=30, vol_ratio=1.2, high20=110, cfg=_CFG)
+
+def test_pullback_blocks_on_distribution_volume():
+    assert not _pullback_ok(spot=101, sma20=100, sma50=95, rsi=45, vol_ratio=2.5, high20=110, cfg=_CFG)
+
+def test_pullback_blocks_when_not_a_real_dip():
+    # Only 2% off the high → not a pullback.
+    assert not _pullback_ok(spot=101, sma20=100, sma50=95, rsi=45, vol_ratio=1.2, high20=103, cfg=_CFG)
+
+def test_pullback_blocks_when_extended_above_ma():
+    # Spot 10% above the MA → not at support.
+    assert not _pullback_ok(spot=110, sma20=100, sma50=95, rsi=45, vol_ratio=1.2, high20=118, cfg=_CFG)

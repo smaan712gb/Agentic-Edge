@@ -173,7 +173,7 @@ async def _tick() -> None:
 
     # Pull today's completed runs and queue Buy decisions we haven't acted on.
     candidates = await _find_unprocessed_buys()
-    if not candidates:
+    if not candidates and not get_settings().PULLBACK_ADD_ENABLED:
         return
 
     # Macro regime read once per tick. Tightens NAV sizing in elevated /
@@ -218,6 +218,30 @@ async def _tick() -> None:
             if await _daily_cap_exhausted():
                 logger.info("auto-entry: daily cap exhausted, sleeping until next tick")
                 return
+
+    # ---- Pullback adds ("buy support") --------------------------------------
+    # Average into still-favored theme names that have dipped to SMA20/SMA50 on
+    # orderly volume with RSI holding — gated on theme in-contact + no hedge-fund
+    # rotation-out, and routed through the SAME capped entry path (per-name /
+    # aggregate / margin / daily caps all still apply). One add/name/day.
+    if get_settings().PULLBACK_ADD_ENABLED and sizing_factor > 0:
+        try:
+            from api.app.positions import _ibkr as _ibkr_pb
+            ib_pb = await _ibkr_pb()
+            already = {c[2].upper() for c in candidates}
+            for run_id, theme_id, symbol, composite in await _find_pullback_adds(ib_pb, already):
+                if await _daily_cap_exhausted():
+                    break
+                async with db_session() as s:
+                    await record_auto_action(
+                        s, loop="entry", action_type="open_leap_pullback", gate_result=None,
+                        symbol=symbol, payload={"run_id": run_id, "note": "pullback add at MA support"},
+                        outcome="attempt")
+                await _process_one(run_id, theme_id, symbol, composite,
+                                   sizing_factor=sizing_factor, macro_regime=macro_regime,
+                                   pullback_add=True)
+        except Exception as e:
+            logger.debug("auto-entry: pullback-add pass failed: %s", e)
 
 
 def _latest_run_per_theme(
@@ -317,6 +341,7 @@ async def _find_unprocessed_buys() -> list[tuple[str, str, str, float]]:
 async def _process_one(
     run_id: str, theme_id: str, symbol: str, composite: float,
     *, sizing_factor: float = 1.0, macro_regime: str = "calm",
+    pullback_add: bool = False,
 ) -> bool:
     """Run the gate, build the PMCC, submit it. Returns True if a trade was
     placed (or attempted), False if rejected upstream."""
@@ -459,6 +484,7 @@ async def _process_one(
         return await _process_leaps_only(
             run_id=run_id, theme_id=theme_id, symbol=symbol, composite=composite,
             cand=cand, gate=gate, ib=ib, sizing_factor=sizing_factor, macro_regime=macro_regime,
+            pullback_add=pullback_add,
         )
 
     # Manager-conviction tilt: names tracked legendary investors hold with
@@ -655,6 +681,7 @@ STOCK_FALLBACK_NAV_PCT = 0.03
 async def _process_leaps_only(
     *, run_id: str, theme_id: str, symbol: str, composite: float,
     cand: Any, gate, ib: Any, sizing_factor: float = 1.0, macro_regime: str = "calm",
+    pullback_add: bool = False,
 ) -> bool:
     """LEAPS-only entry: buy the long LEAP call outright (no short call, no
     combo). Sized on the full LEAP premium (no short-call credit offsets it),
@@ -727,7 +754,7 @@ async def _process_leaps_only(
             run_id=run_id, symbol=symbol, side="BUY", qty=n_contracts,
             order_type="LMT", status="submitting",
             structure="leap_only", position_state="leap_pending",
-            entry_strategy="leaps_only",
+            entry_strategy="leaps_pullback_add" if pullback_add else "leaps_only",
             leap_expiry=cand.leap.expiry, leap_strike=cand.leap.strike,
             leap_delta_actual=cand.leap.delta, leap_iv=cand.leap.iv,
             leap_open_interest=cand.leap.open_interest, leap_qty=n_contracts,
@@ -863,6 +890,140 @@ async def _has_unmanaged_orphan(ib: Any) -> bool:
             managed.add(int(cfg.get(k) or 0))
     managed.discard(0)
     return bool(opt_conids - managed)
+
+
+def _rsi_14(closes: list, period: int = 14) -> "float | None":
+    """Wilder-style RSI(14) from a close series. None if too little history."""
+    if len(closes) < period + 1:
+        return None
+    gains = losses = 0.0
+    for i in range(-period, 0):
+        d = float(closes[i]) - float(closes[i - 1])
+        gains += max(d, 0.0)
+        losses += max(-d, 0.0)
+    if losses == 0:
+        return 100.0
+    rs = (gains / period) / (losses / period)
+    return round(100.0 - 100.0 / (1.0 + rs), 1)
+
+
+async def _pullback_add_signals(symbol: str, ib: Any) -> "dict | None":
+    """Technicals for a pullback-add decision: spot vs SMA20/SMA50, RSI, volume
+    ratio, dip off the 20-day high, and whether spot is AT support (within
+    PULLBACK_ADD_MA_PROXIMITY_PCT of either MA, from above). None on data gap."""
+    from datetime import date, timedelta
+    from tradingagents.dataflows.fallback import get_stock_data_with_fallback
+    try:
+        df = await get_stock_data_with_fallback(
+            symbol, date.today() - timedelta(days=140), date.today(), ibkr_provider=ib)
+        if df is None or len(df) < 55 or "Close" not in df.columns:
+            return None
+        closes = df["Close"].astype(float).tolist()
+        spot, sma20, sma50 = closes[-1], sum(closes[-20:]) / 20, sum(closes[-50:]) / 50
+        high20 = max(closes[-20:])
+        rsi = _rsi_14(closes)
+        vol_ratio = None
+        if "Volume" in df.columns:
+            vols = df["Volume"].astype(float).tolist()
+            if len(vols) >= 21:
+                avg20 = sum(vols[-21:-1]) / 20
+                vol_ratio = round(vols[-1] / avg20, 2) if avg20 > 0 else None
+        prox = get_settings().PULLBACK_ADD_MA_PROXIMITY_PCT
+        # "At support" = spot within prox of the MA and not broken materially below it.
+        near20 = sma20 > 0 and abs(spot - sma20) / sma20 <= prox and spot >= sma20 * (1 - prox)
+        near50 = sma50 > 0 and abs(spot - sma50) / sma50 <= prox and spot >= sma50 * (1 - prox)
+        return {"spot": spot, "sma20": sma20, "sma50": sma50, "high20": high20,
+                "rsi": rsi, "vol_ratio": vol_ratio,
+                "dip": (high20 - spot) / high20 if high20 > 0 else 0.0,
+                "at_support": bool(near20 or near50),
+                "which_ma": "sma20" if near20 else ("sma50" if near50 else None)}
+    except Exception as e:
+        logger.debug("pullback signals failed for %s: %s", symbol, e)
+        return None
+
+
+async def _hedge_funds_rotating_out(symbol: str) -> bool:
+    """True if a tracked institution recently reduced/exited this holding
+    (stake_watch stake_reduction_flagged in the last 10 days) — a rotation-out
+    cue that BLOCKS a pullback add. Fail-open (False) if unavailable."""
+    try:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=10)
+        async with db_session() as s:
+            row = (await s.execute(
+                select(AutoAction.id)
+                .where(AutoAction.symbol == symbol)
+                .where(AutoAction.action_type == "stake_reduction_flagged")
+                .where(AutoAction.timestamp >= cutoff).limit(1))).first()
+        return row is not None
+    except Exception:
+        return False
+
+
+async def _pullback_added_today(symbol: str) -> bool:
+    """At most one pullback add per name per day."""
+    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    async with db_session() as s:
+        row = (await s.execute(
+            select(AutoAction.id)
+            .where(AutoAction.symbol == symbol)
+            .where(AutoAction.action_type == "open_leap_pullback")
+            .where(AutoAction.timestamp >= start).limit(1))).first()
+    return row is not None
+
+
+async def _find_pullback_adds(ib: Any, exclude: set) -> list:
+    """Held theme names dipping to SMA20/SMA50 support that still pass every gate:
+    thesis not broken (latest decision != Avoid), theme in-contact, no hedge-fund
+    rotation-out, RSI favorable, orderly volume. Returns (run_id, theme_id, symbol,
+    composite) tuples routed through the normal capped entry path."""
+    s = get_settings()
+    if not s.PULLBACK_ADD_ENABLED:
+        return []
+    from tradingagents.strategies.maintenance.theme_health import is_theme_hot_for_symbol
+    # Held leap_only names.
+    async with db_session() as sess:
+        held = {(r[0] or "").upper() for r in (await sess.execute(
+            select(TradeIntent.symbol).where(TradeIntent.status == "filled")
+            .where(TradeIntent.structure == "leap_only")
+            .where(TradeIntent.position_state.in_(["leap_open", "leap_open_naked"])))).all()}
+    out: list = []
+    for sym in sorted(held - {x.upper() for x in exclude}):
+        try:
+            if await _pullback_added_today(sym):
+                continue
+            # Thesis + theme + hedge-fund gates.
+            async with db_session() as sess:
+                dec = (await sess.execute(
+                    select(TickerScore.decision, TickerScore.composite, TickerScore.run_id, Run.theme_id)
+                    .join(Run, Run.id == TickerScore.run_id)
+                    .where(Run.status == "done").where(TickerScore.symbol == sym)
+                    .order_by(Run.finished_at.desc()).limit(1))).first()
+            if not dec or (dec[0] or "") == "Avoid":
+                continue
+            decision, composite, run_id, theme_id = dec[0], float(dec[1] or 0), dec[2], dec[3]
+            async with db_session() as sess:
+                hot, _bt = await is_theme_hot_for_symbol(sess, sym)
+            if not hot:                                   # theme not in-contact
+                continue
+            if await _hedge_funds_rotating_out(sym):      # institutions exiting
+                continue
+            sig = await _pullback_add_signals(sym, ib)
+            if not sig or not sig["at_support"]:
+                continue
+            if sig["dip"] < s.PULLBACK_ADD_MIN_DIP_PCT:   # not a real pullback
+                continue
+            if sig["rsi"] is None or not (s.PULLBACK_ADD_RSI_MIN <= sig["rsi"] <= s.PULLBACK_ADD_RSI_MAX):
+                continue
+            if sig["vol_ratio"] is not None and sig["vol_ratio"] > s.PULLBACK_ADD_MAX_VOLUME_RATIO:
+                continue                                   # distribution / panic volume
+            logger.info("pullback-add candidate: %s at %s support (spot %.2f, RSI %.0f, vol %.1fx, dip %.0f%%) "
+                        "— theme in-contact, no HF rotation",
+                        sym, sig["which_ma"], sig["spot"], sig["rsi"] or 0,
+                        sig["vol_ratio"] or 0, sig["dip"] * 100)
+            out.append((run_id, theme_id, sym, composite))
+        except Exception as e:
+            logger.debug("pullback-add eval failed for %s: %s", sym, e)
+    return out
 
 
 async def _check_entry_caps(*, ib: Any, symbol: str, new_cost: float, nav: float,

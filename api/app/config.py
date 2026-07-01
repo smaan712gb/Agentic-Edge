@@ -332,6 +332,17 @@ class Settings(BaseSettings):
     # one. Sizing already scales with conviction; this is the floor below which
     # we don't participate at all. 0 disables the floor.
     ENTRY_MIN_COMPOSITE: float = 6.0
+    # Pullback-add ("buy support"): average into a still-favored theme name when
+    # it dips to SMA20/SMA50 support on ORDERLY (not distribution) volume with RSI
+    # holding — but ONLY while the theme is in-contact AND no tracked hedge fund is
+    # rotating out. All normal caps (per-name 15%, aggregate, per-theme, margin,
+    # daily) still apply, and it's deduped to at most one add/name/day. Off-switch.
+    PULLBACK_ADD_ENABLED: bool = True
+    PULLBACK_ADD_MA_PROXIMITY_PCT: float = 0.03   # within 3% of SMA20/50 = "at support"
+    PULLBACK_ADD_MIN_DIP_PCT: float = 0.05        # >=5% off the 20-day high (a real pullback)
+    PULLBACK_ADD_RSI_MIN: float = 38.0            # below → breakdown, skip (not "favorable")
+    PULLBACK_ADD_RSI_MAX: float = 58.0            # above → not actually pulled back
+    PULLBACK_ADD_MAX_VOLUME_RATIO: float = 1.6    # dip must be orderly, not a >1.6x distribution day
     # Reject LEAP entries whose bid/ask spread exceeds this fraction of mid —
     # illiquid LEAPs fill far from fair value (the CRDO overpay). 0.15 = skip
     # if the spread is wider than 15% of mid.
