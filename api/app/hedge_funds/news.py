@@ -164,20 +164,22 @@ async def extract_news_signal(headline: str, body: Optional[str], symbol: str) -
 
 
 async def _watched_symbols(ib: Any) -> dict[str, Optional[str]]:
-    """symbol -> a theme_id (first match, for tagging). Theme universe plus
-    any held stock positions."""
+    """symbol -> a theme_id (first match, for tagging). The full theme universe
+    (every ThemeSymbol — dynamic, no hand-kept list) plus any held stock
+    positions. ``ib`` may be None (FMP-only run)."""
     out: dict[str, Optional[str]] = {}
     async with db_session() as s:
         rows = (await s.execute(select(ThemeSymbol.symbol, ThemeSymbol.theme_id))).all()
     for sym, theme_id in rows:
         out.setdefault((sym or "").upper(), theme_id)
     # Held stock positions (so portfolio names not in a theme are still watched).
-    try:
-        for p in await ib.get_positions():
-            if str(p.get("secType", "")).upper() == "STK":
-                out.setdefault((p.get("symbol") or "").upper(), None)
-    except Exception as e:
-        logger.debug("news: positions fetch for watchlist failed: %s", e)
+    if ib is not None:
+        try:
+            for p in await ib.get_positions():
+                if str(p.get("secType", "")).upper() == "STK":
+                    out.setdefault((p.get("symbol") or "").upper(), None)
+        except Exception as e:
+            logger.debug("news: positions fetch for watchlist failed: %s", e)
     out.pop("", None)
     return out
 
@@ -195,83 +197,123 @@ async def run_news_sweep(
         summary["skipped_reason"] = "NEWS_SWEEP_ENABLED=false"
         return summary
 
+    # IBKR news is best-effort — a free, limited feed. FMP is the real news API
+    # that gives dynamic coverage across the whole theme universe.
+    ib = None
     try:
         from api.app.positions import _ibkr
         ib = await _ibkr()
     except Exception as e:
-        summary["skipped_reason"] = f"ibkr unavailable: {e}"
+        logger.debug("news: IBKR unavailable, FMP-only run: %s", e)
+
+    fmp = None
+    if getattr(settings, "NEWS_FMP_ENABLED", True) and getattr(settings, "FMP_API_KEY", None):
+        try:
+            from tradingagents.dataflows.providers.fmp import FmpProvider
+            fmp = FmpProvider(api_key=settings.FMP_API_KEY)
+        except Exception as e:
+            logger.debug("news: FMP provider init failed: %s", e)
+
+    if ib is None and fmp is None:
+        summary["skipped_reason"] = "no news source (IBKR down, FMP unconfigured)"
         return summary
+
+    from datetime import timedelta
+    _from = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).strftime("%Y-%m-%d")
 
     watch = await _watched_symbols(ib)
     symbols = list(watch.keys())[:max_symbols]
     summary["symbols"] = len(symbols)
 
-    for sym in symbols:
-        try:
-            articles = await ib.get_historical_news(
-                sym, lookback_hours=lookback_hours, max_results=max_per_symbol, fetch_body=True,
-            )
-        except Exception as e:
-            logger.debug("news: fetch failed for %s: %s", sym, e)
-            continue
-        summary["articles"] += len(articles)
+    try:
+        for sym in symbols:
+            articles: list[dict[str, Any]] = []
+            if ib is not None:
+                try:
+                    ib_arts = await ib.get_historical_news(
+                        sym, lookback_hours=lookback_hours, max_results=max_per_symbol, fetch_body=True,
+                    )
+                    for a in ib_arts:
+                        a["_src"] = "ib_news"
+                    articles.extend(ib_arts)
+                except Exception as e:
+                    logger.debug("news: IB fetch failed for %s: %s", sym, e)
+            if fmp is not None:
+                try:
+                    fmp_arts = await fmp.get_stock_news(sym, limit=max_per_symbol, from_date=_from)
+                    for a in fmp_arts:
+                        a["_src"] = "fmp_news"
+                    articles.extend(fmp_arts)
+                except Exception as e:
+                    logger.debug("news: FMP fetch failed for %s: %s", sym, e)
+            summary["articles"] += len(articles)
 
-        for art in articles:
-            _text = (art.get("headline") or "") + " " + (art.get("body") or "")
-            c_hits = match_chokepoints(_text)
-            b_hits = match_bearish(_text)
-            if not c_hits and not b_hits:
-                continue
-            # Merge both lanes into the stored tag list; bearish tags namespaced
-            # so the overlay can find them ("bear:short", "bear:notable_short:burry").
-            hits = list(c_hits) + [f"bear:{t}" for t in b_hits]
-            is_notable_short = any(t.startswith("notable_short:") for t in b_hits)
-            summary["hits"] += 1
-            provider = art.get("provider") or ""
-            article_id = str(art.get("article_id") or "")
+            for art in articles:
+                _src = art.get("_src", "ib_news")
+                _text = (art.get("headline") or "") + " " + (art.get("body") or "")
+                c_hits = match_chokepoints(_text)
+                b_hits = match_bearish(_text)
+                if not c_hits and not b_hits:
+                    continue
+                # Merge both lanes into the stored tag list; bearish tags namespaced
+                # so the overlay can find them ("bear:short", "bear:notable_short:burry").
+                hits = list(c_hits) + [f"bear:{t}" for t in b_hits]
+                is_notable_short = any(t.startswith("notable_short:") for t in b_hits)
+                summary["hits"] += 1
+                provider = art.get("provider") or ""
+                article_id = str(art.get("article_id") or "")
 
-            # Dedup.
-            async with db_session() as s:
-                exists = (await s.execute(
-                    select(NewsMention.id)
-                    .where(NewsMention.source_type == "ib_news")
-                    .where(NewsMention.provider == provider)
-                    .where(NewsMention.article_id == article_id)
-                    .where(NewsMention.ticker == sym)
-                )).first()
-            if exists:
-                continue
+                # Dedup — keyed on the article's own source so IB + FMP copies of
+                # the same story don't collide.
+                async with db_session() as s:
+                    exists = (await s.execute(
+                        select(NewsMention.id)
+                        .where(NewsMention.source_type == _src)
+                        .where(NewsMention.provider == provider)
+                        .where(NewsMention.article_id == article_id)
+                        .where(NewsMention.ticker == sym)
+                    )).first()
+                if exists:
+                    continue
 
-            signal = await extract_news_signal(art.get("headline") or "", art.get("body"), sym)
-            # If the bearish lane fired but the LLM was unavailable/uncertain, we
-            # still know the story is bearish — don't let a missing key erase it.
-            if b_hits and not signal.get("sentiment"):
-                signal = {**signal, "sentiment": "bearish"}
-            published = _parse_time(art.get("time"))
+                signal = await extract_news_signal(art.get("headline") or "", art.get("body"), sym)
+                # If the bearish lane fired but the LLM was unavailable/uncertain, we
+                # still know the story is bearish — don't let a missing key erase it.
+                if b_hits and not signal.get("sentiment"):
+                    signal = {**signal, "sentiment": "bearish"}
+                published = _parse_time(art.get("time"))
 
-            async with db_session() as s:
-                s.add(NewsMention(
-                    source_type="ib_news", provider=provider, article_id=article_id,
-                    ticker=sym, theme_id=watch.get(sym),
-                    headline=(art.get("headline") or "")[:1000],
-                    chokepoint_hits=hits,
-                    sentiment=signal.get("sentiment"),
-                    conviction=signal.get("conviction"),
-                    summary=signal.get("summary"),
-                    published_at=published,
-                ))
-            summary["stored"] += 1
+                async with db_session() as s:
+                    s.add(NewsMention(
+                        source_type=_src, provider=provider, article_id=article_id,
+                        ticker=sym, theme_id=watch.get(sym),
+                        headline=(art.get("headline") or "")[:1000],
+                        url=(art.get("url") or None),
+                        chokepoint_hits=hits,
+                        sentiment=signal.get("sentiment"),
+                        conviction=signal.get("conviction"),
+                        summary=signal.get("summary"),
+                        published_at=published,
+                    ))
+                summary["stored"] += 1
 
-            if emit_alerts:
-                await _alert_mention(sym, art.get("headline") or "", hits, signal,
-                                     notable_short=is_notable_short)
-                summary["alerts"] += 1
-            if is_notable_short:
-                logger.warning("NOTABLE SHORT captured in news: %s — %s",
-                               sym, (art.get("headline") or "")[:160])
+                if emit_alerts:
+                    await _alert_mention(sym, art.get("headline") or "", hits, signal,
+                                         notable_short=is_notable_short)
+                    summary["alerts"] += 1
+                if is_notable_short:
+                    logger.warning("NOTABLE SHORT captured in news: %s — %s",
+                                   sym, (art.get("headline") or "")[:160])
+    finally:
+        if fmp is not None:
+            try:
+                await fmp.aclose()
+            except Exception:
+                pass
 
-    logger.info("news sweep: %d symbols, %d articles, %d chokepoint hits, %d stored",
-                summary["symbols"], summary["articles"], summary["hits"], summary["stored"])
+    logger.info("news sweep: %d symbols, %d articles, %d hits, %d stored (src: IB=%s FMP=%s)",
+                summary["symbols"], summary["articles"], summary["hits"], summary["stored"],
+                ib is not None, fmp is not None)
     return summary
 
 

@@ -177,10 +177,13 @@ class Settings(BaseSettings):
     EDGAR_USER_AGENT_EMAIL: Optional[str] = None
     EDGAR_POLL_ENABLED: bool = True
 
-    # ----- Phase 3 chokepoint news layer (free, IB-sourced) -----------
-    # Sweeps the account's IBKR news providers for chokepoint-relevant items
-    # on portfolio + theme names. No paid feeds. Off-switch only.
+    # ----- Phase 3 chokepoint + bearish news layer -------------------
+    # Sweeps news for chokepoint AND short/bearish items across the whole theme
+    # universe. Two sources: IBKR's free feed (best-effort) and FMP's news API
+    # (real coverage, dynamic per-symbol). NEWS_FMP_ENABLED gates the FMP source
+    # (needs FMP_API_KEY); without it the sweep falls back to IBKR only.
     NEWS_SWEEP_ENABLED: bool = True
+    NEWS_FMP_ENABLED: bool = True
 
     # ----- Theme Rotation Detector ------------------------------------
     # Flags a theme as "rotating out" when ROTATION_MIN_SIGNALS of {RS
