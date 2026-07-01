@@ -342,10 +342,14 @@ class Settings(BaseSettings):
     # rotating out. All normal caps (per-name 15%, aggregate, per-theme, margin,
     # daily) still apply, and it's deduped to at most one add/name/day. Off-switch.
     PULLBACK_ADD_ENABLED: bool = True
-    PULLBACK_ADD_MA_PROXIMITY_PCT: float = 0.03   # within 3% of SMA20/50 = "at support"
+    PULLBACK_ADD_MA_PROXIMITY_PCT: float = 0.05   # within 5% of SMA20/50 = "at support"
     PULLBACK_ADD_MIN_DIP_PCT: float = 0.05        # >=5% off the 20-day high (a real pullback)
-    PULLBACK_ADD_RSI_MIN: float = 38.0            # below → breakdown, skip (not "favorable")
-    PULLBACK_ADD_RSI_MAX: float = 58.0            # above → not actually pulled back
+    # RSI band for a healthy uptrend pullback: above the floor = not a breakdown;
+    # below the ceiling = not overbought. 40-68 is the "dip in a strong trend"
+    # sweet spot — a name AT support with RSI ~55-65 pulled back but held strength
+    # (the earlier 38-58 ceiling wrongly excluded exactly those buy-the-dip setups).
+    PULLBACK_ADD_RSI_MIN: float = 40.0
+    PULLBACK_ADD_RSI_MAX: float = 68.0
     PULLBACK_ADD_MAX_VOLUME_RATIO: float = 1.6    # dip must be orderly, not a >1.6x distribution day
     # Reject LEAP entries whose bid/ask spread exceeds this fraction of mid —
     # illiquid LEAPs fill far from fair value (the CRDO overpay). 0.15 = skip
