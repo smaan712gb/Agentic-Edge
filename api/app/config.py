@@ -167,6 +167,7 @@ class Settings(BaseSettings):
     # managers' 13F put positions.
     NOTABLE_SHORT_TRACKING_ENABLED: bool = True
     NOTABLE_SHORT_EXIT_DELTA: float = 10.0   # confirmation amplifier, not a driver
+    NOTABLE_SHORT_NEWS_TTL_DAYS: int = 21    # how long a news-sourced short stays "live" context
     INSIDER_BUY_MIN_USD: float = 200_000          # 30d cluster $ floor
 
     # ----- SEC EDGAR (Hedge Fund Signal Tracker) ----------------------

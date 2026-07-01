@@ -3,12 +3,19 @@
 Pipeline (sweep, same shape as the EDGAR sweep):
   watched symbols (theme universe + held portfolio)
     -> IBKR historical news per symbol (account's free news providers)
-    -> chokepoint-keyword filter (only supply-chain-relevant items kept)
+    -> TWO parallel filters, keep the article if EITHER fires:
+         * chokepoint keywords (supply-chain bottleneck radar), and
+         * bearish/short-disclosure language (a notable short on our name)
     -> DeepSeek sentiment/summary extraction (best-effort)
-    -> news_mentions store (deduped) + alert (louder when smart money holds it)
+    -> news_mentions store (deduped) + alert (louder when smart money holds it;
+       CRITICAL alert on a named short-seller). A ``bear:notable_short:<name>``
+       tag is what the notable-short overlay reads to auto-detect a short from
+       news — no longer relying on a hand-maintained registry.
 
-Deliberately high-signal: we only store/alert articles that hit the chokepoint
-dictionary, so this is a bottleneck radar on your names — not a news firehose.
+Still high-signal: we keep only articles that hit the chokepoint dictionary OR
+carry explicit short/put language — a bottleneck+short radar on your names, not
+a news firehose. Capturing a short is not acting on it: a lone short remains
+confirmation-only downstream.
 """
 
 from __future__ import annotations
@@ -68,6 +75,51 @@ def match_chokepoints(text: str) -> list[str]:
     if not text:
         return []
     return [kw for kw, rx in _CHOKEPOINT_RE if rx.search(text)]
+
+
+# ---------------------------------------------------------------------------
+# Bearish / short-disclosure lane — runs PARALLEL to the chokepoint filter.
+# The chokepoint dictionary is a supply-chain radar; it silently drops a
+# "<famous investor> is short NVDA" story because that headline carries no
+# bottleneck keyword. That is exactly how the Burry NVDA/AMAT/SOXX short got
+# missed. This lane keeps bearish/short items on our watched names so a notable
+# short is CAPTURED and surfaced — consistent with the overlay's rule that
+# capturing is not acting (a lone short stays confirmation-only).
+# ---------------------------------------------------------------------------
+NOTABLE_BEAR_NAMES: list[str] = [
+    "burry", "scion", "chanos", "kynikos", "hindenburg",
+    "muddy waters", "citron", "greenlight", "einhorn",
+]
+_SHORT_LANGUAGE: list[str] = [
+    "short position", "shorted", "short thesis", "shorting", "is short",
+    "started a short", "put position", "bought puts", "puts on", "put options",
+    "betting against", "bearish bet", "short bet", "soxx puts",
+]
+
+_BEAR_NAME_RE = [re.compile(r"\b" + re.escape(n) + r"\b", re.IGNORECASE) for n in NOTABLE_BEAR_NAMES]
+_SHORT_LANG_RE = [re.compile(r"\b" + re.escape(p) + r"\b", re.IGNORECASE) for p in _SHORT_LANGUAGE]
+
+
+def match_bearish(text: str) -> list[str]:
+    """Bearish/short-disclosure tags in the text (empty = nothing bearish).
+
+    ``short`` = explicit short/put language on the name. ``notable_short:<name>``
+    = a recognized short-seller is named alongside that short language — the
+    highest-value bearish hit, and the one that feeds the notable-short overlay.
+    Deliberately tight (requires explicit short/put language, not vague
+    'overvalued' chatter) to keep this the high-signal lane the module promises."""
+    if not text:
+        return []
+    has_short = any(rx.search(text) for rx in _SHORT_LANG_RE)
+    if not has_short:
+        return []
+    tags: list[str] = ["short"]
+    for n, rx in zip(NOTABLE_BEAR_NAMES, _BEAR_NAME_RE):
+        if rx.search(text):
+            tags.append(f"notable_short:{n.split()[0]}")
+    # de-dup, preserve order
+    seen: set[str] = set()
+    return [t for t in tags if not (t in seen or seen.add(t))]
 
 
 _NEWS_SYS_PROMPT = (
@@ -165,9 +217,15 @@ async def run_news_sweep(
         summary["articles"] += len(articles)
 
         for art in articles:
-            hits = match_chokepoints((art.get("headline") or "") + " " + (art.get("body") or ""))
-            if not hits:
+            _text = (art.get("headline") or "") + " " + (art.get("body") or "")
+            c_hits = match_chokepoints(_text)
+            b_hits = match_bearish(_text)
+            if not c_hits and not b_hits:
                 continue
+            # Merge both lanes into the stored tag list; bearish tags namespaced
+            # so the overlay can find them ("bear:short", "bear:notable_short:burry").
+            hits = list(c_hits) + [f"bear:{t}" for t in b_hits]
+            is_notable_short = any(t.startswith("notable_short:") for t in b_hits)
             summary["hits"] += 1
             provider = art.get("provider") or ""
             article_id = str(art.get("article_id") or "")
@@ -185,6 +243,10 @@ async def run_news_sweep(
                 continue
 
             signal = await extract_news_signal(art.get("headline") or "", art.get("body"), sym)
+            # If the bearish lane fired but the LLM was unavailable/uncertain, we
+            # still know the story is bearish — don't let a missing key erase it.
+            if b_hits and not signal.get("sentiment"):
+                signal = {**signal, "sentiment": "bearish"}
             published = _parse_time(art.get("time"))
 
             async with db_session() as s:
@@ -201,8 +263,12 @@ async def run_news_sweep(
             summary["stored"] += 1
 
             if emit_alerts:
-                await _alert_mention(sym, art.get("headline") or "", hits, signal)
+                await _alert_mention(sym, art.get("headline") or "", hits, signal,
+                                     notable_short=is_notable_short)
                 summary["alerts"] += 1
+            if is_notable_short:
+                logger.warning("NOTABLE SHORT captured in news: %s — %s",
+                               sym, (art.get("headline") or "")[:160])
 
     logger.info("news sweep: %d symbols, %d articles, %d chokepoint hits, %d stored",
                 summary["symbols"], summary["articles"], summary["hits"], summary["stored"])
@@ -215,7 +281,8 @@ def _parse_time(t: Any) -> Optional[datetime]:
     return None
 
 
-async def _alert_mention(symbol: str, headline: str, hits: list[str], signal: dict[str, Any]) -> None:
+async def _alert_mention(symbol: str, headline: str, hits: list[str], signal: dict[str, Any],
+                         *, notable_short: bool = False) -> None:
     from ..autotrade.alerts import alert
     # Louder when tracked managers hold the name — chokepoint news on a
     # smart-money-confirmed name is the highest-value signal.
@@ -229,10 +296,17 @@ async def _alert_mention(symbol: str, headline: str, hits: list[str], signal: di
     except Exception:
         pass
     sent = signal.get("sentiment")
-    level = "warning" if sent in ("bullish", "bearish") else "info"
+    bearish = notable_short or any(str(h).startswith("bear:") for h in hits)
+    if notable_short:
+        level, kind = "critical", "⚠ NOTABLE SHORT"
+    elif bearish:
+        level, kind = "warning", "Short/bearish news"
+    else:
+        level = "warning" if sent in ("bullish", "bearish") else "info"
+        kind = "Chokepoint news"
     await alert(
         level=level,
-        title=f"Chokepoint news: {symbol} [{', '.join(hits[:3])}]{smart}",
+        title=f"{kind}: {symbol} [{', '.join(hits[:3])}]{smart}",
         body=(f"{headline[:160]}"
               + (f" · {sent} ({signal.get('conviction')})" if sent else "")
               + (f" — {signal.get('summary')}" if signal.get("summary") else "")),

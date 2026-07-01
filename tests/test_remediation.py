@@ -220,3 +220,36 @@ def test_notable_short_exit_delta_config():
     s = get_settings()
     assert s.NOTABLE_SHORT_TRACKING_ENABLED is True
     assert s.NOTABLE_SHORT_EXIT_DELTA > 0
+
+
+# ---------------------------------------------------------------------------
+# Bearish NEWS lane — the automated capture that catches a headline short
+# even when the article carries no supply-chain chokepoint keyword.
+# ---------------------------------------------------------------------------
+
+def test_news_bearish_lane_catches_named_short_without_chokepoint():
+    from api.app.hedge_funds.news import match_chokepoints, match_bearish
+    # The exact story that was missed: a watched name (AMAT), no chokepoint word.
+    txt = ("Michael Burry Is Short NVDA, AMAT, SOXX — Sees Big Korea Chip "
+           "Spending As 'Beginning Of The End'. Burry started a short position "
+           "in Applied Materials at $729.40 and bought SOXX puts.")
+    assert match_chokepoints(txt) == []            # chokepoint filter drops it (the old bug)
+    tags = match_bearish(txt)
+    assert "short" in tags                          # bearish lane keeps it
+    assert "notable_short:burry" in tags            # and flags the named short-seller
+
+def test_news_bearish_lane_ignores_plain_bullish_or_vague():
+    from api.app.hedge_funds.news import match_bearish
+    assert match_bearish("NVDA rips to a new high on strong AI demand") == []
+    # 'overvalued' chatter alone (no explicit short/put language) is NOT kept —
+    # keeps this the high-signal lane, not a doom-word firehose.
+    assert match_bearish("Analysts debate whether chips are overvalued") == []
+
+def test_news_bearish_requires_short_language_for_notable_name():
+    from api.app.hedge_funds.news import match_bearish
+    # A bear is merely quoted, no short disclosed → not a notable-short hit.
+    assert match_bearish("Burry weighed in on the AI rally in an interview") == []
+
+def test_news_short_ttl_config():
+    from api.app.config import get_settings
+    assert get_settings().NOTABLE_SHORT_NEWS_TTL_DAYS > 0
