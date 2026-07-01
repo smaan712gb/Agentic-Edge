@@ -159,9 +159,18 @@ async def _gate_strategy_budget(
     # every rejection then logs another row, but those are 'rejected' so
     # they don't actually feed the counter — only 'passed' informational
     # rows do, which is enough to break things).
-    bookkeeping_suffix = ("_gate_passed", "_ineligible", "_hold")
-    bookkeeping_prefix = ("filing_alert_", "macro_regime_", "sector_regime_")
-    bookkeeping_exact = ("heartbeat",)
+    # These carry gate_status='passed' for the audit trail but are NOT trades
+    # (flags, observability, health pings, macro/regime reads, and attempts that
+    # were blocked before any order was placed). Counting them exhausts the daily
+    # trade / new-entry caps on pure bookkeeping — e.g. the health monitor's 50+
+    # health_check rows/day alone would trip AUTO_MAX_TRADES_PER_DAY=50. Only
+    # actual order activity (open_* filled/abandoned/submitted, closes, trims,
+    # rolls) should count.
+    bookkeeping_suffix = ("_gate_passed", "_ineligible", "_hold", "_capped",
+                          "_skipped_cap", "_flagged", "_blocked")
+    bookkeeping_prefix = ("filing_alert_", "macro_regime_", "sector_regime_",
+                          "position_pressure_", "event_", "entry_blocked_")
+    bookkeeping_exact = ("heartbeat", "health_check", "open_leap_pullback")
     def _exclude_bookkeeping(q):
         for suffix in bookkeeping_suffix:
             q = q.where(~AutoAction.action_type.like(f"%{suffix}"))
