@@ -21,8 +21,10 @@ no env file edit is required when this module ships:
     DEEPSEEK_PRO_MODEL  → DEEPSEEK_DEEP_MODEL
     DEEPSEEK_FAST_MODEL → DEEPSEEK_QUICK_MODEL
 
-Fail-fast: required keys missing OR ``IBKR_MODE != "paper"`` raises
-during settings construction so the app refuses to start.
+Fail-fast: required keys missing raises during settings construction. Live mode
+(``IBKR_MODE="live"``) additionally refuses to start unless
+``I_UNDERSTAND_LIVE_AUTONOMOUS_TRADING=1`` is set — a deliberate second gate so
+real-money autonomy is never one env flag away.
 """
 
 from __future__ import annotations
@@ -199,7 +201,14 @@ class Settings(BaseSettings):
     # position's exit pressure: a strong name holds longer (−), a weak one
     # trims sooner (+). Kept small (< the rotation delta of 25) so the quant
     # signal informs but never single-handedly forces a drawdown exit.
-    QUANT_EXIT_MAX_DELTA: float = 10.0
+    QUANT_EXIT_MAX_DELTA: float = 15.0   # modest bump 2026-06-30 — more say in trim/close
+    # Max bidirectional entry SIZE tilt the quant overlay may apply: a
+    # structurally strong candidate (high edge) sizes up to (1+tilt)×, a weak one
+    # down to (1-tilt)×, neutral = 1.0. Applied before the absolute $ cap so a
+    # boost can never breach PMCC_MAX_DOLLARS. Symmetric to manager-conviction;
+    # never a gate — quant tilts size, it doesn't block an entry. This is the
+    # entry-side wiring of the research factory's edge (2026-06-30).
+    QUANT_ENTRY_MAX_TILT: float = 0.15
     # While the overlay weights are still the cold-start theory PRIOR (no
     # forward-return labels matured yet → IC un-measured), scale the quant
     # edge's influence by this factor so 100%-prior weights don't drive entry
@@ -214,6 +223,24 @@ class Settings(BaseSettings):
     # 'aggressive' band it FLAGS the LEAP for close (alert + operator-confirm,
     # never an auto-dump — kind 'exit_pressure' is not an auto-close kind).
     LEAP_GRADED_EXIT_ENABLED: bool = True
+
+    # Autonomous execution of the graded LEAP exit-pressure (operator policy
+    # 2026-06-30): the score now ACTS, not just flags. `aggressive` (>75) auto
+    # full-closes the LEAP; `trim_heavy` (60-75) auto-trims LEAP_TRIM_HEAVY_PCT
+    # of the contracts to de-risk. GUARDRAIL: only fires with multi-signal
+    # agreement (>=2 of {theme deterioration, technical exhaustion incl. RSI,
+    # rotation, quant edge}), so a single noisy pillar — and raw price drawdown,
+    # which is not even a pillar here — can never auto-dump. Set False to revert
+    # to flag-and-confirm instantly. Trims are deduped to at most once/name/day
+    # and share the AUTO_MAX_CLOSES_PER_DAY cap with full closes.
+    LEAP_AUTO_EXIT_ENABLED: bool = True
+    LEAP_TRIM_HEAVY_PCT: float = 0.33   # fraction of contracts sold on a trim_heavy de-risk
+    # Catastrophic slow-bleed STOP — the 100%-loss backstop for a long call.
+    # A LEAP whose premium has fallen this far from entry AND whose underlying is
+    # below its 200-day MA (structural downtrend) is auto-closed: that combination
+    # is a broken thesis, not a one-day beta drop, so it does not violate the
+    # no-drawdown-dumps rule. Set high enough to never fire on normal volatility.
+    LEAP_CATASTROPHIC_STOP_PCT: float = 0.65
 
     # ----- Observability ----------------------------------------------
     # Persist logs to a rotating file (in addition to the console). Without
@@ -288,6 +315,23 @@ class Settings(BaseSettings):
     # buffer well above the 10% breaker floor so sizing stops before margin
     # gets tight, not at the cliff. 0.20 = leave ≥20% free.
     ENTRY_MIN_MARGIN_CUSHION: float = 0.20
+    # AGGREGATE exposure ceiling: total open LEAP premium (= total max-loss for a
+    # long-call book) across ALL names as a fraction of NAV. The per-name cap
+    # bounds single-name blowups; THIS bounds the whole correlated book so a
+    # systemic AI-compute drawdown can't take the entire account. 1.0 = never
+    # hold more premium-at-risk than NAV. Checked before every entry, fails
+    # closed on an unreadable NAV/positions.
+    AUTO_MAX_GROSS_PREMIUM_PCT_NAV: float = 1.0
+    # Per-THEME concentration: max open premium in any one theme as a fraction of
+    # NAV. Themes are highly correlated (one AI/compute supply-chain graph), so
+    # this stops a dozen 15%-of-NAV names in one theme becoming a single 100%-of-
+    # NAV bet. 0.40 = ≤40% of NAV in any single theme.
+    AUTO_MAX_THEME_PREMIUM_PCT_NAV: float = 0.40
+    # Minimum scorecard composite required to auto-enter. A weak "Buy" (e.g. a
+    # degraded/noisy run) must not auto-trade real money identically to a strong
+    # one. Sizing already scales with conviction; this is the floor below which
+    # we don't participate at all. 0 disables the floor.
+    ENTRY_MIN_COMPOSITE: float = 6.0
     # Reject LEAP entries whose bid/ask spread exceeds this fraction of mid —
     # illiquid LEAPs fill far from fair value (the CRDO overpay). 0.15 = skip
     # if the spread is wider than 15% of mid.
@@ -329,11 +373,22 @@ class Settings(BaseSettings):
                 f"IBKR_MODE={v!r}: must be 'paper' or 'live'."
             )
         if v == "live":
+            # LIVE-ARMING FRICTION: real-money autonomy must not be one env flag
+            # away. Require an explicit second acknowledgment or refuse to start,
+            # so IBKR_MODE=live can never be flipped on accidentally.
+            import os
+            ack = os.getenv("I_UNDERSTAND_LIVE_AUTONOMOUS_TRADING", "").strip().lower()
+            if ack not in ("1", "true", "yes"):
+                raise ValueError(
+                    "IBKR_MODE=live requires explicit acknowledgment: set "
+                    "I_UNDERSTAND_LIVE_AUTONOMOUS_TRADING=1 to arm REAL-MONEY autonomous "
+                    "trading. Refusing to start otherwise."
+                )
             import logging
             logger = logging.getLogger("agentic_edge.config")
             logger.warning(
                 "=" * 64
-                + "\n IBKR_MODE=live — REAL-MONEY trading enabled."
+                + "\n IBKR_MODE=live — REAL-MONEY autonomous trading ARMED."
                 + "\n Connect to Gateway on port 4001 (live) with a U-prefix"
                 + "\n account ID. Paper port is 4002, paper account starts D."
                 + "\n" + "=" * 64

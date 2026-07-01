@@ -44,6 +44,13 @@ logger = logging.getLogger("agentic_edge.maint_loop")
 
 _TASK: Optional[asyncio.Task] = None
 _POLL_INTERVAL_SEC = 300       # 5 min during RTH
+# Hard ceiling on a single tick. A full tick walks ~20+ positions with
+# per-name provider fetches and legitimately runs 1.5-4 min; this ceiling
+# sits well above that. It exists only so a stalled IBKR await (the
+# 2026-06-29 "competing live session" freeze that wedged this loop for 17h)
+# is cancelled instead of hanging the loop forever. On timeout the tick is
+# cancelled and the loop continues at the next poll.
+_TICK_TIMEOUT_SEC = 600
 
 
 async def start_maintenance_loop() -> None:
@@ -51,6 +58,8 @@ async def start_maintenance_loop() -> None:
     if _TASK and not _TASK.done():
         return
     _TASK = asyncio.create_task(_loop_forever(), name="maint_loop")
+    from .supervisor import supervise
+    supervise(_TASK, start_maintenance_loop, "maint_loop")
     logger.info("maintenance loop started (poll=%ds)", _POLL_INTERVAL_SEC)
 
 
@@ -70,9 +79,26 @@ async def _loop_forever() -> None:
     await asyncio.sleep(15.0)
     while True:
         try:
-            await _tick()
+            await asyncio.wait_for(_tick(), timeout=_TICK_TIMEOUT_SEC)
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            logger.error(
+                "maintenance tick exceeded %ds and was cancelled — likely a "
+                "stalled IBKR market-data call. Loop continues at next poll.",
+                _TICK_TIMEOUT_SEC,
+            )
+            try:
+                await alert(
+                    level="warning",
+                    title="Maintenance loop tick timed out",
+                    body=(f"Tick exceeded {_TICK_TIMEOUT_SEC}s and was cancelled "
+                          "to prevent a permanent hang. Loop continues — check for "
+                          "a competing IBKR market-data session. Exits are paused "
+                          "until the next tick completes."),
+                )
+            except Exception:  # noqa: BLE001 — never let alerting wedge the loop
+                pass
         except Exception as e:
             logger.exception("maintenance tick failed: %s", e)
         await asyncio.sleep(_POLL_INTERVAL_SEC)
@@ -125,6 +151,24 @@ async def _tick() -> None:
     # holdings imported into the system, manual fills, etc.) so they get
     # monitored for exit triggers like everything else.
     orphans_adopted = await _adopt_orphan_positions(positions)
+
+    # Adopt OPTION orphans too — a long-dated long call held at the broker with
+    # no intent (manual fill, import, a lost intent row) is otherwise invisible
+    # to exits/rotation forever (the silent-unmanaged-LEAP failure mode). The
+    # stock adopter deliberately skips options; this handles bare LEAPs safely.
+    try:
+        orphans_adopted += await _adopt_orphan_leaps(positions)
+    except Exception as e:
+        logger.exception("leap orphan adoption failed: %s", e)
+
+    # Exit-side reconcile: sync a managed leap intent's qty DOWN to broker truth
+    # when the broker holds fewer contracts than the intent believes — catches a
+    # trim/close that filled after the walker marked it abandoned (the late-fill
+    # race), so the loop never manages or re-trims a stale quantity.
+    try:
+        await _reconcile_leap_qty(positions)
+    except Exception as e:
+        logger.exception("leap qty reconcile failed: %s", e)
 
     # Off-theme sweep: any stock long whose symbol isn't in any current
     # theme gets walked out so the capital can recycle into theme-aligned
@@ -248,6 +292,7 @@ async def _tick() -> None:
                 # forward-roll logic; the short-call branches inside are guarded
                 # by short_call presence, so they no-op for a bare long LEAP.
                 await _evaluate_pmcc(intent, latest_decisions.get(sym), ib,
+                                     pos=pos_by_symbol.get(sym),
                                      filing_thesis_break=filing_breaks_by_symbol.get(sym))
         except Exception as e:
             logger.exception("maint loop: %s evaluation failed: %s", sym, e)
@@ -378,6 +423,121 @@ async def _adopt_orphan_positions(ibkr_positions: list[dict]) -> int:
     return new_count
 
 
+async def _adopt_orphan_leaps(ibkr_positions: list[dict]) -> int:
+    """Adopt bare long-dated LONG CALLS held at the broker with no managing
+    intent into `leap_only` intents, so exits/rotation/roll manage them.
+
+    Guardrails (never misadopt a PMCC short leg or a random short-dated option):
+      * long CALLS only (right C/CALL, qty > 0) — never a short/put leg;
+      * long-dated only (DTE > 365) — genuine LEAPs, not front-month;
+      * no active intent already covers the conid or symbol;
+      * symbol is in the theme universe (same policy as the stock adopter).
+    Premium (per-share) comes from the provider's normalized avg_price.
+    """
+    from api.app.db import ThemeSymbol
+
+    cands: list[dict] = []
+    for p in ibkr_positions:
+        sec = str(p.get("secType") or p.get("sec_type") or "").upper()
+        right = str(p.get("right") or "").upper()
+        qty = float(p.get("qty") or 0)
+        if sec != "OPT" or right not in ("C", "CALL") or qty <= 0:
+            continue
+        dte = _dte_from_str(str(p.get("expiry") or ""))
+        if dte is None or dte <= 365:      # genuine LEAP only
+            continue
+        if not int(p.get("conid") or 0):
+            continue
+        cands.append(p)
+    if not cands:
+        return 0
+
+    syms = sorted({(p.get("symbol") or "").upper() for p in cands})
+    new_count = 0
+    async with db_session() as s:
+        owned_rows = (await s.execute(
+            select(TradeIntent.symbol, TradeIntent.walking_config)
+            .where(TradeIntent.status.in_(["filled", "submitting", "submitted", "closing"]))
+            .where(TradeIntent.position_state.in_(
+                ["pmcc_full", "leap_pending", "leap_open", "leap_open_naked", "closing"]))
+        )).all()
+        owned_syms = {(r[0] or "").upper() for r in owned_rows}
+        owned_conids = {int((cfg or {}).get("leap_conid") or 0) for _sym, cfg in owned_rows}
+        theme_syms = {
+            (r[0] or "").upper() for r in (await s.execute(
+                select(ThemeSymbol.symbol).where(ThemeSymbol.symbol.in_(syms)))).all() if r[0]
+        }
+        for p in cands:
+            sym = (p.get("symbol") or "").upper()
+            conid = int(p.get("conid") or 0)
+            if conid in owned_conids or sym in owned_syms or sym not in theme_syms:
+                continue
+            qty = float(p.get("qty") or 0)
+            premium = round(float(p.get("avg_price") or 0), 2) or None
+            intent = TradeIntent(
+                symbol=sym, side="BUY", qty=qty, order_type="LMT", limit_px=premium,
+                status="filled", structure="leap_only", position_state="leap_open",
+                leap_strike=float(p.get("strike") or 0) or None,
+                leap_expiry=str(p.get("expiry") or "") or None,
+                leap_qty=int(qty), leap_fill_price=premium, net_debit_filled=premium,
+                leap_filled_at=datetime.now(timezone.utc),
+                entry_strategy="adopted_orphan_leap",
+                rationale=(f"Adopted orphan LEAP: {qty:.0f}x {sym} "
+                           f"{p.get('strike')}C {p.get('expiry')} @ ${premium}/sh — held at "
+                           f"broker with no intent; adopting into exit management."),
+                walking_config={"leap_conid": conid, "source": "maint_loop_orphan_leap_adopt",
+                                "adopted_at": datetime.now(timezone.utc).isoformat()},
+            )
+            s.add(intent)
+            await s.flush()
+            s.add(TradeAuditLog(
+                intent_id=intent.id, action="orphan_leap_adopted", outcome="filled",
+                payload={"symbol": sym, "conid": conid, "qty": qty, "leap_premium": premium}))
+            owned_syms.add(sym); owned_conids.add(conid)
+            new_count += 1
+    if new_count:
+        logger.warning("maint loop: adopted %d orphan LEAP(s) into exit management", new_count)
+    return new_count
+
+
+async def _reconcile_leap_qty(ibkr_positions: list[dict]) -> None:
+    """Sync a managed leap_only intent's qty DOWN to broker truth when the
+    broker holds fewer contracts than the intent believes. Catches a trim/close
+    that filled after the walker marked it abandoned (late-fill race) so the
+    loop never re-trims or manages a stale quantity. Never syncs UP (an increase
+    is a fresh position the orphan-adopt path owns)."""
+    by_conid: dict[int, float] = {}
+    for p in ibkr_positions:
+        cid = int(p.get("conid") or 0)
+        if cid:
+            by_conid[cid] = float(p.get("qty") or 0)
+    async with db_session() as s:
+        rows = (await s.execute(
+            select(TradeIntent)
+            .where(TradeIntent.structure == "leap_only")
+            .where(TradeIntent.status == "filled")
+            .where(TradeIntent.position_state.in_(["leap_open", "leap_open_naked", "closing"]))
+        )).scalars().all()
+        for i in rows:
+            conid = int((i.walking_config or {}).get("leap_conid") or 0)
+            if not conid or conid not in by_conid:
+                continue           # phantom (no broker pos) handled in _evaluate_pmcc
+            broker_qty = by_conid[conid]
+            cur = float(i.qty or 0)
+            if broker_qty > 0 and broker_qty < cur - 1e-6:
+                old = cur
+                i.qty = broker_qty
+                if i.leap_qty is not None:
+                    i.leap_qty = int(broker_qty)
+                s.add(TradeAuditLog(
+                    intent_id=i.id, action="leap_qty_reconciled_to_broker", outcome="reconciled",
+                    payload={"symbol": i.symbol, "old_qty": old, "broker_qty": broker_qty,
+                             "note": "broker holds fewer contracts than intent — likely a "
+                                     "trim/close that filled after being marked abandoned"}))
+                logger.warning("maint loop: %s qty reconciled %g -> %g (broker truth)",
+                               i.symbol, old, broker_qty)
+
+
 # ---------------------------------------------------------------------------
 # Off-theme position sweep
 # ---------------------------------------------------------------------------
@@ -502,6 +662,21 @@ async def _off_theme_exit_signal(sym: str, pos: dict) -> Optional[str]:
     return None
 
 
+async def _autotrade_active() -> bool:
+    """Live dual kill-switch check, re-read immediately before each order so an
+    operator ``disable`` halts within ONE order — not after the whole 5-10 min
+    tick. The tick's single top-of-loop check let exits/trims/rolls keep firing
+    for minutes after a disable. Fails CLOSED (unreadable state → no order)."""
+    if not get_settings().AUTOTRADE_ENABLED:
+        return False
+    try:
+        async with db_session() as s:
+            st = await s.get(SystemState, 1)
+            return bool(st and st.autotrade_enabled)
+    except Exception:
+        return False
+
+
 async def _execute_off_theme_close(*, sym: str, qty: float, pos: dict, ib: Any,
                                    exit_signal: str = "") -> None:
     """Submit a marketable LMT SELL to close one off-theme stock position.
@@ -511,6 +686,9 @@ async def _execute_off_theme_close(*, sym: str, qty: float, pos: dict, ib: Any,
     TradeIntent so the close has a full audit trail (TradeAuditLog +
     auto_actions) symmetric with every other system trade.
     """
+    if not await _autotrade_active():
+        logger.info("maint: kill switch active — skipping off-theme close for %s", sym)
+        return
     from ib_insync import Stock  # type: ignore
     from tradingagents.dataflows.providers.base import TradeIntent as IntentDC
 
@@ -569,7 +747,7 @@ async def _execute_off_theme_close(*, sym: str, qty: float, pos: dict, ib: Any,
 
     intent_dc = IntentDC(
         ticker=sym, side="SELL", qty=int(qty),
-        order_type="LMT", limit_px=limit, tif="DAY", account_mode="paper",
+        order_type="LMT", limit_px=limit, tif="DAY", account_mode=get_settings().IBKR_MODE,
     )
     try:
         result = await ib.submit_trade(intent_dc)
@@ -669,12 +847,12 @@ async def _reconcile_orphan_pmcc_intents(ibkr_positions: list[dict]) -> int:
                 # Wrong direction — not a clean PMCC pair on these conids.
                 continue
 
-            # avg_price for options from IBKR is total cost basis per
-            # contract (premium × multiplier of 100). Convert to per-share.
-            leap_cost_total = float(leap_pos.get("avg_price") or 0)
-            short_cost_total = float(short_pos.get("avg_price") or 0)
-            leap_premium = round(leap_cost_total / 100.0, 2) if leap_cost_total else None
-            short_premium = round(short_cost_total / 100.0, 2) if short_cost_total else None
+            # IbkrProvider.get_positions already normalizes option avg_price to
+            # PER-SHARE premium (see ibkr.py). The old comment/code here divided
+            # by 100 AGAIN, storing a cost basis 100× too small. Use avg_price
+            # directly, consistent with the leap-only branch below.
+            leap_premium = round(float(leap_pos.get("avg_price") or 0), 2) or None
+            short_premium = round(float(short_pos.get("avg_price") or 0), 2) or None
             net_debit = None
             if leap_premium is not None and short_premium is not None:
                 net_debit = round(leap_premium - short_premium, 2)
@@ -868,6 +1046,14 @@ async def _evaluate_stock(
     last = float(pos.get("last_price") or 0)
     qty = float(pos.get("qty") or 0)
     if qty == 0 or avg <= 0 or last <= 0:
+        return
+    # Freshness gate: if no live tick arrived, last_price is a cost-basis
+    # substitution (looks flat) — acting on it would SUPPRESS a real drawdown's
+    # exit. Skip price-driven exit logic this tick and surface it rather than
+    # deciding on a frozen price. (Absent field = assume fresh, e.g. tests.)
+    if pos.get("price_fresh", True) is False:
+        logger.warning("maint: %s has no fresh price (cost-basis fallback) — "
+                       "skipping price-driven exit this tick", intent.symbol)
         return
 
     # ---- Theme health gates -----------------------------------------
@@ -1278,13 +1464,68 @@ async def _live_intraday_change_pct(symbol: str) -> Optional[float]:
 
 
 async def _evaluate_pmcc(intent: TradeIntent, latest_decision: Optional[str], ib: Any,
+                         pos: Optional[dict] = None,
                          filing_thesis_break: Optional[str] = None) -> None:
-    """Roll/exit decisions for a PMCC / LEAP position. Currently flags only;
-    actual roll execution requires the option-chain probe + combo build,
-    same path as entries. For Phase D v1 we mark intent flags + alert
-    the operator; v2 will auto-fire the rolls."""
+    """Roll/exit decisions for a LEAP position. Auto-executes genuine
+    structural/fundamental exits (theme + filing thesis break, earnings crash,
+    DTE cliff, catastrophic slow-bleed stop); flags price-driven ones (Avoid,
+    delta decay, graded exit-pressure) for operator confirm."""
     from tradingagents.strategies.maintenance.exits import maybe_close_pmcc
     from tradingagents.strategies.maintenance.earnings import days_to_earnings
+    from tradingagents.strategies.maintenance.theme_health import get_thesis_break_signal
+
+    sym = (intent.symbol or "").upper()
+
+    # PHANTOM auto-close: the broker shows no position for this filled intent
+    # (closed outside the system / expired / assigned / a late-exit fill). Only
+    # the stock path used to handle this; leap_only phantoms lingered forever,
+    # re-quoting a position that doesn't exist. Reconcile to closed and stop.
+    if pos is None:
+        async with db_session() as s:
+            i = await s.get(TradeIntent, intent.id)
+            if i and i.status == "filled":
+                i.status = "closed"
+                i.position_state = "closed"
+                s.add(TradeAuditLog(
+                    intent_id=i.id, action="phantom_leap_auto_closed", outcome="closed",
+                    payload={"symbol": sym, "note": "broker holds no matching position; "
+                             "reconciled to closed by maint loop"}))
+        return
+
+    # THEME thesis-break — reacts to a broken thesis WITHOUT a discrete event.
+    # Previously wired only to the stock path, so a held LEAP could ride a slow
+    # thesis erosion to zero. Route it here and AUTO-CLOSE (a confirmed
+    # multi-day theme break across ALL of a name's themes is fundamental).
+    try:
+        async with db_session() as s:
+            theme_break = await get_thesis_break_signal(s, sym)
+    except Exception as e:
+        theme_break = None
+        logger.debug("theme thesis-break check failed for %s: %s", sym, e)
+    if theme_break:
+        await _flag_pmcc_close(intent=intent, reason=f"theme thesis broken: {theme_break}",
+                               kind="thesis_break")
+        return
+
+    # CATASTROPHIC slow-bleed STOP — the 100%-loss backstop. Fires ONLY on a
+    # large premium loss CONFIRMED by a structural downtrend (underlying below
+    # its 200-day MA), never on a one-day beta drop.
+    try:
+        entry_prem = float(intent.leap_fill_price or intent.net_debit_target or 0)
+        cur_prem = float(pos.get("last_price") or 0)
+        # Require a FRESH price — never auto-close on a cost-basis/frozen fallback.
+        if entry_prem > 0 and cur_prem > 0 and pos.get("price_fresh", True):
+            down = (entry_prem - cur_prem) / entry_prem
+            if down >= get_settings().LEAP_CATASTROPHIC_STOP_PCT and await _underlying_in_downtrend(sym, ib):
+                await _flag_pmcc_close(
+                    intent=intent,
+                    reason=(f"catastrophic stop: LEAP down {down:.0%} from entry "
+                            f"(${entry_prem:.2f}->${cur_prem:.2f}) with underlying below its "
+                            f"200-day MA — structural break, not a one-day drop"),
+                    kind="catastrophic_stop")
+                return
+    except Exception as e:
+        logger.debug("catastrophic-stop check failed for %s: %s", sym, e)
 
     # Close decision first
     leap_dte_days = _dte_from_str(intent.leap_expiry) if intent.leap_expiry else None
@@ -1492,13 +1733,33 @@ async def _record_leap_exit_pressure(intent: TradeIntent, ib: Any) -> None:
             outcome=pressure.band,
         )
 
-    # Top band only → FLAG for close (operator-confirm; never auto-dump here).
-    if pressure.band == "aggressive":
-        await _flag_pmcc_close(
-            intent=intent,
-            reason=f"exit pressure {pressure.score:.0f}/100 (graded): {pressure.rationale}",
-            kind="exit_pressure", auto_execute=False,
-        )
+    # Autonomous execution of the graded score (operator policy 2026-06-30):
+    # `aggressive` (>75) -> full close; `trim_heavy` (60-75) -> partial de-risk
+    # trim. GUARDRAIL: require >=2 contributing pillars (theme deterioration /
+    # technical exhaustion incl. RSI / rotation / quant edge) so a lone noisy
+    # signal can't auto-act — and raw price drawdown, which is not a pillar in
+    # this score, can never trigger a sale. Falls back to flag-and-confirm when
+    # autonomy is disabled or the guardrail isn't met.
+    if pressure.band in ("aggressive", "trim_heavy"):
+        contributing = sum(
+            1 for k in ("theme_deterioration", "tech_exhaustion", "rotation_pressure")
+            if (pressure.sub_scores.get(k) or 0) > 0
+        ) + (1 if (quant_delta or 0) > 0 else 0)
+        auto_ok = get_settings().LEAP_AUTO_EXIT_ENABLED and contributing >= 2
+        reason = (f"exit pressure {pressure.score:.0f}/100 (graded, {contributing} "
+                  f"signal(s)): {pressure.rationale}")
+        if pressure.band == "aggressive":
+            # auto_ok -> auto full close; else -> flag for operator confirm.
+            await _flag_pmcc_close(intent=intent, reason=reason,
+                                   kind="exit_pressure", auto_execute=auto_ok)
+        elif auto_ok:
+            # trim_heavy de-risk: sell a slice, once per name per day.
+            full_qty = int(intent.qty or 0)
+            trim_qty = max(1, round(full_qty * get_settings().LEAP_TRIM_HEAVY_PCT))
+            if full_qty > 1 and trim_qty < full_qty and not await _leap_trimmed_today(intent.id):
+                await _flag_pmcc_close(intent=intent, reason=reason,
+                                       kind="exit_pressure_trim", auto_execute=True,
+                                       close_qty=trim_qty)
 
 
 async def _evaluate_short_call_roll(intent: TradeIntent, ib: Any, days_to_e: Optional[int]) -> None:
@@ -1618,6 +1879,9 @@ def _mid_or_last(q: dict[str, Any]) -> Optional[float]:
 
 async def _execute_stock_exit(*, intent: TradeIntent, qty: float, reason: str, exit_kind: str, ib: Any) -> None:
     """Submit a marketable LMT SELL to close a stock position. Audited."""
+    if not await _autotrade_active():
+        logger.info("maint: kill switch active — skipping stock exit for %s", intent.symbol)
+        return
     from ib_insync import Stock  # type: ignore
     from tradingagents.dataflows.providers.base import TradeIntent as IntentDC
 
@@ -1655,7 +1919,7 @@ async def _execute_stock_exit(*, intent: TradeIntent, qty: float, reason: str, e
 
     intent_dc = IntentDC(
         ticker=intent.symbol, side="SELL", qty=int(qty),
-        order_type="LMT", limit_px=limit, tif="DAY", account_mode="paper",
+        order_type="LMT", limit_px=limit, tif="DAY", account_mode=get_settings().IBKR_MODE,
     )
     try:
         result = await ib.submit_trade(intent_dc)
@@ -1694,9 +1958,15 @@ async def _execute_stock_exit(*, intent: TradeIntent, qty: float, reason: str, e
 
 
 async def _flag_pmcc_close(*, intent: TradeIntent, reason: str, kind: str,
-                           auto_execute: Optional[bool] = None) -> None:
+                           auto_execute: Optional[bool] = None,
+                           close_qty: Optional[int] = None) -> None:
     """Close a LEAP: SELL-TO-CLOSE the long call outright, walked toward the bid
     through the single-leg executor.
+
+    ``close_qty`` controls full-close vs partial-trim: None (default) sells the
+    whole position and marks the intent closed; a value < the held quantity is a
+    PARTIAL de-risk trim — only that many contracts are sold, the intent stays
+    ``leap_open`` with its qty reduced, and the action is recorded as a trim.
 
     LEAPS-only book — there is no short leg to buy back, so this is a single
     SELL on the LEAP conid (the legacy two-leg combo close was removed when we
@@ -1714,6 +1984,12 @@ async def _flag_pmcc_close(*, intent: TradeIntent, reason: str, kind: str,
     """
     if auto_execute is None:
         auto_execute = kind in _AUTO_CLOSE_KINDS
+
+    # Re-check the kill switch immediately before an AUTO close/trim so a
+    # mid-tick disable halts within one order. Flag-only still records/alerts.
+    if auto_execute and not await _autotrade_active():
+        logger.info("maint: kill switch active — flagging instead of auto-closing %s", intent.symbol)
+        auto_execute = False
 
     # FLAG-ONLY path: record + alert once per (intent, kind), then leave the
     # position open for the operator to close. Deduped so a signal that stays
@@ -1810,12 +2086,18 @@ async def _flag_pmcc_close(*, intent: TradeIntent, reason: str, kind: str,
             )
         return
 
-    qty = int(intent.qty or 1)
+    full_qty = int(intent.qty or 1)
+    qty = int(close_qty) if close_qty else full_qty
+    is_partial = close_qty is not None and 0 < qty < full_qty
+    if qty <= 0:
+        return
 
     async with db_session() as s:
         s.add(TradeAuditLog(
-            intent_id=intent.id, action="auto_pmcc_close_attempt",
+            intent_id=intent.id,
+            action="auto_leap_trim_attempt" if is_partial else "auto_pmcc_close_attempt",
             payload={"symbol": intent.symbol, "leap_conid": leap_conid, "qty": qty,
+                     "full_qty": full_qty, "partial": is_partial,
                      "reason": reason, "kind": kind},
         ))
 
@@ -1827,37 +2109,60 @@ async def _flag_pmcc_close(*, intent: TradeIntent, reason: str, kind: str,
             walk_interval_sec=20, max_offset_pct_of_spread=0.50,
             timeout_sec=180,
         ),
-        adaptive_priority="Urgent",   # earnings/thesis break — exit decisively
+        # Full closes (earnings/thesis break) exit decisively; a partial
+        # de-risk trim walks the limit instead of paying up across the spread.
+        adaptive_priority="Normal" if is_partial else "Urgent",
     )
 
     async with db_session() as s:
         i = await s.get(TradeIntent, intent.id)
         if i:
             if result.status == "filled":
-                i.status = "closed"
-                i.position_state = "closed"
+                if is_partial:
+                    # Partial de-risk: reduce the held quantity, keep it open.
+                    i.qty = max(0.0, float(i.qty or 0) - qty)
+                    if i.leap_qty is not None:
+                        i.leap_qty = max(0, int(i.leap_qty) - qty)
+                    if i.qty <= 0:   # defensive — shouldn't happen given is_partial
+                        i.status = "closed"
+                        i.position_state = "closed"
+                else:
+                    i.status = "closed"
+                    i.position_state = "closed"
             elif result.status not in ("abandoned", "rejected_pretrade"):
                 i.status = "error"
+        # action_type drives the daily-cap counter + trim dedup, so keep
+        # 'leap_trim_*' and 'pmcc_close_*' distinct.
+        prefix = "leap_trim" if is_partial else "pmcc_close"
         s.add(TradeAuditLog(
-            intent_id=intent.id, action="auto_pmcc_close_outcome",
+            intent_id=intent.id,
+            action="auto_leap_trim_outcome" if is_partial else "auto_pmcc_close_outcome",
             outcome=result.status,
             # TradeAuditLog has no `error` column — fold it into payload
             # (result.to_dict() already carries it, but be explicit).
-            payload={**result.to_dict(), "error": result.error},
+            payload={**result.to_dict(), "error": result.error, "qty": qty,
+                     "partial": is_partial},
         ))
         await record_auto_action(
-            s, loop="maintenance", action_type=f"pmcc_close_{result.status}",
+            s, loop="maintenance", action_type=f"{prefix}_{result.status}",
             gate_result=_synthetic_passed_gate(),
             symbol=intent.symbol, intent_id=intent.id,
-            payload={"reason": reason, "kind": kind, "execution": result.to_dict()},
+            payload={"reason": reason, "kind": kind, "qty": qty,
+                     "partial": is_partial, "execution": result.to_dict()},
             outcome=result.status,
         )
 
     if result.status == "filled":
-        await alert(level="warning", title=f"LEAP CLOSED: {intent.symbol}",
-                    body=f"@ ${result.fill_price:.2f}. Reason: {reason}")
+        if is_partial:
+            await alert(level="warning", title=f"LEAP TRIMMED: {intent.symbol}",
+                        body=(f"Sold {qty} of {full_qty} contracts @ ${result.fill_price:.2f} "
+                              f"(de-risk). Reason: {reason}"))
+        else:
+            await alert(level="warning", title=f"LEAP CLOSED: {intent.symbol}",
+                        body=f"@ ${result.fill_price:.2f}. Reason: {reason}")
     elif result.status == "abandoned":
-        await alert(level="warning", title=f"LEAP close abandoned: {intent.symbol}",
+        verb = "trim" if is_partial else "close"
+        await alert(level="warning", title=f"LEAP {verb} abandoned: {intent.symbol}",
                     body=f"walked to floor; will retry next tick. {reason}")
 
 
@@ -1999,7 +2304,26 @@ _ALERTED_FILING_LINKS: set[str] = set()
 # AUTO-EXECUTE the close. Everything else (delta decay, scorecard "Avoid") is a
 # price-drawdown proxy and stays FLAG-ONLY so a normal high-beta down day never
 # auto-dumps a position (operator policy on this book).
-_AUTO_CLOSE_KINDS = {"earnings_break", "thesis_break", "dte_cliff"}
+_AUTO_CLOSE_KINDS = {"earnings_break", "thesis_break", "dte_cliff", "catastrophic_stop"}
+
+
+async def _underlying_in_downtrend(symbol: str, ib: Any) -> bool:
+    """True if spot is below its 200-day MA — a structural downtrend that
+    confirms a large LEAP loss is a broken thesis, not a transient beta drop.
+    Fails to False (do NOT auto-close) when history is unavailable, so a data
+    gap can never trigger a catastrophic sale."""
+    try:
+        from datetime import date, timedelta
+        from tradingagents.dataflows.fallback import get_stock_data_with_fallback
+        df = await get_stock_data_with_fallback(
+            symbol, date.today() - timedelta(days=340), date.today(), ibkr_provider=ib)
+        if df is None or len(df) < 150 or "Close" not in df.columns:
+            return False
+        closes = df["Close"].astype(float).tolist()
+        ma200 = sum(closes[-200:]) / min(200, len(closes))
+        return closes[-1] < ma200
+    except Exception:
+        return False
 
 # Intents we've already flagged-for-manual-close, keyed by f"{intent_id}:{kind}".
 # A flag-only close re-evaluates true every tick; without this it would re-alert
@@ -2555,6 +2879,9 @@ async def _execute_stock_trim(
     Mirrors ``_execute_stock_exit`` but only sells ``trim_qty`` shares
     and decrements ``intent.qty`` rather than transitioning to closed.
     """
+    if not await _autotrade_active():
+        logger.info("maint: kill switch active — skipping stock trim for %s", intent.symbol)
+        return
     from ib_insync import Stock  # type: ignore
     from tradingagents.dataflows.providers.base import TradeIntent as IntentDC
 
@@ -2595,7 +2922,7 @@ async def _execute_stock_trim(
 
     intent_dc = IntentDC(
         ticker=sym, side="SELL", qty=int(trim_qty),
-        order_type="LMT", limit_px=limit, tif="DAY", account_mode="paper",
+        order_type="LMT", limit_px=limit, tif="DAY", account_mode=get_settings().IBKR_MODE,
     )
     try:
         result = await ib.submit_trade(intent_dc)
@@ -2646,27 +2973,57 @@ async def _execute_stock_trim(
 async def _maintenance_cap_hit(kind: str) -> bool:
     """True if today's count of `kind` actions has hit the daily cap."""
     from api.app.autotrade.auto_gate import DEFAULT_CAPS
+    from sqlalchemy import func, or_
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     if kind == "close":
-        action_prefix = "pmcc_close_"
+        # Trims and full closes both reduce exposure — count them together so a
+        # busy de-risking day can't blow past the daily exit cap.
+        action_filter = or_(
+            AutoAction.action_type == "pmcc_close_filled",
+            AutoAction.action_type == "leap_trim_filled",
+        )
         cap = DEFAULT_CAPS["AUTO_MAX_CLOSES_PER_DAY"]
     elif kind == "roll":
-        action_prefix = "pmcc_roll_"
+        action_filter = AutoAction.action_type.like("pmcc_roll_filled")
         cap = DEFAULT_CAPS["AUTO_MAX_ROLLS_PER_DAY"]
     else:
         return False
     async with db_session() as s:
-        from sqlalchemy import func
         n = (
             await s.execute(
                 select(func.count())
                 .select_from(AutoAction)
                 .where(AutoAction.timestamp >= today)
                 .where(AutoAction.loop == "maintenance")
-                .where(AutoAction.action_type.like(f"{action_prefix}filled"))
+                .where(action_filter)
             )
         ).scalar_one()
     return n >= cap
+
+
+async def _leap_trimmed_today(intent_id: str) -> bool:
+    """True if this intent already had a de-risk trim ATTEMPT today (filled OR
+    abandoned), so the trim_heavy band shaves a position at most once/day.
+
+    Counting abandoned attempts too (not just fills) is deliberate: with the
+    walker's cancel now real but still fallibly-confirmable, an abandoned trim's
+    resting order could fill late — re-firing the trim on the next tick would
+    double-trim. Waiting until the next day is the safe default for a non-urgent
+    de-risk. (Genuine full closes go through the aggressive-band path, which
+    removes the position, so this only gates the partial-trim band.)"""
+    from sqlalchemy import func
+    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    async with db_session() as s:
+        n = (
+            await s.execute(
+                select(func.count())
+                .select_from(AutoAction)
+                .where(AutoAction.timestamp >= today)
+                .where(AutoAction.intent_id == intent_id)
+                .where(AutoAction.action_type.like("leap_trim_%"))
+            )
+        ).scalar_one()
+    return n > 0
 
 
 # ---------------------------------------------------------------------------
@@ -2676,12 +3033,16 @@ async def _maintenance_cap_hit(kind: str) -> bool:
 
 async def _execute_auto_short_call_close(intent: TradeIntent, ib: Any, reason: str) -> None:
     """Buy back the existing short call WITHOUT opening a new one.
+    (Kill-switch re-checked inside via the shared guard.)
 
     Earnings-hedge use case: closes the short leg 2 sessions before the
     print, leaves the LEAP uncapped through the move. Next maintenance
     tick after earnings will see the short side empty and (when
     sequenced-relisting is wired) re-establish.
     """
+    if not await _autotrade_active():
+        logger.info("maint: kill switch active — skipping short-call close for %s", intent.symbol)
+        return
     cfg = dict((intent.walking_config or {}))
     short_conid = int(cfg.get("short_call_conid", 0))
     if not short_conid:
@@ -2746,6 +3107,9 @@ async def _execute_auto_short_call_close(intent: TradeIntent, ib: Any, reason: s
 async def _execute_auto_short_call_roll(intent: TradeIntent, decision, ib: Any) -> None:
     """Auto-fire roll: BUY-TO-CLOSE old short + SELL-TO-OPEN new short
     as one atomic combo through the walking-limit executor."""
+    if not await _autotrade_active():
+        logger.info("maint: kill switch active — skipping short-call roll for %s", intent.symbol)
+        return
     if not decision.new_leg or not decision.new_leg.conid:
         return
     if await _maintenance_cap_hit("roll"):
@@ -2831,6 +3195,9 @@ async def _execute_auto_short_call_roll(intent: TradeIntent, decision, ib: Any) 
 
 async def _execute_auto_leap_forward_roll(intent: TradeIntent, decision, ib: Any) -> None:
     """SELL old LEAP + BUY new LEAP, walked at net debit through the executor."""
+    if not await _autotrade_active():
+        logger.info("maint: kill switch active — skipping LEAP roll for %s", intent.symbol)
+        return
     if not decision.new_leg or not decision.new_leg.conid:
         return
     if await _maintenance_cap_hit("roll"):

@@ -49,6 +49,13 @@ logger = logging.getLogger("agentic_edge.entry_loop")
 
 _TASK: Optional[asyncio.Task] = None
 _POLL_INTERVAL_SEC = 60
+# Hard ceiling on a single tick. A legitimate tick — even when slowed to a
+# few minutes by provider rate-limiting — never approaches this; it exists
+# solely so a stalled IBKR await (e.g. a market-data request frozen by
+# "competing live session") can't wedge the loop forever the way it did on
+# 2026-06-29 (17h silent outage). On timeout the tick is cancelled and the
+# loop continues at the next poll.
+_TICK_TIMEOUT_SEC = 300
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +69,8 @@ async def start_entry_loop() -> None:
     if _TASK and not _TASK.done():
         return
     _TASK = asyncio.create_task(_loop_forever(), name="entry_loop")
+    from .supervisor import supervise
+    supervise(_TASK, start_entry_loop, "entry_loop")
     logger.info("auto-entry loop started (poll=%ds)", _POLL_INTERVAL_SEC)
 
 
@@ -79,9 +88,25 @@ async def stop_entry_loop() -> None:
 async def _loop_forever() -> None:
     while True:
         try:
-            await _tick()
+            await asyncio.wait_for(_tick(), timeout=_TICK_TIMEOUT_SEC)
         except asyncio.CancelledError:
             raise
+        except asyncio.TimeoutError:
+            logger.error(
+                "entry_loop tick exceeded %ds and was cancelled — likely a "
+                "stalled IBKR market-data call. Loop continues at next poll.",
+                _TICK_TIMEOUT_SEC,
+            )
+            try:
+                await alert(
+                    level="warning",
+                    title="Entry loop tick timed out",
+                    body=(f"Tick exceeded {_TICK_TIMEOUT_SEC}s and was cancelled "
+                          "to prevent a permanent hang. Loop continues — check for "
+                          "a competing IBKR market-data session."),
+                )
+            except Exception:  # noqa: BLE001 — never let alerting wedge the loop
+                pass
         except Exception as e:
             logger.exception("entry_loop tick failed: %s", e)
         await asyncio.sleep(_POLL_INTERVAL_SEC)
@@ -133,6 +158,18 @@ async def _tick() -> None:
         # positions this tick.
         logger.warning("auto-entry: breaker check errored (%s) — skipping new entries this tick", e)
         return
+
+    # Block-on-mismatch: don't add NEW risk while the book is in an inconsistent
+    # state (a live position with no managing intent). The maint loop auto-adopts
+    # such orphans within a tick, so this is a short fail-safe pause, not a stall.
+    try:
+        from api.app.positions import _ibkr as _ibkr2
+        if await _has_unmanaged_orphan(await _ibkr2()):
+            logger.warning("auto-entry: unmanaged position(s) present — pausing new entries "
+                           "until reconciled (maint loop adopts orphans each tick)")
+            return
+    except Exception as e:
+        logger.debug("auto-entry: orphan-parity check failed (%s) — continuing", e)
 
     # Pull today's completed runs and queue Buy decisions we haven't acted on.
     candidates = await _find_unprocessed_buys()
@@ -232,14 +269,17 @@ async def _find_unprocessed_buys() -> list[tuple[str, str, str, float]]:
         if not run_ids:
             return []
 
-        rows = (
-            await s.execute(
-                select(TickerScore.run_id, TickerScore.symbol, TickerScore.composite)
-                .where(TickerScore.run_id.in_(run_ids))
-                .where(TickerScore.decision == "Buy")
-                .order_by(TickerScore.composite.desc())
-            )
-        ).all()
+        # Minimum-conviction floor: a weak "Buy" (degraded/noisy run) must not
+        # auto-trade real money identically to a strong one. 0 disables.
+        _min_comp = float(get_settings().ENTRY_MIN_COMPOSITE)
+        _q = (
+            select(TickerScore.run_id, TickerScore.symbol, TickerScore.composite)
+            .where(TickerScore.run_id.in_(run_ids))
+            .where(TickerScore.decision == "Buy")
+        )
+        if _min_comp > 0:
+            _q = _q.where(TickerScore.composite >= _min_comp)
+        rows = (await s.execute(_q.order_by(TickerScore.composite.desc()))).all()
 
         # Already submitted (any TradeIntent for one of these runs + symbol).
         existing = {
@@ -355,6 +395,18 @@ async def _process_one(
     try:
         elig = await select_pmcc_legs(symbol=symbol, contracts=1, ibkr=ib)
     except Exception as e:
+        # Distinguish a TRANSIENT probe failure (empty/degraded option-params
+        # from a flapping data farm — ProviderError.retryable) from a genuine
+        # "this name has no usable options" (e.g. an ADR). The candidate de-dup
+        # skips any symbol with an `open_*` action in the ~30h window, so
+        # recording a transient blip as ineligible would lock a hot name out for
+        # over a day — exactly how SNDK (which has a real Jan-2028 LEAP) was
+        # silently dropped. On a retryable failure, record NOTHING and return
+        # False so the name stays a candidate and is re-probed next tick.
+        if getattr(e, "retryable", False):
+            logger.warning("auto-entry: %s option-chain probe transient failure — "
+                           "will retry next tick (not recorded ineligible): %s", symbol, e)
+            return False
         logger.info("auto-entry: %s PMCC probe failed — %s", symbol, e)
         async with db_session() as s:
             await record_auto_action(
@@ -363,7 +415,7 @@ async def _process_one(
                 payload={"run_id": run_id, "reason": f"probe_error: {e}"},
                 outcome="ineligible",
             )
-        return True  # treat as processed; don't retry this symbol today
+        return True  # genuinely ineligible (no listed options); don't retry today
     if not elig.eligible or elig.candidate is None:
         # PMCC failed eligibility. For high-conviction names (composite ≥ 7),
         # fall back to a small stock buy — better to participate at reduced
@@ -414,12 +466,25 @@ async def _process_one(
     # (1.0) for untracked names.
     conviction_factor, conviction_meta = await _manager_conviction(symbol)
 
+    # Quant overlay tilt: the research factory's per-symbol edge sizes the entry
+    # up (structurally strong) or down (weak), bounded by QUANT_ENTRY_MAX_TILT.
+    # Never a gate. 1.0 (neutral) for names with no feature snapshot. This is the
+    # entry-side counterpart to symbol_exit_delta on the exit path.
+    quant_factor, quant_edge_score = 1.0, 50.0
+    if get_settings().QUANT_OVERLAY_ENABLED:
+        try:
+            from api.app.research.overlay import symbol_entry_factor
+            quant_factor, quant_edge_score = await symbol_entry_factor(symbol)
+        except Exception as e:
+            logger.debug("auto-entry: quant entry-factor failed for %s: %s", symbol, e)
+
     # NAV-aware sizing: target ~7% NAV per spread × macro sizing_factor ×
-    # conviction, capped at $250k absolute.
+    # conviction × quant tilt, capped at $250k absolute.
     nav = await _fetch_nav(ib)
     n_contracts = _size_pmcc_contracts(
         net_debit_per_spread=cand.net_debit, nav=nav,
         sizing_factor=sizing_factor, conviction_factor=conviction_factor,
+        quant_factor=quant_factor,
     )
     if n_contracts <= 0:
         logger.info("auto-entry: %s sized to 0 contracts (macro=%s blocks)",
@@ -427,8 +492,9 @@ async def _process_one(
         return False
     total_debit = round(cand.net_debit * n_contracts * 100, 2)
     logger.info(
-        "auto-entry: %s sized to %d contracts (NAV=$%.0f × sf=%.2f × conv=%.2f, debit/spread=$%.2f, total=$%.0f, macro=%s%s)",
-        symbol, n_contracts, nav, sizing_factor, conviction_factor, cand.net_debit, total_debit, macro_regime,
+        "auto-entry: %s sized to %d contracts (NAV=$%.0f × sf=%.2f × conv=%.2f × quant=%.2f[edge %.0f], debit/spread=$%.2f, total=$%.0f, macro=%s%s)",
+        symbol, n_contracts, nav, sizing_factor, conviction_factor, quant_factor, quant_edge_score,
+        cand.net_debit, total_debit, macro_regime,
         (f", smart-money={conviction_meta.get('manager_count')}mgr" if conviction_meta.get("matched") else ""),
     )
 
@@ -451,6 +517,7 @@ async def _process_one(
         "spot_at_build": cand.spot, "auto_origin": "entry_loop",
         "nav_at_build": nav, "target_pct_nav": PMCC_TARGET_PCT_NAV,
         "conviction_factor": conviction_factor, "manager_conviction": conviction_meta,
+        "quant_factor": quant_factor, "quant_edge_score": quant_edge_score,
     }
     async with db_session() as s:
         intent = TradeIntent(
@@ -637,8 +704,9 @@ async def _process_leaps_only(
                     outcome="capped")
             logger.info("auto-entry LEAPS: %s skipped — wide spread %.0f%%", symbol, _spr * 100)
             return False
-    # (b) Per-name concentration + (c) margin headroom.
-    _cap = await _check_entry_caps(ib=ib, symbol=symbol, new_cost=total_cost, nav=nav)
+    # (b) Per-name + aggregate + per-theme concentration, daily capital, margin.
+    _cap = await _check_entry_caps(ib=ib, symbol=symbol, new_cost=total_cost, nav=nav,
+                                   theme_id=theme_id)
     if _cap is not None:
         async with db_session() as s:
             await record_auto_action(
@@ -715,7 +783,10 @@ async def _process_leaps_only(
                 intent_id=intent_id,
                 payload={"run_id": run_id, "fill_price": result.fill_price,
                          "contracts": n_contracts, "walk_steps": result.walk_steps,
-                         "conviction": conviction_meta},
+                         "conviction": conviction_meta,
+                         # Drives the daily-capital cap in _check_entry_caps.
+                         "net_debit_pct_nav": round(total_cost / nav, 4) if nav > 0 else 0.0,
+                         "total_cost": total_cost},
                 outcome="filled", ibkr_order_id=str(result.order_id or ""))
         else:
             if i:
@@ -763,50 +834,137 @@ async def _fetch_nav(ib: Any) -> float:
     return 0.0
 
 
-async def _check_entry_caps(*, ib: Any, symbol: str, new_cost: float, nav: float) -> "str | None":
-    """Capped-pyramiding guardrails (option B). Returns a reason string to
-    BLOCK the entry, or None to allow.
+async def _has_unmanaged_orphan(ib: Any) -> bool:
+    """True if the broker holds an OPTION position whose conid isn't covered by
+    any active managing intent (an unmanaged orphan). Used to pause NEW entries
+    while the book is inconsistent; returns False (don't block) if positions are
+    unreadable — the circuit breaker already fails closed on account issues."""
+    try:
+        positions = await ib.get_positions()
+    except Exception:
+        return False
+    opt_conids = {int(p.get("conid") or 0) for p in positions
+                  if str(p.get("secType") or p.get("sec_type") or "").upper() == "OPT"
+                  and float(p.get("qty") or 0) != 0}
+    opt_conids.discard(0)
+    if not opt_conids:
+        return False
+    async with db_session() as s:
+        rows = (await s.execute(
+            select(TradeIntent.walking_config)
+            .where(TradeIntent.status.in_(["filled", "submitting", "submitted", "closing"]))
+            .where(TradeIntent.position_state.in_(
+                ["leap_open", "leap_open_naked", "pmcc_full", "leap_pending", "closing"]))
+        )).all()
+    managed: set[int] = set()
+    for (cfg,) in rows:
+        cfg = cfg or {}
+        for k in ("leap_conid", "short_call_conid"):
+            managed.add(int(cfg.get(k) or 0))
+    managed.discard(0)
+    return bool(opt_conids - managed)
 
-    Adds to an already-held name are permitted, but bounded:
-      1. Per-name exposure (held premium on this underlying + the proposed
-         premium) must stay under ENTRY_MAX_NAME_PCT_OF_NAV.
-      2. The free-funds cushion remaining after the buy must stay above
-         ENTRY_MIN_MARGIN_CUSHION (a buffer well above the breaker floor).
 
-    Fails CLOSED — if positions/account can't be read, the entry is blocked
-    rather than placed blind.
+async def _check_entry_caps(*, ib: Any, symbol: str, new_cost: float, nav: float,
+                            theme_id: "str | None" = None) -> "str | None":
+    """Pre-submit exposure guardrails. Returns a reason string to BLOCK the
+    entry, or None to allow. Checked (in order): per-name, aggregate gross
+    premium-at-risk, per-theme concentration, daily capital deployed, and free-
+    funds cushion. Fails CLOSED — an unreadable NAV / positions / account blocks
+    the entry rather than placing it blind.
     """
     s = get_settings()
+    # Fail closed: never size or gate on a blind/failed NAV read.
+    if nav <= 0:
+        return "NAV unreadable — blocking entry (fail closed)"
     try:
         positions = await ib.get_positions()
     except Exception as e:
         return f"cap check: positions unreadable ({e})"
-    name_cost = 0.0
-    for p in positions:
-        if (p.get("symbol") or "").upper() == symbol.upper() and float(p.get("qty") or 0) != 0:
-            name_cost += abs(float(p.get("qty") or 0)) * float(p.get("avg_price") or 0) * 100.0
-    if nav > 0:
-        pct = (name_cost + new_cost) / nav
-        if pct > s.ENTRY_MAX_NAME_PCT_OF_NAV:
-            return (f"per-name cap: {symbol} would be {pct:.0%} of NAV "
-                    f"(cap {s.ENTRY_MAX_NAME_PCT_OF_NAV:.0%}; held ${name_cost:,.0f} + new ${new_cost:,.0f})")
+
+    def _prem(p: dict) -> float:
+        return abs(float(p.get("qty") or 0)) * float(p.get("avg_price") or 0) * 100.0
+
+    held = [p for p in positions if float(p.get("qty") or 0) != 0]
+    name_cost = sum(_prem(p) for p in held if (p.get("symbol") or "").upper() == symbol.upper())
+    gross_cost = sum(_prem(p) for p in held)
+
+    # 1. Per-name concentration.
+    if (name_cost + new_cost) / nav > s.ENTRY_MAX_NAME_PCT_OF_NAV:
+        return (f"per-name cap: {symbol} would be {(name_cost + new_cost) / nav:.0%} of NAV "
+                f"(cap {s.ENTRY_MAX_NAME_PCT_OF_NAV:.0%}; held ${name_cost:,.0f} + new ${new_cost:,.0f})")
+
+    # 2. AGGREGATE gross premium-at-risk across the whole (correlated) book.
+    if (gross_cost + new_cost) / nav > s.AUTO_MAX_GROSS_PREMIUM_PCT_NAV:
+        return (f"aggregate exposure cap: total open premium would be "
+                f"{(gross_cost + new_cost) / nav:.0%} of NAV "
+                f"(cap {s.AUTO_MAX_GROSS_PREMIUM_PCT_NAV:.0%}; held ${gross_cost:,.0f} + new ${new_cost:,.0f})")
+
+    # 3. Per-theme concentration (correlated cluster).
+    if theme_id:
+        try:
+            from api.app.db import ThemeSymbol
+            async with db_session() as sess:
+                theme_syms = {
+                    (r[0] or "").upper() for r in (await sess.execute(
+                        select(ThemeSymbol.symbol).where(ThemeSymbol.theme_id == theme_id)
+                    )).all() if r[0]
+                }
+            theme_cost = sum(_prem(p) for p in held if (p.get("symbol") or "").upper() in theme_syms)
+            if (theme_cost + new_cost) / nav > s.AUTO_MAX_THEME_PREMIUM_PCT_NAV:
+                return (f"theme concentration cap: {theme_id} would be "
+                        f"{(theme_cost + new_cost) / nav:.0%} of NAV "
+                        f"(cap {s.AUTO_MAX_THEME_PREMIUM_PCT_NAV:.0%})")
+        except Exception as e:
+            logger.debug("theme-cap check failed for %s/%s: %s", symbol, theme_id, e)
+
+    # 4. Daily capital deployed (the previously-dead 80%/day cap). Sum today's
+    #    FILLED entries' recorded net_debit_pct_nav; block if this entry pushes
+    #    the day past the ceiling.
+    try:
+        start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        async with db_session() as sess:
+            rows = (await sess.execute(
+                select(AutoAction.payload)
+                .where(AutoAction.timestamp >= start)
+                .where(AutoAction.loop == "entry")
+                .where(AutoAction.outcome == "filled")
+            )).scalars().all()
+        deployed = sum(float(p.get("net_debit_pct_nav") or 0.0) for p in rows if isinstance(p, dict))
+        new_pct = new_cost / nav
+        cap = get_settings_cap("AUTO_MAX_CAPITAL_DEPLOYED_PER_DAY")
+        if deployed + new_pct > cap:
+            return (f"daily capital cap: {deployed:.0%} deployed + {new_pct:.0%} new "
+                    f"> {cap:.0%}/day")
+    except Exception as e:
+        logger.debug("daily-capital cap check failed for %s: %s", symbol, e)
+
+    # 5. Free-funds cushion after the buy.
     try:
         acct = await ib.get_account_summary()
         netliq = float(acct.get("NetLiquidation") or 0)
         avail = float(acct.get("AvailableFunds") or 0)
     except Exception as e:
         return f"cap check: account unreadable ({e})"
-    if netliq > 0:
-        cushion_after = (avail - new_cost) / netliq
-        if cushion_after < s.ENTRY_MIN_MARGIN_CUSHION:
-            return (f"margin headroom: entry would leave {cushion_after:.1%} cushion "
-                    f"(min {s.ENTRY_MIN_MARGIN_CUSHION:.0%}; avail ${avail:,.0f} - cost ${new_cost:,.0f})")
+    if netliq <= 0:
+        return "account NetLiquidation unreadable — blocking entry (fail closed)"
+    cushion_after = (avail - new_cost) / netliq
+    if cushion_after < s.ENTRY_MIN_MARGIN_CUSHION:
+        return (f"margin headroom: entry would leave {cushion_after:.1%} cushion "
+                f"(min {s.ENTRY_MIN_MARGIN_CUSHION:.0%}; avail ${avail:,.0f} - cost ${new_cost:,.0f})")
     return None
+
+
+def get_settings_cap(name: str) -> float:
+    """Read a numeric cap from auto_gate.DEFAULT_CAPS (single source of truth)."""
+    from .auto_gate import DEFAULT_CAPS
+    return float(DEFAULT_CAPS[name])
 
 
 def _size_pmcc_contracts(
     *, net_debit_per_spread: float, nav: float,
     sizing_factor: float = 1.0, conviction_factor: float = 1.0,
+    quant_factor: float = 1.0,
 ) -> int:
     """Target contracts so net debit deployed ≈ PMCC_TARGET_PCT_NAV × NAV,
     capped at PMCC_MAX_DOLLARS. Minimum 1 contract.
@@ -820,12 +978,14 @@ def _size_pmcc_contracts(
     money can tilt allocation without ever breaching the absolute ceiling.
     """
     if net_debit_per_spread <= 0 or nav <= 0:
-        return 1
+        return 0   # fail closed: no valid price / blind NAV → do not size an entry
     if sizing_factor <= 0:
         return 0
-    # Conviction lifts the % target, then the absolute $ cap clamps it, then
-    # the macro factor tightens — order matters so the cap is never exceeded.
-    target = min(nav * PMCC_TARGET_PCT_NAV * max(conviction_factor, 1.0),
+    # Conviction lifts the % target and the quant edge tilts it (bidirectional:
+    # strong name sizes up, weak sizes down), THEN the absolute $ cap clamps,
+    # THEN the macro factor tightens — order matters so the cap is never
+    # exceeded even when conviction × quant both boost.
+    target = min(nav * PMCC_TARGET_PCT_NAV * max(conviction_factor, 1.0) * max(quant_factor, 0.0),
                  PMCC_MAX_DOLLARS) * sizing_factor
     n = int(target / (net_debit_per_spread * 100))
     return max(1, n)
@@ -945,7 +1105,7 @@ async def _try_stock_fallback(
     from tradingagents.dataflows.providers.base import TradeIntent as IntentDC
     intent_dc = IntentDC(
         ticker=symbol, side="BUY", qty=qty, order_type="LMT",
-        limit_px=limit, tif="DAY", account_mode="paper",
+        limit_px=limit, tif="DAY", account_mode=get_settings().IBKR_MODE,
     )
     try:
         result = await ib.submit_trade(intent_dc)

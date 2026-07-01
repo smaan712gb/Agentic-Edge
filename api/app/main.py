@@ -77,6 +77,31 @@ from .repos import EventRepo, RunRepo, ThemeRepo
 logger = logging.getLogger(__name__)
 
 
+import re as _re
+
+_SECRET_QS_RE = _re.compile(
+    r'(?i)([?&](?:apikey|api_key|token|key|secret|password|access_token)=)[^&\s"\']+')
+
+
+class _SecretRedactingFilter(logging.Filter):
+    """Mask secret-bearing query params (apikey/token/key/...) in any log record
+    before it is emitted. Defense-in-depth against a provider that puts its
+    credential in the URL (e.g. FMP ...?apikey=XXX) — httpx is also silenced,
+    but this guarantees no code path can persist the key to disk."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+            if "=" in msg:
+                redacted = _SECRET_QS_RE.sub(r"\1REDACTED", msg)
+                if redacted != msg:
+                    record.msg = redacted
+                    record.args = ()
+        except Exception:
+            pass
+        return True
+
+
 def _setup_file_logging() -> None:
     """Persist logs to a rotating file alongside the console.
 
@@ -98,12 +123,23 @@ def _setup_file_logging() -> None:
         if any(isinstance(h, RotatingFileHandler) for h in root.handlers):
             return
         os.makedirs(s.LOG_DIR, exist_ok=True)
+        # SECURITY: httpx logs the full request URL at INFO. Providers that
+        # authenticate via a query param (FMP: ...?apikey=XXX) leak the key into
+        # the log file on every call. Silence httpx/httpcore request logging, and
+        # attach a redaction filter as defense-in-depth so ANY apikey/token/key
+        # query param that reaches a log record is masked before it hits disk.
+        for _noisy in ("httpx", "httpcore"):
+            logging.getLogger(_noisy).setLevel(logging.WARNING)
+        _redactor = _SecretRedactingFilter()
+        for _h in root.handlers:
+            _h.addFilter(_redactor)
         handler = RotatingFileHandler(
             os.path.join(s.LOG_DIR, "agentic_edge.log"),
             maxBytes=s.LOG_MAX_BYTES, backupCount=s.LOG_BACKUP_COUNT, encoding="utf-8",
         )
         handler.setFormatter(logging.Formatter(
             "%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+        handler.addFilter(_redactor)
         level = getattr(logging, str(s.LOG_LEVEL).upper(), logging.INFO)
         handler.setLevel(level)
         root.addHandler(handler)
@@ -308,6 +344,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await start_heartbeat()
     await start_entry_loop()
     await start_maintenance_loop()
+    # Boot-time parity check: surface any DB↔broker drift (orphans/phantoms)
+    # immediately instead of up to 15 min later on the first scheduled health
+    # tick. Best-effort, non-blocking — never hold up startup.
+    async def _boot_reconcile() -> None:
+        try:
+            await asyncio.sleep(8.0)  # let IBKR bind + first positions arrive
+            from .autotrade.health_monitor import run_health_check
+            await run_health_check()
+        except Exception as e:  # pragma: no cover
+            logging.getLogger("agentic_edge").warning("boot parity check failed: %s", e)
+    asyncio.create_task(_boot_reconcile())
     try:
         yield
     finally:

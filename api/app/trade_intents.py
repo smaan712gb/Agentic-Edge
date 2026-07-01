@@ -24,10 +24,11 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
+from .admin import _require_admin
 from .autotrade.auto_gate import check_auto_action, record_auto_action
 from .config import get_settings
 from .db import (
@@ -60,7 +61,9 @@ class BuildPmccIn(BaseModel):
 
 
 @router.post("/{run_id}/{symbol}/build-pmcc", status_code=201)
-async def build_pmcc(run_id: str, symbol: str, body: BuildPmccIn) -> dict[str, Any]:
+async def build_pmcc(run_id: str, symbol: str, body: BuildPmccIn,
+                     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")) -> dict[str, Any]:
+    _require_admin(x_admin_token)
     """Probe IBKR option chain, select PMCC legs, persist intent for review."""
     sym = symbol.strip().upper()
 
@@ -155,7 +158,9 @@ async def build_pmcc(run_id: str, symbol: str, body: BuildPmccIn) -> dict[str, A
 
 
 @router.post("/{intent_id}/submit")
-async def submit_intent(intent_id: str) -> dict[str, Any]:
+async def submit_intent(intent_id: str,
+                        x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")) -> dict[str, Any]:
+    _require_admin(x_admin_token)
     """Run the auto-gate, then submit the combo to IBKR via walking limit."""
     settings = get_settings()
     async with db_session() as s:
@@ -231,7 +236,7 @@ async def submit_intent(intent_id: str) -> dict[str, Any]:
                 i.status = "error"
             s.add(TradeAuditLog(
                 intent_id=intent_id, action="submit_outcome",
-                outcome="ibkr_unreachable", error=str(e),
+                outcome="ibkr_unreachable", payload={"error": str(e)},
             ))
         raise HTTPException(503, f"IBKR not reachable: {e}")
 
@@ -279,8 +284,7 @@ async def submit_intent(intent_id: str) -> dict[str, Any]:
         s.add(TradeAuditLog(
             intent_id=intent_id, action="submit_outcome",
             outcome=result.status, ibkr_account=None,
-            payload=result.to_dict(),
-            error=result.error,
+            payload={**result.to_dict(), "error": result.error},
         ))
     return {"status": result.status, "intent_id": intent_id, "execution": result.to_dict()}
 
@@ -291,7 +295,9 @@ async def submit_intent(intent_id: str) -> dict[str, Any]:
 
 
 @router.post("/{intent_id}/cancel")
-async def cancel_intent(intent_id: str) -> dict[str, Any]:
+async def cancel_intent(intent_id: str,
+                        x_admin_token: str | None = Header(default=None, alias="X-Admin-Token")) -> dict[str, Any]:
+    _require_admin(x_admin_token)
     async with db_session() as s:
         i = await s.get(TradeIntent, intent_id)
         if i is None:

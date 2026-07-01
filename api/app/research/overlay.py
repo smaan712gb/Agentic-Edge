@@ -309,6 +309,46 @@ async def symbol_exit_delta(symbol: str) -> float:
         return 0.0
 
 
+def edge_to_entry_factor(edge: float, max_tilt: float) -> float:
+    """Map a 0-100 quant edge to a bounded, bidirectional entry SIZE multiplier.
+
+    edge 100 (structurally strong) -> 1 + max_tilt (size the conviction buy up);
+    edge 0   (weak)                -> 1 - max_tilt (size down);
+    edge 50  (neutral)             -> 1.0. Clamped non-negative. The mirror of
+    edge_to_exit_delta on the sizing axis."""
+    return round(max(0.0, 1.0 + (edge - 50.0) / 50.0 * max_tilt), 3)
+
+
+async def symbol_entry_factor(symbol: str) -> tuple[float, float]:
+    """(size_factor, edge_score) for an entry candidate from its latest snapshot.
+
+    Returns (1.0, 50.0) when there's no snapshot or the overlay is unusable — so
+    entry sizing degrades to its non-quant behaviour, never erroring. The factor
+    tilts position size; it is never a gate."""
+    try:
+        from sqlalchemy import select
+        from ..config import get_settings
+        from ..db import SymbolFeatureSnapshot, get_session as db_session
+        if not get_settings().QUANT_OVERLAY_ENABLED:
+            return 1.0, 50.0
+        max_tilt = float(getattr(get_settings(), "QUANT_ENTRY_MAX_TILT", 0.15))
+        eff_weights, _source, shrink = await _resolve_active_weights()
+        async with db_session() as s:
+            row = (await s.execute(
+                select(SymbolFeatureSnapshot)
+                .where(SymbolFeatureSnapshot.symbol == symbol.strip().upper())
+                .order_by(SymbolFeatureSnapshot.as_of.desc())
+                .limit(1)
+            )).scalar_one_or_none()
+        if row is None:
+            return 1.0, 50.0
+        edge = quant_edge(row.features or {}, eff_weights, shrink=shrink)["score"]
+        return edge_to_entry_factor(edge, max_tilt), edge
+    except Exception as e:  # pragma: no cover - never break the entry path
+        logger.debug("overlay: entry-factor failed for %s: %s", symbol, e)
+        return 1.0, 50.0
+
+
 async def build_extra_context(symbols: list[str]) -> dict[str, str]:
     """{ticker: QUANT-SIGNALS block} for the scorer, from each symbol's latest
     feature snapshot. Symbols without a snapshot are omitted (the scorer simply

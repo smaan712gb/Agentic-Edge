@@ -39,6 +39,8 @@ async def start_heartbeat() -> None:
     if _TASK and not _TASK.done():
         return
     _TASK = asyncio.create_task(_loop_forever(), name="ibkr_heartbeat")
+    from .supervisor import supervise
+    supervise(_TASK, start_heartbeat, "ibkr_heartbeat")
     logger.info("ibkr heartbeat started (every %.0fs)", _PING_INTERVAL_SEC)
 
 
@@ -66,6 +68,18 @@ async def _loop_forever() -> None:
                 logger.info("ibkr heartbeat: connection state -> %s",
                             "connected" if connected else "disconnected")
             _CONNECTED = connected
+            # Active market-data recovery: the socket can be UP while IBKR
+            # refuses market data (error 10197, competing live session). The
+            # disconnect path never fires for that, so trigger a (cooldown-
+            # guarded) reconnect to re-acquire the data farm. force_reconnect()
+            # self-limits to once per ~5 min, so this can't thrash.
+            if connected and getattr(prov, "market_data_unhealthy", None) and prov.market_data_unhealthy():
+                logger.warning("ibkr heartbeat: market data refused (10197/competing session) "
+                               "— forcing reconnect to recover the data farm")
+                try:
+                    await prov.force_reconnect("heartbeat: market-data unhealthy")
+                except Exception as e:
+                    logger.warning("ibkr heartbeat: force_reconnect errored: %s", e)
         except asyncio.CancelledError:
             raise
         except Exception as e:

@@ -357,6 +357,80 @@ async def manual_exit_position(
     raise HTTPException(400, f"unknown structure {structure!r}")
 
 
+@router.post("/positions/flatten-all")
+async def flatten_all(
+    body: KillSwitchToggle,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    """EMERGENCY STOP: (1) flip the kill switch OFF, (2) global-cancel all
+    working orders, (3) submit marketable closes for EVERY live position.
+
+    Bypasses the trading kill switch deliberately — this IS the emergency exit.
+    Long option positions close via the single-leg walker (Urgent); stocks via a
+    marketable SELL. Best-effort per position; returns a per-symbol summary."""
+    _require_admin(x_admin_token)
+    from .positions import _ibkr
+    from tradingagents.strategies.execution import ExecutionConfig, submit_single_leg_option
+    from tradingagents.dataflows.providers.base import TradeIntent as IntentDC
+
+    # 1. Kill switch OFF (stops the autonomous loops from placing anything new).
+    async with db_session() as s:
+        state = await s.get(SystemState, 1)
+        if state is not None:
+            state.autotrade_enabled = False
+            state.last_kill_at = datetime.now(timezone.utc)
+            state.kill_reason = f"FLATTEN-ALL by {body.actor}: {body.reason or '(none)'}"
+            state.updated_by = body.actor
+    await alert(level="critical", title="FLATTEN-ALL invoked",
+                body=f"by={body.actor}; reason={body.reason or '(none)'} — cancelling orders + closing all positions")
+
+    try:
+        ib = await _ibkr()
+    except Exception as e:
+        raise HTTPException(503, f"IBKR not reachable: {e}")
+
+    # 2. Global-cancel every working order.
+    cancelled = False
+    try:
+        ib_inst = await ib._ensure_connected()
+        ib_inst.reqGlobalCancel()
+        cancelled = True
+    except Exception as e:
+        logger.warning("flatten-all: reqGlobalCancel failed: %s", e)
+
+    # 3. Close every live position.
+    positions = await ib.get_positions()
+    closed: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    for p in positions:
+        sym = (p.get("symbol") or "").upper()
+        qty = float(p.get("qty") or 0)
+        if qty == 0:
+            continue
+        sec = str(p.get("secType") or p.get("sec_type") or "").upper()
+        conid = int(p.get("conid") or 0)
+        try:
+            if sec == "OPT" and conid and qty > 0:
+                r = await submit_single_leg_option(
+                    ibkr=ib, conid=conid, contracts=int(abs(qty)), action="SELL",
+                    config=ExecutionConfig(walk_interval_sec=15, max_offset_pct_of_spread=0.60,
+                                           timeout_sec=120),
+                    adaptive_priority="Urgent")
+                closed.append({"symbol": sym, "conid": conid, "qty": qty, "status": r.status})
+            elif sec == "STK":
+                side = "SELL" if qty > 0 else "BUY"
+                r2 = await ib.submit_trade(IntentDC(
+                    ticker=sym, side=side, qty=int(abs(qty)), order_type="MKT",
+                    tif="DAY", account_mode=get_settings().IBKR_MODE))
+                closed.append({"symbol": sym, "qty": qty, "status": r2.get("status")})
+        except Exception as e:
+            errors.append({"symbol": sym, "error": str(e)})
+            logger.exception("flatten-all: close failed for %s: %s", sym, e)
+
+    return {"ok": True, "kill_switch": "disabled", "orders_cancelled": cancelled,
+            "closed": closed, "errors": errors, "count": len(closed)}
+
+
 @router.get("/positions/managed")
 async def list_managed_positions(
     x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),

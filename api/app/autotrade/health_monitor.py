@@ -30,10 +30,10 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from ..config import get_settings
-from ..db import SystemState, TradeIntent, Run, get_session as db_session
+from ..db import AutoAction, SystemState, TradeIntent, Run, get_session as db_session
 from .alerts import alert
 from .auto_gate import AutoGateResult, record_auto_action
 
@@ -149,9 +149,14 @@ async def run_health_check() -> dict[str, Any]:
         for p in live:
             sym = (p.get("symbol") or "").upper()
             cid = int(p.get("conid") or 0)
+            sec = str(p.get("secType") or p.get("sec_type") or "").upper()
             if cid and cid in intent_conids:
-                continue
-            if sym in intent_syms:
+                continue                       # exact conid match — managed
+            # For OPTIONS a bare symbol match is NOT sufficient: a second contract
+            # on an already-held underlying (different conid) is its own orphan
+            # and must be surfaced, not hidden behind the symbol. Only fall back
+            # to a symbol match for non-option (stock) positions.
+            if sec != "OPT" and sym in intent_syms:
                 continue
             orphans.append(sym or f"conid:{cid}")
         if orphans:
@@ -207,6 +212,31 @@ async def run_health_check() -> dict[str, Any]:
         metrics["stuck_submitting"] = len(wedged)
     except Exception as e:
         add("warning", "Stuck-intent check failed", str(e))
+
+    # --- 5b. Maintenance-loop liveness ----------------------------------
+    # A dead maint loop = exits stop firing while everything else looks green.
+    # The supervisor auto-restarts a crashed loop, but if that also fails this
+    # catches it: during RTH the loop writes a heartbeat auto_action each ~5-min
+    # tick; a newest heartbeat older than ~15 min means the loop is not running.
+    try:
+        from api.app.autotrade.market_conditions import gate_rth
+        if gate_rth() is None:   # only meaningful during RTH
+            async with db_session() as s:
+                last_hb = (
+                    await s.execute(
+                        select(func.max(AutoAction.timestamp))
+                        .where(AutoAction.loop == "maintenance")
+                        .where(AutoAction.action_type == "heartbeat")
+                    )
+                ).scalar_one_or_none()
+            age_min = None if last_hb is None else (_utcnow() - _aware(last_hb)).total_seconds() / 60.0
+            metrics["maint_heartbeat_age_min"] = None if age_min is None else round(age_min, 1)
+            if age_min is None or age_min > 15.0:
+                add("critical", "Maintenance loop appears STALLED",
+                    f"newest maint heartbeat is {('never' if age_min is None else f'{age_min:.0f} min')} old "
+                    f"(expect ≤5 min during RTH) — exits may not be firing. Check the loop/supervisor.")
+    except Exception as e:
+        add("warning", "Maint-loop liveness check failed", str(e))
 
     # --- 6. Signal freshness --------------------------------------------
     try:
