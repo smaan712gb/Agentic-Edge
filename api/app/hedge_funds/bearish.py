@@ -1,9 +1,11 @@
 """Bearish institutional overlay — notable-short detection.
 
-Symmetric to the bullish ``conviction`` layer: where that reads tracked long
-managers' 13F holdings as buy-side conviction, this reads NOTABLE SHORT-SELLERS'
-bearish positioning and turns it into a signal that (a) BLOCKS new pullback-adds
-on a name a famous bear is short, and (b) BUMPS its exit pressure.
+Reads NOTABLE SHORT-SELLERS' bearish positioning as CONTEXT — deliberately NOT a
+standalone signal. A single bear (e.g. Burry short SOXX) is often early/wrong, so
+this never gates an entry or triggers an exit on its own. It is (a) LOGGED on a
+pullback-add so the operator sees the disagreement (never a veto), and (b) on the
+exit side, only AMPLIFIES exit pressure when the name ALREADY shows other bearish
+signals — confirmation, not a driver.
 
 Two sources, because a short from today's news won't hit a 13F for ~45 days:
 

@@ -157,15 +157,16 @@ class Settings(BaseSettings):
     INSIDER_BUY_CONVICTION_FACTOR: float = 1.15   # applied when a cluster is present
 
     # ----- Bearish institutional overlay (notable-short detection) ----
-    # Symmetric to the bullish conviction layer: a notable short-seller short a
-    # name (or an ETF covering its theme, e.g. Burry short SOXX) BLOCKS new
-    # pullback-adds on it and BUMPS its exit pressure. Sources: a news/operator
-    # registry (bearish.NOTABLE_SHORTS) + tier="bear" managers' 13F put positions.
+    # A notable short-seller's position is CONTEXT, not a standalone signal — a
+    # single bear (e.g. Burry short SOXX) is often early/wrong, so it must not
+    # gate entries or trigger exits by itself. It is logged on pullback-adds
+    # (never a veto) and, on the exit side, only AMPLIFIES exit pressure when the
+    # name ALREADY shows other bearish signals (theme deterioration / exhaustion
+    # / rotation) — confirmation-only, never an independent guardrail pillar.
+    # Sources: news/operator registry (bearish.NOTABLE_SHORTS) + tier="bear"
+    # managers' 13F put positions.
     NOTABLE_SHORT_TRACKING_ENABLED: bool = True
-    # Exit-pressure points added when a notable bear is short the name (bounded so
-    # it tightens exits but can't single-handedly force a drawdown dump — the
-    # multi-signal guardrail still applies).
-    NOTABLE_SHORT_EXIT_DELTA: float = 20.0
+    NOTABLE_SHORT_EXIT_DELTA: float = 10.0   # confirmation amplifier, not a driver
     INSIDER_BUY_MIN_USD: float = 200_000          # 30d cluster $ floor
 
     # ----- SEC EDGAR (Hedge Fund Signal Tracker) ----------------------

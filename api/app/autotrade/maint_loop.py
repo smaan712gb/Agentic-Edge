@@ -1706,8 +1706,11 @@ async def _record_leap_exit_pressure(intent: TradeIntent, ib: Any) -> None:
         except Exception as e:
             logger.debug("leap exit-pressure: quant delta failed for %s: %s", sym, e)
 
-    # Bearish overlay — a notable short-seller short this name (or its theme via
-    # an ETF short) BUMPS exit pressure, tightening exits on a shorted holding.
+    # Bearish overlay — CONFIRMATION ONLY. A single short-seller's position is
+    # opinion, not a signal, so the bump applies ONLY when the name already
+    # shows OTHER bearish pressure (theme deterioration, technical exhaustion, or
+    # rotation). The short then AMPLIFIES a real signal; on an otherwise-healthy
+    # name it does nothing (and never counts as an independent guardrail pillar).
     short_delta = 0.0
     try:
         from api.app.hedge_funds.bearish import notable_short_pressure, notable_short_exit_delta
@@ -1716,11 +1719,21 @@ async def _record_leap_exit_pressure(intent: TradeIntent, ib: Any) -> None:
             _tids = [r[0] for r in (await _s2.execute(
                 select(_TSb.theme_id).where(_TSb.symbol == sym))).all() if r[0]]
         _is_short, _sm = await notable_short_pressure(sym, _tids)
-        short_delta = notable_short_exit_delta(_is_short)
-        if short_delta:
-            logger.info("exit-pressure: %s carries notable-bear short (+%.0f) — %s",
-                        sym, short_delta,
-                        "; ".join(str(h.get("manager", "")) for h in _sm.get("hits", [])[:2]))
+        if _is_short:
+            _corroborated = (
+                (best_theme is not None and (best_theme.streak_days_below_floor > 0
+                 or (best_theme.composite is not None and best_theme.composite < 40)))
+                or (exhaustion_score is not None and exhaustion_score > 0.3)
+                or (rotation_delta is not None and rotation_delta > 0)
+            )
+            if _corroborated:
+                short_delta = notable_short_exit_delta(True)
+                logger.info("exit-pressure: %s notable-bear short CONFIRMED by other weakness "
+                            "(+%.0f) — %s", sym, short_delta,
+                            "; ".join(str(h.get("manager", "")) for h in _sm.get("hits", [])[:2]))
+            else:
+                logger.debug("exit-pressure: %s has a notable short but NO corroborating "
+                             "weakness — ignoring (a short alone is not a signal)", sym)
     except Exception as e:
         logger.debug("leap exit-pressure: notable-short check failed for %s: %s", sym, e)
 
@@ -1762,7 +1775,9 @@ async def _record_leap_exit_pressure(intent: TradeIntent, ib: Any) -> None:
         contributing = sum(
             1 for k in ("theme_deterioration", "tech_exhaustion", "rotation_pressure")
             if (pressure.sub_scores.get(k) or 0) > 0
-        ) + (1 if (quant_delta or 0) > 0 else 0) + (1 if short_delta > 0 else 0)
+        ) + (1 if (quant_delta or 0) > 0 else 0)
+        # (notable-short is confirmation-only — it amplifies the score but never
+        # counts as an independent pillar, so a lone short can't trigger an exit.)
         auto_ok = get_settings().LEAP_AUTO_EXIT_ENABLED and contributing >= 2
         reason = (f"exit pressure {pressure.score:.0f}/100 (graded, {contributing} "
                   f"signal(s)): {pressure.rationale}")

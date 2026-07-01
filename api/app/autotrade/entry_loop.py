@@ -1043,16 +1043,19 @@ async def _find_pullback_adds(ib: Any, exclude: set) -> list:
                 continue
             if await _hedge_funds_rotating_out(sym):      # institutions exiting
                 continue
-            # Notable-bear short: don't add into a name (or theme) a famous
-            # short-seller is short — a direct bearish institutional signal.
+            # Notable-bear short = CONTEXT, not a veto. A single short-seller's
+            # opinion isn't confirmation, and this setup already passed the
+            # bullish gates (theme in-contact, no HF rotation, at support, RSI/
+            # volume favorable). Log it so the operator sees the disagreement,
+            # but don't block — the short only bites via the exit path, and only
+            # when corroborated by real weakness.
             try:
                 from api.app.hedge_funds.bearish import notable_short_pressure
-                short_active, short_meta = await notable_short_pressure(
-                    sym, [theme_id] if theme_id else None)
-                if short_active:
-                    logger.info("pullback-add BLOCKED: %s — notable bear short (%s)", sym,
-                                "; ".join(str(h.get("manager", "")) for h in short_meta.get("hits", [])[:2]))
-                    continue
+                _short, _sm = await notable_short_pressure(sym, [theme_id] if theme_id else None)
+                if _short:
+                    logger.info("pullback-add: %s — note: notable bear short (%s), but bullish "
+                                "setup intact; proceeding (short is context, not a veto)", sym,
+                                "; ".join(str(h.get("manager", "")) for h in _sm.get("hits", [])[:2]))
             except Exception as e:
                 logger.debug("notable-short check failed for %s: %s", sym, e)
             sig = await _pullback_add_signals(sym, ib)
