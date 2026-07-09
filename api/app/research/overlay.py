@@ -46,6 +46,14 @@ PRIOR_WEIGHTS: dict[str, float] = {
     "z_flow_imbalance":            0.4,
     "z_momentum_20d":              0.3,
     "persona_aschenbrenner":       0.3,
+    # Technical engines (2026-07-09). Deliberately small priors: blended_weights
+    # only scores features present HERE, so absence meant the TA engines
+    # contributed zero to quant edge no matter what their IC said. Small prior
+    # = they participate immediately but IC evidence decides their real weight.
+    "z_ema_stack_score":           0.3,
+    "z_pattern_bull_count":        0.2,
+    "z_accum_dist_balance":        0.2,
+    "z_cba_confidence_num":        0.2,
 }
 
 SIGNAL_LABELS: dict[str, str] = {
@@ -56,6 +64,10 @@ SIGNAL_LABELS: dict[str, str] = {
     "z_flow_imbalance":            "options flow tilt",
     "z_momentum_20d":              "20d momentum",
     "persona_aschenbrenner":       "buildout-thesis (Aschenbrenner) lens",
+    "z_ema_stack_score":           "EMA trend-stack alignment",
+    "z_pattern_bull_count":        "bullish chart patterns",
+    "z_accum_dist_balance":        "accumulation vs distribution days",
+    "z_cba_confidence_num":        "closing-bell accumulation",
 }
 
 # Bayesian shrinkage strength: ~k labelled rows of IC evidence to move a weight

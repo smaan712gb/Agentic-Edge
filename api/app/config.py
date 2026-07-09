@@ -172,6 +172,11 @@ class Settings(BaseSettings):
     NOTABLE_SHORT_TRACKING_ENABLED: bool = True
     NOTABLE_SHORT_EXIT_DELTA: float = 10.0   # confirmation amplifier, not a driver
     NOTABLE_SHORT_NEWS_TTL_DAYS: int = 21    # how long a news-sourced short stays "live" context
+    # Fresh institutional selling on a HELD name (recent tier-1/2 13F trim/exit
+    # or a 13D/G stake reduction) — same confirmation-only discipline as the
+    # notable-short overlay: amplifies existing weakness, never an independent
+    # pillar, never fires on an otherwise-healthy name.
+    INSTITUTIONAL_SELL_EXIT_DELTA: float = 8.0
     INSIDER_BUY_MIN_USD: float = 200_000          # 30d cluster $ floor
 
     # ----- SEC EDGAR (Hedge Fund Signal Tracker) ----------------------
@@ -279,6 +284,21 @@ class Settings(BaseSettings):
     # per-symbol attempts/intents within the window still de-dup, so widening it
     # does not cause re-entry churn.
     ENTRY_RUN_LOOKBACK_HOURS: int = 30
+    # A walking-limit order that ABANDONED (walked to its price cap unfilled —
+    # price discipline, not a thesis rejection) may be re-attempted with fresh
+    # pricing after this cooldown, up to the attempts cap below. Previously one
+    # unfilled midday walk burned the candidate for the whole lookback window
+    # (VRT + ANET, 2026-07-09 — both abandoned ~12:10 ET, never retried).
+    # Non-abandoned outcomes (filled, ineligible, error) still never retry.
+    ENTRY_ABANDON_RETRY_COOLDOWN_MIN: int = 120
+    ENTRY_MAX_ORDER_ATTEMPTS_PER_DAY: int = 2
+    # Correlation-aware sizing: a candidate highly correlated to the EXISTING
+    # book adds concentration, not diversification — "you own 20 stocks but 5
+    # bets". Sizes DOWN (0.5× / 0.75×), never blocks: a haircut, not a gate.
+    # Uses 90d daily-return correlation vs currently-open names; fail-open 1.0.
+    ENTRY_CORR_HAIRCUT_ENABLED: bool = True
+    ENTRY_CORR_HIGH: float = 0.80    # avg corr ≥ this → 0.5× size
+    ENTRY_CORR_MED: float = 0.65     # avg corr ≥ this → 0.75× size
 
     # ----- Execution (IBKR) -------------------------------------------
     IBKR_HOST: str = "127.0.0.1"

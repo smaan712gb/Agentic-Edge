@@ -169,7 +169,11 @@ async def _gate_strategy_budget(
     bookkeeping_suffix = ("_gate_passed", "_ineligible", "_hold", "_capped",
                           "_skipped_cap", "_flagged", "_blocked")
     bookkeeping_prefix = ("filing_alert_", "macro_regime_", "sector_regime_",
-                          "position_pressure_", "event_", "entry_blocked_")
+                          "position_pressure_", "event_", "entry_blocked_",
+                          # Insider Form-4 alerts are research observability, not
+                          # trades — 32 insider_buy_alert rows on TSM (2026-07-09)
+                          # consumed its per-symbol budget and blocked a real entry.
+                          "insider_")
     bookkeeping_exact = ("heartbeat", "health_check", "open_leap_pullback")
     def _exclude_bookkeeping(q):
         for suffix in bookkeeping_suffix:

@@ -326,18 +326,42 @@ async def _find_unprocessed_buys() -> list[tuple[str, str, str, float]]:
         # Already-attempted within the window (any open_* on this symbol). Bound
         # to the same lookback so a name entered yesterday isn't re-tried today,
         # while a genuinely new Buy still routes.
-        attempted = {
-            r[0]
-            for r in (
-                await s.execute(
-                    select(AutoAction.symbol)
-                    .where(AutoAction.timestamp >= cutoff)
-                    .where(AutoAction.symbol.is_not(None))
-                    .where(AutoAction.action_type.like("open_%"))
-                    .where(AutoAction.gate_status.in_(["passed", "error"]))
+        #
+        # ABANDONED walks are the one retryable outcome: the order hit its price
+        # cap unfilled — a pricing event, not a thesis rejection. Such a symbol
+        # becomes a candidate again once the cooldown elapses, capped at
+        # ENTRY_MAX_ORDER_ATTEMPTS_PER_DAY total order attempts. Any other
+        # outcome (filled, ineligible, error) blocks for the whole window.
+        attempt_rows = (
+            await s.execute(
+                select(AutoAction.symbol, AutoAction.outcome, AutoAction.timestamp)
+                .where(AutoAction.timestamp >= cutoff)
+                .where(AutoAction.symbol.is_not(None))
+                .where(AutoAction.action_type.like("open_%"))
+                .where(AutoAction.gate_status.in_(["passed", "error"]))
+            )
+        ).all()
+        by_symbol: dict[str, list[tuple[Optional[str], datetime]]] = {}
+        for sym, outcome, ts in attempt_rows:
+            by_symbol.setdefault(sym, []).append((outcome, ts))
+        cooldown = timedelta(minutes=get_settings().ENTRY_ABANDON_RETRY_COOLDOWN_MIN)
+        max_attempts = int(get_settings().ENTRY_MAX_ORDER_ATTEMPTS_PER_DAY)
+        now = datetime.now(timezone.utc)
+        attempted: set[str] = set()
+        for sym, tries in by_symbol.items():
+            if any(o != "abandoned" for o, _ in tries):
+                attempted.add(sym)
+                continue
+            last_ts = max(ts for _, ts in tries)
+            if last_ts.tzinfo is None:
+                last_ts = last_ts.replace(tzinfo=timezone.utc)
+            if len(tries) >= max_attempts or (now - last_ts) < cooldown:
+                attempted.add(sym)
+            else:
+                logger.info(
+                    "auto-entry: %s abandoned %d× — cooldown elapsed, eligible "
+                    "for a fresh attempt", sym, len(tries),
                 )
-            ).all()
-        }
 
         return [
             (r[0], run_to_theme[r[0]], r[1], float(r[2] or 0))
@@ -426,7 +450,12 @@ async def _process_one(
     # not a system error; treat it as ineligible and move on so one bad
     # symbol doesn't crash the entire entry tick.
     try:
-        elig = await select_pmcc_legs(symbol=symbol, contracts=1, ibkr=ib)
+        # LEAPS-only: the short call is never sold, so its OI/spread/delta
+        # must not veto the entry — only the LEAP leg is validated.
+        elig = await select_pmcc_legs(
+            symbol=symbol, contracts=1, ibkr=ib,
+            require_short_call=not get_settings().LEAPS_ONLY,
+        )
     except Exception as e:
         # Distinguish a TRANSIENT probe failure (empty/degraded option-params
         # from a flapping data farm — ProviderError.retryable) from a genuine
@@ -706,11 +735,25 @@ async def _process_leaps_only(
         return False
 
     conviction_factor, conviction_meta = await _manager_conviction(symbol)
+
+    # Correlation-aware haircut: a candidate that moves with the existing book
+    # adds concentration, not a new bet — size it DOWN (never block). Fail-open.
+    corr_factor, avg_corr = 1.0, None
+    if get_settings().ENTRY_CORR_HAIRCUT_ENABLED:
+        try:
+            corr_factor, avg_corr = await _correlation_haircut(symbol)
+            if corr_factor < 1.0:
+                logger.info(
+                    "auto-entry LEAPS: %s correlation haircut %.2f× "
+                    "(avg 90d corr vs book %.2f)", symbol, corr_factor, avg_corr or 0)
+        except Exception as e:
+            logger.debug("auto-entry: correlation haircut failed for %s: %s", symbol, e)
+
     nav = await _fetch_nav(ib)
     # Size on the LEAP's full per-share cost (×100 = per contract).
     n_contracts = _size_pmcc_contracts(
         net_debit_per_spread=leap_px, nav=nav,
-        sizing_factor=sizing_factor, conviction_factor=conviction_factor)
+        sizing_factor=sizing_factor * corr_factor, conviction_factor=conviction_factor)
     if n_contracts <= 0:
         logger.info("auto-entry LEAPS: %s sized to 0 (macro=%s)", symbol, macro_regime)
         return False
@@ -1403,6 +1446,30 @@ async def _resolve_stuck_intents() -> None:
                 title=f"Watchdog: {len(rows)} stuck intent(s) abandoned",
                 body=", ".join(f"{i.symbol} ({i.id})" for i in rows),
             )
+
+
+async def _correlation_haircut(symbol: str) -> tuple[float, Optional[float]]:
+    """(sizing multiplier, avg correlation) for a candidate vs the CURRENT
+    book (open intents). 1.0 when the book is small or data is unavailable —
+    a haircut, never a gate."""
+    from api.app.report.portfolio_risk import candidate_book_correlation, corr_haircut_factor
+    s = get_settings()
+    async with db_session() as db:
+        book = [
+            r[0] for r in (
+                await db.execute(
+                    select(TradeIntent.symbol.distinct())
+                    .where(TradeIntent.status.in_(["filled", "submitted"]))
+                    .where(TradeIntent.position_state.in_(
+                        ["pmcc_full", "leap_pending", "leap_open",
+                         "leap_open_naked", "closing"]))
+                )
+            ).all() if r[0]
+        ]
+    if len(book) < 2:
+        return 1.0, None
+    avg = await candidate_book_correlation(symbol.upper(), [b.upper() for b in book])
+    return corr_haircut_factor(avg, high=s.ENTRY_CORR_HIGH, med=s.ENTRY_CORR_MED), avg
 
 
 async def _daily_cap_exhausted() -> bool:

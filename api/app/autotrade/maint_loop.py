@@ -1737,13 +1737,44 @@ async def _record_leap_exit_pressure(intent: TradeIntent, ib: Any) -> None:
     except Exception as e:
         logger.debug("leap exit-pressure: notable-short check failed for %s: %s", sym, e)
 
+    # Fresh institutional selling — CONFIRMATION ONLY, same discipline as the
+    # notable-short overlay. A tracked fund's recent 13F trim/exit or a 13D/G
+    # holder reduction on this name AMPLIFIES pressure only when the name
+    # already shows other weakness; on a healthy name it does nothing, and it
+    # never counts as an independent guardrail pillar. This is the wire the
+    # stake watch + 13F delta engine were built for.
+    inst_sell_delta = 0.0
+    try:
+        from api.app.hedge_funds.conviction import recent_manager_selling
+        _selling, _sell_meta = await recent_manager_selling(sym)
+        if _selling:
+            _corroborated_inst = (
+                (best_theme is not None and (best_theme.streak_days_below_floor > 0
+                 or (best_theme.composite is not None and best_theme.composite < 40)))
+                or (exhaustion_score is not None and exhaustion_score > 0.3)
+                or (rotation_delta is not None and rotation_delta > 0)
+            )
+            if _corroborated_inst:
+                inst_sell_delta = float(get_settings().INSTITUTIONAL_SELL_EXIT_DELTA)
+                logger.info(
+                    "exit-pressure: %s fresh institutional selling CONFIRMED by other "
+                    "weakness (+%.0f) — %d fund cuts, %d stake reductions", sym,
+                    inst_sell_delta, len(_sell_meta.get("fund_cuts", [])),
+                    len(_sell_meta.get("stake_reductions", [])),
+                )
+            else:
+                logger.debug("exit-pressure: %s has fresh institutional selling but NO "
+                             "corroborating weakness — ignoring (confirmation-only)", sym)
+    except Exception as e:
+        logger.debug("leap exit-pressure: institutional-sell check failed for %s: %s", sym, e)
+
     pressure = compute_exit_pressure(
         theme_composite=(best_theme.composite if best_theme else None),
         theme_streak_days=(best_theme.streak_days_below_floor if best_theme else 0),
         trim_band="none",
         exhaustion_score=exhaustion_score,
         rotation_score_delta=rotation_delta,
-        quant_edge_delta=((quant_delta or 0.0) + short_delta) or None,
+        quant_edge_delta=((quant_delta or 0.0) + short_delta + inst_sell_delta) or None,
         weights=LEAPS_WEIGHTS,
     )
 
@@ -1755,6 +1786,7 @@ async def _record_leap_exit_pressure(intent: TradeIntent, ib: Any) -> None:
                 "score": pressure.score, "band": pressure.band,
                 "rationale": pressure.rationale, "sub_scores": pressure.sub_scores,
                 "quant_exit_delta": quant_delta, "rotation_delta": rotation_delta,
+                "institutional_sell_delta": inst_sell_delta or None,
                 "exhaustion_score": exhaustion_score,
                 "theme": ({"composite": best_theme.composite,
                            "streak": best_theme.streak_days_below_floor}
@@ -2272,10 +2304,17 @@ async def _compute_daily_signals(symbol: str) -> dict[str, Optional[float]]:
       ma_20d             20-day simple moving average of close
       open_today         today's open
       prior_close        previous session's close
+      last_close         LATEST bar's close (today's live/partial bar when the
+                         feed carries it) — the correct "where is price NOW"
+                         input. prior_close is one session stale by definition;
+                         comparing it against an MA that includes today's bar
+                         biased the rotation breadth bearish on strong up days
+                         (2026-07-09: 14/17 themes false-flagged during a rally).
     """
     out: dict[str, Optional[float]] = {
         "pct_move_today": None, "volume_ratio": None, "rsi_14": None,
         "ma_20d": None, "open_today": None, "prior_close": None,
+        "last_close": None,
     }
     try:
         from datetime import date, timedelta
@@ -2295,6 +2334,8 @@ async def _compute_daily_signals(symbol: str) -> dict[str, Optional[float]]:
         opens = df["Open"].astype(float).tolist() if "Open" in df.columns else []
         volumes = df["Volume"].astype(float).tolist() if "Volume" in df.columns else []
 
+        if closes:
+            out["last_close"] = closes[-1]
         if len(closes) >= 2:
             out["pct_move_today"] = (closes[-1] - closes[-2]) / closes[-2]
             out["prior_close"] = closes[-2]

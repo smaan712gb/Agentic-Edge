@@ -22,13 +22,39 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
-from sqlalchemy.dialects.sqlite import insert as sqlite_upsert
+from sqlalchemy import select, update
 
 from .config import get_settings
 from .db import EquitySnapshot, Position, get_session as db_session
 
 logger = logging.getLogger(__name__)
+
+
+async def _upsert_position_row(
+    s: Any, *, account_id: str, symbol: str, qty: float,
+    avg_price: float, last_price: float, pnl: float, now: datetime,
+) -> None:
+    """Update-or-insert one snapshot row keyed by (account_id, symbol).
+
+    NOT an ON CONFLICT upsert: the table's UNIQUE(user_id, account_id, symbol)
+    never fires while user_id is NULL (SQL treats NULLs as distinct), so the
+    previous sqlite upsert silently INSERTED a fresh duplicate row on every
+    read — the table grew to hundreds of thousands of stale rows. A manual
+    update-then-insert is idempotent regardless of the constraint.
+    """
+    res = await s.execute(
+        update(Position)
+        .where(Position.user_id.is_(None))
+        .where(Position.account_id == account_id)
+        .where(Position.symbol == symbol)
+        .values(qty=qty, avg_price=avg_price, last_price=last_price,
+                pnl=pnl, captured_at=now)
+    )
+    if res.rowcount == 0:
+        s.add(Position(
+            user_id=None, account_id=account_id, symbol=symbol, qty=qty,
+            avg_price=avg_price, last_price=last_price, pnl=pnl, captured_at=now,
+        ))
 
 
 _ib_lock = asyncio.Lock()
@@ -82,16 +108,9 @@ async def snapshot_positions(rows: list[dict[str, Any]]) -> int:
             last_price = float(r.get("last_price") or 0)
             pnl = float(r.get("pnl") or (last_price - avg_price) * qty)
             account_id = str(r.get("account_id") or "default")
-            await s.execute(
-                sqlite_upsert(Position).values(
-                    user_id=None, account_id=account_id, symbol=symbol,
-                    qty=qty, avg_price=avg_price, last_price=last_price,
-                    pnl=pnl, captured_at=now,
-                ).on_conflict_do_update(
-                    index_elements=["user_id", "account_id", "symbol"],
-                    set_={"qty": qty, "avg_price": avg_price,
-                          "last_price": last_price, "pnl": pnl, "captured_at": now},
-                )
+            await _upsert_position_row(
+                s, account_id=account_id, symbol=symbol, qty=qty,
+                avg_price=avg_price, last_price=last_price, pnl=pnl, now=now,
             )
             written += 1
     return written
@@ -143,20 +162,10 @@ async def positions_real() -> list[dict[str, Any]]:
             # this snapshot table.
             if sec_type and sec_type != "STK":
                 continue
-            stmt = (
-                sqlite_upsert(Position).values(
-                    user_id=None, account_id=account_id, symbol=symbol,
-                    qty=qty, avg_price=avg_price, last_price=last_price,
-                    pnl=pnl, captured_at=now,
-                )
-                .on_conflict_do_update(
-                    index_elements=["user_id", "account_id", "symbol"],
-                    set_={"qty": qty, "avg_price": avg_price,
-                          "last_price": last_price, "pnl": pnl,
-                          "captured_at": now},
-                )
+            await _upsert_position_row(
+                s, account_id=account_id, symbol=symbol, qty=qty,
+                avg_price=avg_price, last_price=last_price, pnl=pnl, now=now,
             )
-            await s.execute(stmt)
     return out
 
 

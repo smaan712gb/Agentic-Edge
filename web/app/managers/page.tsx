@@ -145,7 +145,7 @@ export default function ManagersPage() {
         {managers === null && <div className="text-[var(--color-fg-muted)]">Loading managers…</div>}
         {managers?.length === 0 && (
           <div className="glass p-5 text-sm text-[var(--color-fg-muted)]">
-            No managers loaded yet. Add them to <code>api/app/hedge_funds/managers.toml</code> and restart.
+            No tracked investors yet — they appear after the first filing sweep.
           </div>
         )}
         {managers?.map((m) => (
@@ -228,7 +228,7 @@ export default function ManagersPage() {
             )}
             {overlap?.length === 0 && (
               <tr><td colSpan={5} className="px-5 py-4 text-[var(--color-fg-muted)]">
-                No overlapping positions yet — run the EDGAR backfill or wait for the first sweep.
+                No overlapping positions yet — they appear after the first filing sweep.
               </td></tr>
             )}
             {overlap?.map((r) => (
@@ -256,7 +256,7 @@ export default function ManagersPage() {
       <div className="flex items-center gap-2 mt-8 mb-3">
         <Newspaper className="h-4 w-4 text-[var(--color-accent)]" />
         <h2 className="text-lg font-semibold tracking-tight">Chokepoint news</h2>
-        <span className="text-xs text-[var(--color-fg-dim)]">supply-chain headlines on your names (IB feed)</span>
+        <span className="text-xs text-[var(--color-fg-dim)]">supply-chain headlines on your names · live news feed</span>
       </div>
       <div className="glass divide-y divide-[var(--color-border)]">
         {mentions === null && <div className="p-5 text-[var(--color-fg-muted)]">Loading…</div>}
@@ -278,7 +278,11 @@ export default function ManagersPage() {
                 {m.chokepoint_hits.slice(0, 4).map((h) => (
                   <span key={h} className="chip text-[10px] text-[var(--color-fg-muted)]">{h}</span>
                 ))}
-                <span className="text-[10px] text-[var(--color-fg-dim)] ml-1">{m.provider}</span>
+                {m.published_at && (
+                  <span className="text-[10px] text-[var(--color-fg-dim)] ml-1">
+                    {new Date(m.published_at).toLocaleDateString("en-US", { month: "short", day: "numeric" })}
+                  </span>
+                )}
               </div>
             </div>
           </div>

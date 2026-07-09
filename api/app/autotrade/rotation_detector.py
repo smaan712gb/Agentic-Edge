@@ -126,7 +126,10 @@ async def run_rotation_sweep() -> dict[str, Any]:
                     sig = await _compute_daily_signals(sym)
                     sig_cache[sym] = sig
                 ma20 = sig.get("ma_20d")
-                last = sig.get("prior_close")  # latest close proxy
+                # Latest close, NOT prior_close: prior_close is one session
+                # stale while ma_20d includes the latest bar, which biased
+                # breadth bearish on rally days (14/17 false flags 2026-07-09).
+                last = sig.get("last_close") or sig.get("prior_close")
                 if ma20 and last:
                     total += 1
                     if last < ma20:

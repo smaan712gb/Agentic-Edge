@@ -113,22 +113,25 @@ class HedgeFundRepo:
         return list(rows)
 
     async def holdings_for_period(self, manager_id: int, period_end: datetime) -> list["AggHolding"]:
-        """Holdings for a manager at a period, **aggregated per security**.
+        """Holdings for a manager at a period, **deduped per security**.
 
         A manager can file under several CIKs (Situational Awareness has two),
-        each producing its own 13F for the same quarter — so the raw rows
-        double-count a name. We sum value/shares by (cusip, put_call_flag) so
-        every downstream read (top-20, Q/Q deltas, overlap, smart-money) sees
-        one true per-manager position. pct_of_portfolio is recomputed against
-        the aggregated total."""
+        each producing its own 13F for the same quarter. In practice those CIKs
+        file IDENTICAL mirror books (same odd-lot share counts) — they are two
+        registrations of ONE fund, not disjoint sub-portfolios — so SUMMING
+        them double-counts every name (verified: CLSK showed 2×$104.5M, RIOT
+        2×$142.2M). We take the MAX value/shares per (cusip, put_call_flag):
+        correct for mirror CIKs, identical to the single value for a one-CIK
+        manager, and conservative in the (unobserved) genuine-split case.
+        pct_of_portfolio is recomputed against the deduped total."""
         rows = (await self.s.execute(
             select(
                 FundHolding.cusip,
                 FundHolding.put_call_flag,
                 func.max(FundHolding.issuer_name),
                 func.max(FundHolding.ticker),
-                func.sum(FundHolding.value_usd),
-                func.sum(FundHolding.shares),
+                func.max(FundHolding.value_usd),
+                func.max(FundHolding.shares),
             )
             .where(FundHolding.manager_id == manager_id)
             .where(FundHolding.period_end == period_end)
@@ -201,8 +204,9 @@ class HedgeFundRepo:
 
         rows = (await self.s.execute(q)).all()
         # Dedupe by manager (a manager's multiple CIKs each file a 13F, so the
-        # same name shows up once per CIK) — sum within a manager, then count
-        # DISTINCT managers so the cross-fund confirmation isn't inflated.
+        # same name shows up once per CIK). Those CIKs file IDENTICAL mirror
+        # books, so we take the MAX per manager (NOT the sum — summing doubled
+        # SA's CLSK/RIOT to 2×). Then count DISTINCT managers for confirmation.
         by_mgr: dict[str, dict[str, Any]] = {}
         for holding, mgr in rows:
             m = by_mgr.setdefault(mgr.slug, {
@@ -212,8 +216,8 @@ class HedgeFundRepo:
                 "pct_of_portfolio": holding.pct_of_portfolio,
                 "period_end": holding.period_end.isoformat() if holding.period_end else None,
             })
-            m["value_usd"] += holding.value_usd
-            m["shares"] += holding.shares
+            m["value_usd"] = max(m["value_usd"], holding.value_usd)
+            m["shares"] = max(m["shares"], holding.shares)
         managers = list(by_mgr.values())
         agg_value = sum(m["value_usd"] for m in managers)
         agg_shares = sum(m["shares"] for m in managers)

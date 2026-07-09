@@ -44,6 +44,10 @@ _Z_CANDIDATE_KEYS: tuple[str, ...] = (
     "momentum_60d",
     "dist_50dma",
     "rvol",
+    "ema_stack_score",
+    "pattern_bull_count",
+    "accum_dist_balance",
+    "cba_confidence_num",
     "flow_imbalance",
     "gamma_sign_num",
     "dark_pool_notional",
@@ -128,15 +132,18 @@ async def _smartmoney_theme_confirm(symbol: str, themes: list[str]) -> Optional[
 
 
 async def _market_features(symbol: str) -> dict[str, Optional[float]]:
-    """momentum_20d / momentum_60d / dist_50dma / rvol via the fallback chain."""
+    """momentum_20d / momentum_60d / dist_50dma / rvol / ema_stack_score via the
+    fallback chain. The 500-day window exists for the 200 EMA (the trend-stack
+    spec: 8/21/50/100/200 alignment); the shorter factors only need 120."""
     out: dict[str, Optional[float]] = {
         "momentum_20d": None, "momentum_60d": None, "dist_50dma": None, "rvol": None,
+        "ema_stack_score": None, "pattern_bull_count": None, "accum_dist_balance": None,
     }
     try:
         from datetime import date
         from tradingagents.dataflows.fallback import get_stock_data_with_fallback
         df = await get_stock_data_with_fallback(
-            symbol, date.today() - timedelta(days=120), date.today(),
+            symbol, date.today() - timedelta(days=500), date.today(),
         )
     except Exception as e:
         logger.debug("research: price feed failed for %s: %s", symbol, e)
@@ -162,6 +169,21 @@ async def _market_features(symbol: str) -> dict[str, Optional[float]]:
                 base = sum(vols[-21:-1]) / 20
                 if base > 0:
                     out["rvol"] = round(vols[-1] / base, 4)
+        from .trend import ema_stack
+        stack = ema_stack(closes)
+        if stack is not None:
+            out["ema_stack_score"] = stack["score"]
+        # Pattern + structure labels → IC-validatable scalars.
+        from .patterns import bull_pattern_count, detect_patterns, market_structure
+        highs = (df["High"] if "High" in df.columns else df["Close"]).astype(float).tolist()
+        lows = (df["Low"] if "Low" in df.columns else df["Close"]).astype(float).tolist()
+        vols_full = (df["Volume"] if "Volume" in df.columns else df["Close"] * 0).astype(float).tolist()
+        pats = detect_patterns(highs=highs, lows=lows, closes=closes, volumes=vols_full)
+        out["pattern_bull_count"] = float(bull_pattern_count(pats))
+        ms = market_structure(highs=highs, lows=lows, closes=closes, volumes=vols_full)
+        if ms is not None:
+            out["accum_dist_balance"] = float(
+                ms["accumulation_days_25"] - ms["distribution_days_25"])
     except Exception as e:
         logger.debug("research: market feature calc failed for %s: %s", symbol, e)
     return out
@@ -213,6 +235,32 @@ async def _flow_features(symbol: str) -> dict[str, Optional[float]]:
 # ---------------------------------------------------------------------------
 
 
+async def _cba_features(symbols: list[str], as_of: datetime) -> dict[str, float]:
+    """Numeric closing-bell-accumulation read for today: confidence of a
+    passing setup (high=2, med=1, low=0.5), 0 when no setup. One bounded DB
+    query — the first decision-side consumer of the CBA sweep's output."""
+    from ..db import ClosingAccumulationSignal
+    out: dict[str, float] = {}
+    try:
+        async with db_session() as s:
+            rows = (
+                await s.execute(
+                    select(ClosingAccumulationSignal)
+                    .where(ClosingAccumulationSignal.date == as_of)
+                    .where(ClosingAccumulationSignal.symbol.in_(symbols))
+                )
+            ).scalars().all()
+        conf_num = {"high": 2.0, "med": 1.0, "medium": 1.0, "low": 0.5}
+        for r in rows:
+            out[r.symbol] = (
+                conf_num.get((r.confidence or "").lower(), 0.5)
+                if r.setup_passes else 0.0
+            )
+    except Exception as e:
+        logger.debug("research: cba feature read failed: %s", e)
+    return out
+
+
 async def build_snapshot(
     *, as_of: Optional[datetime] = None, with_market: bool = True, with_flow: bool = True,
     max_symbols: int = 200,
@@ -259,6 +307,12 @@ async def build_snapshot(
         flow = await _gather_bounded([_flow_features(s) for s in symbols], limit=6)
         for sym, f in zip(symbols, flow):
             rows[sym].update(f or {})
+
+    # Closing-bell accumulation (today's CBA sweep row) — wires the previously
+    # unread closing_accumulation_signals table into the IC-validated pipeline.
+    cba = await _cba_features(symbols, as_of)
+    for sym in symbols:
+        rows[sym]["cba_confidence_num"] = cba.get(sym, 0.0)
 
     # Cross-sectional standardisation across the universe (history-free rank).
     cross_sectional_z(rows)

@@ -86,3 +86,6 @@ alembic.ini.local
 
 # Quant overlay runtime artifact (recalibrated weights)
 overlay_weights.json
+
+# DB backups from maintenance/dedupe operations
+*.db.backup-*

@@ -248,6 +248,234 @@ export type SmartMoney = {
   managers: { slug: string; name: string; value_usd: number; shares: number; put_call_flag: string; pct_of_portfolio: number | null; period_end: string | null }[];
 };
 
+// --- Morning Report --------------------------------------------------------
+
+export type IdeaTechnical = {
+  momentum_20d: number | null;
+  momentum_60d: number | null;
+  dist_50dma: number | null;
+  rvol: number | null;
+  flow_imbalance: number | null;
+  gamma_sign: "positive" | "negative" | "neutral" | null;
+  as_of: string | null;
+};
+
+export type IdeaTrend = {
+  score: number;
+  label: "perfect alignment" | "mostly aligned" | "mixed" | "mostly inverted" | "downtrend stack";
+  pairs: { pair: string; ok: boolean }[];
+  emas: Record<string, number>;
+  price: number;
+  price_above_8ema: boolean;
+};
+
+export type IdeaPattern = {
+  key: string;
+  name: string;
+  direction: "bullish" | "bearish";
+  confidence: "high" | "medium";
+  detail: string;
+};
+
+export type IdeaStructure = {
+  structure: "uptrend" | "downtrend" | "range";
+  higher_highs: boolean;
+  higher_lows: boolean;
+  accumulation_days_25: number;
+  distribution_days_25: number;
+  distribution_flag: boolean;
+  liquidity_sweep: { side: "lows" | "highs"; detail: string } | null;
+  supply_zone: { low: number; high: number; dist_pct: number } | null;
+  demand_zone: { low: number; high: number; dist_pct: number } | null;
+};
+
+export type IdeaEntry = {
+  score: number;
+  label: "prime setup" | "good setup" | "developing" | "not ready";
+  reasons: { ok: boolean; text: string }[];
+};
+
+export type PortfolioRisk = {
+  empty: boolean;
+  n_holdings: number;
+  health_pct: number | null;
+  risk_label: string;
+  avg_correlation: number | null;
+  effective_bets: number | null;
+  cash_pct: number | null;
+  theme_exposure: { theme: string; pct: number }[];
+};
+
+export type IdeaAnalyst = {
+  pt_consensus: number | null;
+  pt_high: number | null;
+  pt_low: number | null;
+  price: number | null;
+  upside_pct: number | null;
+  grades_30d: { date: string | null; firm: string | null; from: string | null; to: string | null; direction: "up" | "down" | "neutral" }[];
+  n_up_30d: number;
+  n_down_30d: number;
+};
+
+export type IdeaResearch = {
+  headline: string;
+  sentiment: "bullish" | "bearish" | "neutral" | null;
+  conviction: number | null;
+  summary: string | null;
+  published_at: string | null;
+};
+
+export type InstitutionalRead = {
+  label: "constructive" | "cautious" | "mixed" | "limited data";
+  bull: string[];
+  bear: string[];
+};
+
+export type ReportIdea = {
+  symbol: string;
+  theme_id: string;
+  theme: string;
+  composite: number;
+  setup: number;
+  options: number;
+  thesis_fit: number;
+  conviction: number | null;
+  drivers: string[];
+  risks: string[];
+  rationale: string | null;
+  run_id: string;
+  held: boolean;
+  rotation_flagged: boolean;
+  technical?: IdeaTechnical | null;
+  trend?: IdeaTrend | null;
+  patterns?: IdeaPattern[];
+  structure?: IdeaStructure | null;
+  entry?: IdeaEntry;
+  analyst?: IdeaAnalyst | null;
+  research?: IdeaResearch[];
+  smart_money?: { manager_count: number; confirmation: boolean } | null;
+  institutional_read?: InstitutionalRead;
+};
+
+export type ReportHolding = {
+  symbol: string;
+  structure: string;
+  position_state: string;
+  qty: number | null;
+  intent_id: string | null;
+  pnl?: number;
+  last_price?: number;
+  avg_price?: number;
+  exit_pressure: {
+    score: number | null;
+    band: "hold" | "trim_light" | "trim_heavy" | "aggressive" | null;
+    rationale: string | null;
+    sub_scores: Record<string, number> | null;
+    theme: { composite: number | null; streak: number } | null;
+    as_of: string | null;
+  } | null;
+  latest_score: {
+    composite: number;
+    decision: string;
+    conviction: number | null;
+    theme_id: string;
+    theme: string;
+    as_of: string | null;
+  } | null;
+  themes: string[];
+  rotation_flagged: boolean;
+  rotation_themes: string[];
+  smart_money: { manager_count: number; confirmation: boolean; aggregate_value_usd: number } | null;
+  suggested_action: string;
+};
+
+export type ReportStakeFiling = {
+  ticker: string | null;
+  form_type: string;
+  change_type: string;
+  percent_of_class: number | null;
+  prior_percent: number | null;
+  is_activist: boolean;
+  is_holding: boolean;
+  filed_at: string | null;
+};
+
+export type FilingImpact = "positive" | "negative" | "neutral" | "unclear";
+
+export type ReportActivity = {
+  stake_filings: ReportStakeFiling[];
+  fund_moves: { manager: string; ticker: string | null; issuer_name: string | null; change_type: string; change_pct: number | null }[];
+  insider_alerts: {
+    symbol: string | null;
+    direction: "buy" | "sale";
+    headline: string;
+    owner_type: string | null;
+    value_usd: number | null;
+    filing_date: string | null;
+    impact: FilingImpact;
+    impact_note: string;
+    timestamp: string;
+  }[];
+  filing_alerts: {
+    symbol: string | null;
+    form_type: string | null;
+    severity: string | null;
+    rationale: string | null;
+    link: string | null;
+    is_held: boolean;
+    meaning: string;
+    impact: FilingImpact;
+    impact_note: string;
+    timestamp: string;
+  }[];
+};
+
+export type ReportAlerts = {
+  entry_breaker: { tripped: boolean; reason: string | null; tripped_at: string | null };
+  autotrade_enabled: boolean;
+  rotation_flagged: { theme_id: string; flagged: boolean; score: number; signals_tripped: string[] }[];
+  holding_stake_reductions: (ReportStakeFiling & { held: boolean })[];
+};
+
+export type ReportThemeHealth = {
+  theme_id: string;
+  theme: string;
+  composite: number;
+  n_scored: number;
+  n_buys: number;
+  rotation_flagged: boolean;
+};
+
+export type ReportPosture = {
+  score: number;
+  label: "defensive" | "cautious" | "neutral" | "constructive" | "risk-on";
+  components: { theme_health: number; rotation_calm: number; buy_breadth: number };
+  breaker_capped: boolean;
+  themes_flagged: number;
+  themes_total: number;
+};
+
+export type ReportBrief = {
+  text: string;
+  source: "agent" | "fallback";
+  generated_at: string;
+};
+
+export type MorningReport = {
+  as_of: string;
+  generated_at: string;
+  posture: ReportPosture;
+  brief: ReportBrief | { error: string };
+  account: { equity: number; cash: number | null; notional: number | null; cash_pct: number | null; as_of: string } | null;
+  top_ideas: ReportIdea[] | { error: string };
+  holdings: ReportHolding[] | { error: string };
+  off_universe_positions: { symbol: string; qty: number; pnl: number }[];
+  portfolio_risk: PortfolioRisk | { error: string };
+  institutional_activity: ReportActivity | { error: string };
+  alerts: ReportAlerts | { error: string };
+  theme_health: ReportThemeHealth[] | { error: string };
+};
+
 // --- Quant Research Factory ----------------------------------------------
 
 export type UniverseGraphNode = {
@@ -393,6 +621,10 @@ export const api = {
     mentions: (symbol?: string) =>
       jfetch<Mention[]>(`/api/mentions${symbol ? `?symbol=${encodeURIComponent(symbol)}` : ""}`),
     rotation: () => jfetch<RotationRow[]>("/api/rotation"),
+  },
+  report: {
+    morning: (opts?: { refresh?: boolean }) =>
+      jfetch<MorningReport>(`/api/report/morning${opts?.refresh ? "?refresh=true" : ""}`),
   },
   research: {
     universeGraph: (limit = 100) =>

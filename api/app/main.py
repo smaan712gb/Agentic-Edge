@@ -394,6 +394,10 @@ app.include_router(_hedge_funds_router)
 from .research.routes import router as _research_router  # noqa: E402
 app.include_router(_research_router)
 
+# Morning Report — the daily CIO brief (read-only assembly of persisted signals).
+from .report.routes import router as _report_router  # noqa: E402
+app.include_router(_report_router)
+
 
 # ---------------------------------------------------------------------------
 # Health + agents

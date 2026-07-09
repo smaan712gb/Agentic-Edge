@@ -100,6 +100,14 @@ _OVERLAY_RECAL_JOB_ID = "quant_overlay_recalibrate"
 # prior toward measured predictiveness. Fully autonomous self-tuning.
 _OVERLAY_RECAL_CRON = "15 17 * * 1-5"
 
+_MORNING_REPORT_JOB_ID = "morning_report_dispatch"
+# 08:45 ET weekdays — after the overnight EDGAR/stake/insider sweeps, before
+# the 09:00 theme run. The brief reads only persisted artifacts (yesterday's
+# scorecards + pressure bands, overnight filings), so it is deliberately
+# pre-market; the /api/report/morning endpoint always assembles fresh on
+# demand for the dashboard.
+_MORNING_REPORT_CRON = "45 8 * * 1-5"
+
 _MISSED_RUN_JOB_ID = "missed_run_watchdog"
 # Every 30 min, 09:00-15:30 ET weekdays. Recovers the daily theme run if it was
 # missed (process down at 09:00, or scheduler enabled AFTER 09:00) — the gap
@@ -205,6 +213,14 @@ async def start_scheduler() -> None:
         trigger=CronTrigger.from_crontab(_HEALTH_CRON, timezone="America/New_York"),
         id=_HEALTH_JOB_ID, replace_existing=True,
         misfire_grace_time=300, max_instances=1, coalesce=True,
+    )
+    # Morning Report — daily CIO brief pushed through the alert fan-out.
+    # Always-on decision-support; never trades.
+    _SCHEDULER.add_job(
+        _run_morning_report_job,
+        trigger=CronTrigger.from_crontab(_MORNING_REPORT_CRON, timezone="America/New_York"),
+        id=_MORNING_REPORT_JOB_ID, replace_existing=True,
+        misfire_grace_time=600, max_instances=1, coalesce=True,
     )
     # Missed-run watchdog — always-on safety net that recovers the daily theme
     # run if it was skipped (process down at 09:00, or scheduler enabled after
@@ -489,6 +505,22 @@ async def _run_edgar_sweep_job() -> None:
             )
     except Exception as e:
         logger.exception("EDGAR sweep tick failed: %s", e)
+
+
+async def _run_morning_report_job() -> None:
+    """Assemble the Morning Report and push the digest to the alert channel."""
+    try:
+        from .report.morning import dispatch_morning_report
+        report = await dispatch_morning_report()
+        ideas = report.get("top_ideas")
+        holdings = report.get("holdings")
+        logger.info(
+            "morning report dispatched: %d ideas, %d holdings",
+            len(ideas) if isinstance(ideas, list) else 0,
+            len(holdings) if isinstance(holdings, list) else 0,
+        )
+    except Exception as e:
+        logger.exception("morning report dispatch failed: %s", e)
 
 
 async def _run_stake_watch_job() -> None:

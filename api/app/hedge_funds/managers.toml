@@ -107,6 +107,27 @@ tier = "tier2"
 ciks = ["0001088875"]
 themes = ["ai-memory-wall", "private-ai-compute", "advanced-packaging"]
 
+[[manager]]
+slug = "third-point"
+name = "Third Point LLC"
+tier = "tier2"
+ciks = ["lookup"]
+themes = []
+
+[[manager]]
+slug = "soros-fund"
+name = "Soros Fund Management"
+tier = "tier2"
+ciks = ["lookup"]
+themes = []
+
+[[manager]]
+slug = "baupost"
+name = "The Baupost Group"
+tier = "tier2"
+ciks = ["lookup"]
+themes = []
+
 # ================= Activist watchlist — 13D event-driven ===============
 # Tracked for 13D filings (Tier-1 instant alerts), NOT for holding conviction.
 
@@ -132,6 +153,50 @@ name = "D.E. Shaw & Co."
 tier = "tier1"
 ciks = ["0001009207"]
 macro_only = true   # book is futures/swaps-heavy; no single-name signal
+themes = []
+
+# Multi-strategy pod shops: thousands of hedged positions per 13F, so a
+# single name appearing means almost nothing — macro context only, exactly
+# like D.E. Shaw. Never a conviction signal.
+
+[[manager]]
+slug = "millennium"
+name = "Millennium Management"
+tier = "tier2"
+ciks = ["lookup"]
+macro_only = true
+themes = []
+
+[[manager]]
+slug = "point72"
+name = "Point72 Asset Management"
+tier = "tier2"
+ciks = ["lookup"]
+macro_only = true
+themes = []
+
+[[manager]]
+slug = "citadel"
+name = "Citadel Advisors"
+tier = "tier2"
+ciks = ["lookup"]
+macro_only = true
+themes = []
+
+[[manager]]
+slug = "renaissance"
+name = "Renaissance Technologies"
+tier = "tier2"
+ciks = ["lookup"]
+macro_only = true
+themes = []
+
+[[manager]]
+slug = "two-sigma"
+name = "Two Sigma Investments"
+tier = "tier2"
+ciks = ["lookup"]
+macro_only = true
 themes = []
 
 # ===================== Bears — notable short-sellers ===================
