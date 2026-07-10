@@ -327,11 +327,14 @@ async def _find_unprocessed_buys() -> list[tuple[str, str, str, float]]:
         # to the same lookback so a name entered yesterday isn't re-tried today,
         # while a genuinely new Buy still routes.
         #
-        # ABANDONED walks are the one retryable outcome: the order hit its price
-        # cap unfilled — a pricing event, not a thesis rejection. Such a symbol
-        # becomes a candidate again once the cooldown elapses, capped at
-        # ENTRY_MAX_ORDER_ATTEMPTS_PER_DAY total order attempts. Any other
-        # outcome (filled, ineligible, error) blocks for the whole window.
+        # ABANDONED walks and INELIGIBLE probes are the retryable outcomes:
+        # an abandon is a pricing event (walked to cap unfilled) and an
+        # ineligibility is a point-in-time chain read (thin quotes pre-market,
+        # OI ticks not populated, or — as with ALAB on 2026-07-09 — a rule
+        # that has since been removed). Retrying costs a chain probe, not an
+        # order. Both re-qualify after the cooldown, capped at
+        # ENTRY_MAX_ORDER_ATTEMPTS_PER_DAY total attempts. FILLED and ERROR
+        # outcomes still block for the whole window.
         attempt_rows = (
             await s.execute(
                 select(AutoAction.symbol, AutoAction.outcome, AutoAction.timestamp)
@@ -349,7 +352,7 @@ async def _find_unprocessed_buys() -> list[tuple[str, str, str, float]]:
         now = datetime.now(timezone.utc)
         attempted: set[str] = set()
         for sym, tries in by_symbol.items():
-            if any(o != "abandoned" for o, _ in tries):
+            if any(o not in ("abandoned", "ineligible") for o, _ in tries):
                 attempted.add(sym)
                 continue
             last_ts = max(ts for _, ts in tries)
@@ -359,8 +362,9 @@ async def _find_unprocessed_buys() -> list[tuple[str, str, str, float]]:
                 attempted.add(sym)
             else:
                 logger.info(
-                    "auto-entry: %s abandoned %d× — cooldown elapsed, eligible "
-                    "for a fresh attempt", sym, len(tries),
+                    "auto-entry: %s %s %d× — cooldown elapsed, eligible for a "
+                    "fresh attempt", sym, "/".join(sorted({o or "?" for o, _ in tries})),
+                    len(tries),
                 )
 
         return [
