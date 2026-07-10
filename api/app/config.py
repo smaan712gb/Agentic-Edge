@@ -299,6 +299,13 @@ class Settings(BaseSettings):
     ENTRY_CORR_HAIRCUT_ENABLED: bool = True
     ENTRY_CORR_HIGH: float = 0.80    # avg corr ≥ this → 0.5× size
     ENTRY_CORR_MED: float = 0.65     # avg corr ≥ this → 0.75× size
+    # Live tape gate: the intraday pulse (universe breadth vs the broad tape)
+    # acts on NEW BUYING only — the complex-specific analogue of the macro
+    # regime. distribution day → halt new entries this tick; money rotating
+    # OUT of the complex → half size. NEVER touches exits: an intraday
+    # "distribution" read must not become a drawdown-exit trigger.
+    PULSE_ENTRY_GATE_ENABLED: bool = True
+    PULSE_OUT_OF_SEMIS_SIZING: float = 0.5
 
     # ----- Execution (IBKR) -------------------------------------------
     IBKR_HOST: str = "127.0.0.1"

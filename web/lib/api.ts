@@ -477,6 +477,10 @@ export type IntradayPulse = {
   theme_dispersion_pct: number;
   day_type: "accumulation" | "distribution" | "rotation" | "consolidation";
   day_note: string;
+  benchmarks_pct: Record<string, number | null>;
+  semis_rotation: "into_semis" | "out_of_semis" | "within_semis" | "neutral";
+  semis_rotation_note: string;
+  catalysts: { title: string; why_it_matters: string | null; bull_case: string | null; bear_case: string | null }[];
   status_0_10: number;
   leaders: PulseTheme[];
   laggards: PulseTheme[];

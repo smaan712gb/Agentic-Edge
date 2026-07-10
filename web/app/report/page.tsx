@@ -422,22 +422,62 @@ const DAY_TYPE_STYLE: Record<string, string> = {
   consolidation: "text-[var(--color-fg-muted)]",
 };
 
+const SEMIS_ROT_STYLE: Record<string, string> = {
+  into_semis: "border-[var(--color-up)]/40 text-[var(--color-up)]",
+  out_of_semis: "border-[var(--color-down)]/40 text-[var(--color-down)]",
+  within_semis: "border-yellow-500/40 text-yellow-500",
+  neutral: "text-[var(--color-fg-dim)]",
+};
+
+const SEMIS_ROT_LABEL: Record<string, string> = {
+  into_semis: "money moving INTO the complex",
+  out_of_semis: "money moving OUT of the complex",
+  within_semis: "rotation WITHIN the complex",
+  neutral: "tracking the tape",
+};
+
 function PulseCard({ pulse }: { pulse: IntradayPulse }) {
   return (
     <div className="glass p-5 mb-6">
       <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
           <span className="label-eyebrow">Intraday pulse · {pulse.as_of_et}</span>
           <span className={cn("chip text-[10px] capitalize", DAY_TYPE_STYLE[pulse.day_type] ?? "")}>
             {pulse.day_type} day
+          </span>
+          <span className={cn("chip text-[10px]", SEMIS_ROT_STYLE[pulse.semis_rotation] ?? "")}
+            title={pulse.semis_rotation_note}>
+            {SEMIS_ROT_LABEL[pulse.semis_rotation] ?? pulse.semis_rotation}
           </span>
           <span className="text-lg font-semibold tabular-nums">{pulse.status_0_10}/10</span>
         </div>
         <div className="text-xs text-[var(--color-fg-muted)] tabular-nums">
           {pulse.breadth_up_pct.toFixed(0)}% of {pulse.n_symbols_quoted} names up ·
           avg {pulse.avg_change_pct >= 0 ? "+" : ""}{pulse.avg_change_pct.toFixed(1)}%
+          {pulse.benchmarks_pct?.QQQ != null &&
+            ` · QQQ ${pulse.benchmarks_pct.QQQ >= 0 ? "+" : ""}${pulse.benchmarks_pct.QQQ.toFixed(1)}%`}
         </div>
       </div>
+
+      {/* Today's catalysts — real headlines, bull/bear framing */}
+      {(pulse.catalysts?.length ?? 0) > 0 && (
+        <div className="mb-4 space-y-2">
+          {pulse.catalysts.map((c, i) => (
+            <div key={i} className="text-sm">
+              <span className="font-medium">{c.title}</span>
+              {c.why_it_matters && (
+                <span className="text-[var(--color-fg-muted)]"> — {c.why_it_matters}</span>
+              )}
+              {(c.bull_case || c.bear_case) && (
+                <div className="text-[11px] mt-0.5 space-x-3">
+                  {c.bull_case && <span className="text-[var(--color-up)]">▲ {c.bull_case}</span>}
+                  {c.bear_case && <span className="text-[var(--color-down)]">▼ {c.bear_case}</span>}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         <div className="space-y-1">
           {pulse.narrative.split("\n").filter((l) => l.trim()).map((l, i) =>

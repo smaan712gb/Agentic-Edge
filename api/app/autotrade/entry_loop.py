@@ -212,6 +212,45 @@ async def _tick() -> None:
             )
         return
 
+    # Live tape gate — the intraday pulse acting on the desk (NEW BUYING only;
+    # exits are untouched by design). Distribution across OUR universe halts
+    # this tick's entries; money rotating out of the complex halves size.
+    # Fail-open: a pulse outage never blocks trading by itself.
+    if get_settings().PULSE_ENTRY_GATE_ENABLED:
+        try:
+            from api.app.report.pulse import build_intraday_pulse
+            pulse = await build_intraday_pulse()
+            day_type = pulse.get("day_type")
+            semis_rot = pulse.get("semis_rotation")
+            if day_type == "distribution":
+                logger.info("auto-entry: tape gate — distribution day "
+                            "(%.0f%% up, avg %+.1f%%) — no new entries this tick",
+                            pulse.get("breadth_up_pct", 0), pulse.get("avg_change_pct", 0))
+                today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+                async with db_session() as s:
+                    from .auto_gate import record_auto_action
+                    already = (await s.execute(
+                        select(AutoAction.id)
+                        .where(AutoAction.action_type == "entry_blocked_tape")
+                        .where(AutoAction.timestamp >= today).limit(1))).first()
+                    if already is None:
+                        await record_auto_action(
+                            s, loop="entry", action_type="entry_blocked_tape",
+                            gate_result=None,
+                            payload={"day_type": day_type, "semis_rotation": semis_rot,
+                                     "breadth_up_pct": pulse.get("breadth_up_pct"),
+                                     "avg_change_pct": pulse.get("avg_change_pct")},
+                            outcome="blocked",
+                        )
+                return
+            if semis_rot == "out_of_semis":
+                factor = float(get_settings().PULSE_OUT_OF_SEMIS_SIZING)
+                sizing_factor *= factor
+                logger.info("auto-entry: tape gate — money rotating out of the "
+                            "complex — sizing ×%.2f", factor)
+        except Exception as e:
+            logger.debug("auto-entry: tape gate unavailable (%s) — proceeding", e)
+
     for run_id, theme_id, symbol, composite in candidates:
         ok = await _process_one(run_id, theme_id, symbol, composite,
                                 sizing_factor=sizing_factor,

@@ -114,6 +114,11 @@ _PULSE_JOB_ID = "intraday_pulse_dispatch"
 # pulse endpoint serves it live all session with a 3-minute cache.
 _PULSE_CRON = "30 10 * * 1-5"
 
+_PULSE_MONITOR_JOB_ID = "intraday_pulse_monitor"
+# Every 15 min during RTH: refresh the pulse and alert ONLY when the state
+# CHANGES (day type or semis-rotation direction) — a live monitor, not spam.
+_PULSE_MONITOR_CRON = "*/15 9-16 * * 1-5"
+
 _MISSED_RUN_JOB_ID = "missed_run_watchdog"
 # Every 30 min, 09:00-15:30 ET weekdays. Recovers the daily theme run if it was
 # missed (process down at 09:00, or scheduler enabled AFTER 09:00) — the gap
@@ -234,6 +239,13 @@ async def start_scheduler() -> None:
         trigger=CronTrigger.from_crontab(_PULSE_CRON, timezone="America/New_York"),
         id=_PULSE_JOB_ID, replace_existing=True,
         misfire_grace_time=600, max_instances=1, coalesce=True,
+    )
+    # 15-minute live monitor — refresh + alert on day-type/rotation CHANGES.
+    _SCHEDULER.add_job(
+        _run_pulse_monitor_job,
+        trigger=CronTrigger.from_crontab(_PULSE_MONITOR_CRON, timezone="America/New_York"),
+        id=_PULSE_MONITOR_JOB_ID, replace_existing=True,
+        misfire_grace_time=300, max_instances=1, coalesce=True,
     )
     # Missed-run watchdog — always-on safety net that recovers the daily theme
     # run if it was skipped (process down at 09:00, or scheduler enabled after
@@ -534,6 +546,40 @@ async def _run_morning_report_job() -> None:
         )
     except Exception as e:
         logger.exception("morning report dispatch failed: %s", e)
+
+
+_last_pulse_state: Optional[tuple[str, str]] = None
+
+
+async def _run_pulse_monitor_job() -> None:
+    """15-min live monitor: refresh the pulse; alert only on STATE CHANGES
+    (day type or semis-rotation direction). The entry loop reads the same
+    cached pulse as its live tape gate, so this refresh is also what keeps
+    the trading desk's view current."""
+    global _last_pulse_state
+    try:
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30):
+            return  # pre-open quotes are stale prints — skip until the bell
+        from .report.pulse import build_intraday_pulse
+        p = await build_intraday_pulse(refresh=True)
+        state = (p.get("day_type", "?"), p.get("semis_rotation", "?"))
+        if _last_pulse_state is not None and state != _last_pulse_state:
+            from .autotrade.alerts import alert
+            await alert(
+                level="warning" if state[0] == "distribution" or state[1] == "out_of_semis" else "info",
+                title=f"Tape change — {state[0]} day, {state[1].replace('_', ' ')}",
+                body=(f"was: {_last_pulse_state[0]} / {_last_pulse_state[1].replace('_', ' ')}. "
+                      f"{p.get('breadth_up_pct', 0):.0f}% of universe up, "
+                      f"avg {p.get('avg_change_pct', 0):+.1f}%. {p.get('semis_rotation_note', '')}"),
+            )
+        _last_pulse_state = state
+        logger.info("pulse monitor: %s / %s (%.0f%% up, avg %+.1f%%)",
+                    state[0], state[1], p.get("breadth_up_pct", 0),
+                    p.get("avg_change_pct", 0))
+    except Exception as e:
+        logger.exception("pulse monitor tick failed: %s", e)
 
 
 async def _run_pulse_dispatch_job() -> None:
