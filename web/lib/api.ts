@@ -461,6 +461,32 @@ export type ReportBrief = {
   generated_at: string;
 };
 
+export type PulseTheme = {
+  theme_id: string;
+  theme: string;
+  avg_change_pct: number;
+  n: number;
+  rotation_flagged: boolean;
+};
+
+export type IntradayPulse = {
+  as_of_et: string;
+  n_symbols_quoted: number;
+  breadth_up_pct: number;
+  avg_change_pct: number;
+  theme_dispersion_pct: number;
+  day_type: "accumulation" | "distribution" | "rotation" | "consolidation";
+  day_note: string;
+  status_0_10: number;
+  leaders: PulseTheme[];
+  laggards: PulseTheme[];
+  themes_rotation_flagged: string[];
+  narrative: string;
+  narrative_source: "agent" | "fallback";
+  themes: PulseTheme[];
+  generated_at: string;
+};
+
 export type MorningReport = {
   as_of: string;
   generated_at: string;
@@ -625,6 +651,7 @@ export const api = {
   report: {
     morning: (opts?: { refresh?: boolean }) =>
       jfetch<MorningReport>(`/api/report/morning${opts?.refresh ? "?refresh=true" : ""}`),
+    pulse: () => jfetch<IntradayPulse>("/api/report/pulse"),
   },
   research: {
     universeGraph: (limit = 100) =>

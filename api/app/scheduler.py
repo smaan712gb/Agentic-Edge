@@ -108,6 +108,12 @@ _MORNING_REPORT_JOB_ID = "morning_report_dispatch"
 # demand for the dashboard.
 _MORNING_REPORT_CRON = "45 8 * * 1-5"
 
+_PULSE_JOB_ID = "intraday_pulse_dispatch"
+# 10:30 ET — institutions typically finish opening repositioning by 10:00-10:30;
+# this is the first read of the day that isn't opening noise. The /api/report/
+# pulse endpoint serves it live all session with a 3-minute cache.
+_PULSE_CRON = "30 10 * * 1-5"
+
 _MISSED_RUN_JOB_ID = "missed_run_watchdog"
 # Every 30 min, 09:00-15:30 ET weekdays. Recovers the daily theme run if it was
 # missed (process down at 09:00, or scheduler enabled AFTER 09:00) — the gap
@@ -220,6 +226,13 @@ async def start_scheduler() -> None:
         _run_morning_report_job,
         trigger=CronTrigger.from_crontab(_MORNING_REPORT_CRON, timezone="America/New_York"),
         id=_MORNING_REPORT_JOB_ID, replace_existing=True,
+        misfire_grace_time=600, max_instances=1, coalesce=True,
+    )
+    # Intraday pulse — 10:30 ET day-type read pushed to the alert channel.
+    _SCHEDULER.add_job(
+        _run_pulse_dispatch_job,
+        trigger=CronTrigger.from_crontab(_PULSE_CRON, timezone="America/New_York"),
+        id=_PULSE_JOB_ID, replace_existing=True,
         misfire_grace_time=600, max_instances=1, coalesce=True,
     )
     # Missed-run watchdog — always-on safety net that recovers the daily theme
@@ -521,6 +534,28 @@ async def _run_morning_report_job() -> None:
         )
     except Exception as e:
         logger.exception("morning report dispatch failed: %s", e)
+
+
+async def _run_pulse_dispatch_job() -> None:
+    """10:30 ET: compute the intraday pulse and push the day-type call."""
+    try:
+        from .report.pulse import build_intraday_pulse
+        p = await build_intraday_pulse(refresh=True)
+        from .autotrade.alerts import alert
+        await alert(
+            level="info",
+            title=(f"10:30 read — {p['day_type']} day "
+                   f"({p['status_0_10']}/10)"),
+            body=(f"{p['breadth_up_pct']:.0f}% of universe up, avg "
+                  f"{p['avg_change_pct']:+.1f}%. "
+                  + (f"Leaders: "
+                     + ", ".join(t["theme"] for t in p.get("leaders", [])) + "."
+                     if p.get("leaders") else "")),
+        )
+        logger.info("intraday pulse dispatched: %s (%s/10)",
+                    p["day_type"], p["status_0_10"])
+    except Exception as e:
+        logger.exception("intraday pulse dispatch failed: %s", e)
 
 
 async def _run_stake_watch_job() -> None:

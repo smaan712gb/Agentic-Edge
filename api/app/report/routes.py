@@ -7,8 +7,19 @@ from typing import Any
 from fastapi import APIRouter, Query
 
 from .morning import build_morning_report
+from .pulse import build_intraday_pulse
 
 router = APIRouter()
+
+
+@router.get("/api/report/pulse")
+async def intraday_pulse(
+    refresh: bool = Query(False, description="bypass the 3-minute cache"),
+) -> dict[str, Any]:
+    """Live intraday market read: deterministic day-type classification
+    (accumulation / rotation / distribution / consolidation) from batch quotes
+    across the theme universe, plus a grounded plain-words narrative."""
+    return await build_intraday_pulse(refresh=refresh)
 
 
 @router.get("/api/report/morning")

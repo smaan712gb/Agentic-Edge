@@ -8,7 +8,8 @@ import {
 import { PageHeader } from "@/components/PageHeader";
 import { Stat } from "@/components/Stat";
 import {
-  api, type MorningReport, type ReportBrief, type ReportHolding, type ReportIdea,
+  api, type IntradayPulse, type MorningReport, type ReportBrief,
+  type ReportHolding, type ReportIdea,
 } from "@/lib/api";
 import { cn, fmtDateShort, fmtMoney, fmtMoneyDelta } from "@/lib/utils";
 
@@ -52,8 +53,11 @@ function isErr<T>(v: T[] | { error: string } | undefined | null): v is { error: 
   return !!v && !Array.isArray(v);
 }
 
+const PULSE_REFRESH_MS = 180_000;   // matches the endpoint's 3-minute cache
+
 export default function ReportPage() {
   const [report, setReport] = useState<MorningReport | null>(null);
+  const [pulse, setPulse] = useState<IntradayPulse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
 
@@ -70,9 +74,17 @@ export default function ReportPage() {
         if (alive) setError(String(e));
       }
     };
+    const tickPulse = async () => {
+      try {
+        const p = await api.report.pulse();
+        if (alive) setPulse(p);
+      } catch { /* pulse is additive — never break the page */ }
+    };
     tick();
+    tickPulse();
     const t = setInterval(tick, REFRESH_MS);
-    return () => { alive = false; clearInterval(t); };
+    const tp = setInterval(tickPulse, PULSE_REFRESH_MS);
+    return () => { alive = false; clearInterval(t); clearInterval(tp); };
   }, []);
 
   const ideas: ReportIdea[] = !report || isErr(report.top_ideas) ? [] : report.top_ideas;
@@ -147,6 +159,9 @@ export default function ReportPage() {
               </span>
             </div>
           )}
+
+          {/* Intraday pulse — the live day-type read */}
+          {pulse && <PulseCard pulse={pulse} />}
 
           {/* Plain-words brief + risk-appetite gauge */}
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
@@ -396,6 +411,74 @@ export default function ReportPage() {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+const DAY_TYPE_STYLE: Record<string, string> = {
+  accumulation: "border-[var(--color-up)]/40 text-[var(--color-up)]",
+  distribution: "border-[var(--color-down)]/40 text-[var(--color-down)]",
+  rotation: "border-yellow-500/40 text-yellow-500",
+  consolidation: "text-[var(--color-fg-muted)]",
+};
+
+function PulseCard({ pulse }: { pulse: IntradayPulse }) {
+  return (
+    <div className="glass p-5 mb-6">
+      <div className="flex items-center justify-between flex-wrap gap-2 mb-3">
+        <div className="flex items-center gap-2">
+          <span className="label-eyebrow">Intraday pulse · {pulse.as_of_et}</span>
+          <span className={cn("chip text-[10px] capitalize", DAY_TYPE_STYLE[pulse.day_type] ?? "")}>
+            {pulse.day_type} day
+          </span>
+          <span className="text-lg font-semibold tabular-nums">{pulse.status_0_10}/10</span>
+        </div>
+        <div className="text-xs text-[var(--color-fg-muted)] tabular-nums">
+          {pulse.breadth_up_pct.toFixed(0)}% of {pulse.n_symbols_quoted} names up ·
+          avg {pulse.avg_change_pct >= 0 ? "+" : ""}{pulse.avg_change_pct.toFixed(1)}%
+        </div>
+      </div>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="space-y-1">
+          {pulse.narrative.split("\n").filter((l) => l.trim()).map((l, i) =>
+            l.startsWith("## ") ? (
+              <div key={i} className="text-[10px] font-semibold uppercase tracking-wide text-[var(--color-accent)] pt-1.5 first:pt-0">
+                {l.slice(3)}
+              </div>
+            ) : (
+              <p key={i} className="text-sm leading-relaxed">{l}</p>
+            )
+          )}
+        </div>
+        <div className="space-y-1">
+          {pulse.themes.slice(0, 8).map((t) => (
+            <div key={t.theme_id} className="flex items-center gap-2 text-[11px]">
+              <span className="w-48 truncate text-[var(--color-fg-muted)]">
+                {t.theme}{t.rotation_flagged ? " ⚑" : ""}
+              </span>
+              <div className="flex-1 flex items-center">
+                <div className="w-1/2 flex justify-end">
+                  {t.avg_change_pct < 0 && (
+                    <div className="h-1.5 rounded-full bg-[var(--color-down)]"
+                      style={{ width: `${Math.min(50, Math.abs(t.avg_change_pct) * 12)}%` }} />
+                  )}
+                </div>
+                <div className="w-px h-3 bg-[var(--color-border)]" />
+                <div className="w-1/2">
+                  {t.avg_change_pct >= 0 && (
+                    <div className="h-1.5 rounded-full bg-[var(--color-up)]"
+                      style={{ width: `${Math.min(50, t.avg_change_pct * 12)}%` }} />
+                  )}
+                </div>
+              </div>
+              <span className={cn("tabular-nums w-12 text-right",
+                t.avg_change_pct >= 0 ? "text-[var(--color-up)]" : "text-[var(--color-down)]")}>
+                {t.avg_change_pct >= 0 ? "+" : ""}{t.avg_change_pct.toFixed(1)}%
+              </span>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
