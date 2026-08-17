@@ -315,13 +315,24 @@ class Settings(BaseSettings):
     # per-symbol attempts/intents within the window still de-dup, so widening it
     # does not cause re-entry churn.
     ENTRY_RUN_LOOKBACK_HOURS: int = 30
-    # A walking-limit order that ABANDONED (walked to its price cap unfilled —
-    # price discipline, not a thesis rejection) may be re-attempted with fresh
-    # pricing after this cooldown, up to the attempts cap below. Previously one
-    # unfilled midday walk burned the candidate for the whole lookback window
-    # (VRT + ANET, 2026-07-09 — both abandoned ~12:10 ET, never retried).
-    # Non-abandoned outcomes (filled, ineligible, error) still never retry.
-    ENTRY_ABANDON_RETRY_COOLDOWN_MIN: int = 120
+    # Wait before re-attempting a name whose walking-limit ABANDONED (walked to
+    # its price cap unfilled — price discipline, not a thesis rejection) or that
+    # probed INELIGIBLE. Other outcomes (filled, error) never retry.
+    #
+    # 0 = no cooldown: retry on the very next tick the name still qualifies.
+    # Set to 0 (2026-08-17) — a two-hour lockout on a name the scorer still
+    # ranks Buy is a restriction, not a safeguard, and it was compounding the
+    # entry drought: MU and SNDK probed ineligible at 09:32 on a threshold that
+    # has since been lowered, and could not be re-tried for the rest of the
+    # session even after the threshold moved.
+    #
+    # Retries are still naturally paced without it — the entry loop ticks every
+    # 60s and a LEAP entry walks for up to 180s, so a name re-attempts roughly
+    # every 4 minutes rather than continuously. The cost of a retry is one
+    # option-chain probe; raise this if that probe volume ever pressures the
+    # broker's market-data farm (the 10197 competing-session error is the
+    # symptom to watch).
+    ENTRY_ABANDON_RETRY_COOLDOWN_MIN: int = 0
     ENTRY_MAX_ORDER_ATTEMPTS_PER_DAY: Optional[int] = None   # None = retry a name as often as it re-qualifies
     # Correlation-aware sizing: a candidate highly correlated to the EXISTING
     # book adds concentration, not diversification — "you own 20 stocks but 5
