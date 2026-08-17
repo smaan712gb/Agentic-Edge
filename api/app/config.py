@@ -289,6 +289,59 @@ class Settings(BaseSettings):
     # composite) — tightens the existing signal, never forces a drawdown exit.
     ROTATION_EXIT_PRESSURE_DELTA: float = 25.0
 
+    # ----- Morning brief -> trading decisions -------------------------
+    # The brief was designed when execution was manual: the operator read it and
+    # traded. Now that entries are automated, its judgment has to reach the
+    # deciding agent or it is just a newsletter. Two things in it have no other
+    # source in the trading path:
+    #
+    #   posture   — a 0-100 risk-appetite dial built from the system's OWN
+    #               signals (theme health, rotation calm, buy breadth), capped
+    #               at 20 when the entry breaker is latched. The entry loop has
+    #               macro (VIX/SPX) and the intraday pulse, but nothing that
+    #               reads the health of its own signal set.
+    #   idea read — street consensus upside, 30-day analyst grade momentum, and
+    #               a deterministic institutional lean per candidate. No analyst
+    #               data reaches the trading path at all today.
+    #
+    # Both are bounded SIZING TILTS, never gates — consistent with the standing
+    # policy that eligibility stays loose and the walker protects the price.
+    # The brief is built once at 08:45 ET and PERSISTED; the loops read that
+    # stored row all day rather than rebuilding it (it makes provider calls).
+    MORNING_BRIEF_WIRED: bool = True
+    # Posture 50 = neutral = 1.0x. 100 -> 1+tilt, 0 -> 1-tilt.
+    MORNING_POSTURE_MAX_TILT: float = 0.25
+    # Per-symbol tilt from analyst upside + grade momentum + institutional lean.
+    MORNING_IDEA_MAX_TILT: float = 0.15
+    # The brief also computes a 0-100 PERFECT ENTRY SCORE per idea — EMA-stack
+    # alignment, pullback-vs-extended, volume contraction, pending breakout,
+    # minus penalties for distribution days and failed breakouts. Nothing in the
+    # trading path read it: the loop ranked purely on the research composite, so
+    # on 2026-08-17 it bought SNDK at "Entry 46/100 - not ready, extended 20%
+    # above the 8 EMA" while ETN sat unbought at "Entry 82/100 - pullback into
+    # the 8/21 EMA zone, buyable dip".
+    #
+    # Composite and entry score answer different questions and both matter:
+    # the composite says WHAT is worth owning, the entry score says WHETHER now
+    # is a sane moment to buy it. For a multi-year builder, paying up 20% above
+    # the 8 EMA is a worse sin than waiting a session.
+    #
+    # Wired two ways, neither a gate (a poor setup still gets bought, smaller
+    # and later — consistent with favouring attempting):
+    #   rank  — candidates ordered by a blend, so better setups are processed
+    #           first while the day's capacity is still free.
+    #   size  — bounded tilt: 50 neutral, 100 -> 1+tilt, 0 -> 1-tilt.
+    MORNING_ENTRY_SCORE_WIRED: bool = True
+    MORNING_ENTRY_SCORE_MAX_TILT: float = 0.20
+    # Share of the ranking blend given to the entry score (rest to the
+    # composite). 0.4 keeps thesis primary while letting timing break ties.
+    MORNING_ENTRY_RANK_WEIGHT: float = 0.4
+    # Freshness ceiling, same discipline as the rotation flags: a stale brief
+    # describes a market that has moved on. Older than this -> neutral 1.0, so
+    # a missed 08:45 run degrades to "no opinion" rather than yesterday's.
+    # 30h covers a normal overnight gap but never a weekend.
+    MORNING_BRIEF_MAX_AGE_HOURS: float = 30.0
+
     # ----- Quant Research Factory (decision-support, never a gate) -----
     # Point-in-time feature store + IC/alpha-decay research harness. The
     # nightly snapshot writes one feature row per theme symbol; the labeler

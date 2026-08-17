@@ -1063,6 +1063,14 @@ async def dispatch_morning_report() -> dict[str, Any]:
     """Build fresh and push the digest through the alert fan-out. Called by
     the 08:45 ET cron; safe to call ad hoc."""
     report = await build_morning_report(refresh=True)
+    # Persist the decision-relevant slice BEFORE alerting, so the entry loop can
+    # act on today's brief even if the alert fan-out fails. The brief makes
+    # provider calls and is built once; the loops read this stored row all day.
+    try:
+        from .brief_wiring import persist_brief_signals
+        await persist_brief_signals(report)
+    except Exception as e:  # noqa: BLE001 — a persist failure must not lose the brief
+        logger.warning("could not persist morning-brief signals for the loops: %s", e)
     from ..autotrade.alerts import alert
     await alert(
         level="info",

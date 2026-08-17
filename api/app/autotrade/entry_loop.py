@@ -545,6 +545,34 @@ async def _find_unprocessed_buys() -> list[tuple[str, str, str, float]]:
                 "auto-entry: collapsed multi-theme duplicates to one order each — %s",
                 ", ".join(f"{k}×{v}" for k, v in sorted(collapsed.items())),
             )
+
+        # Re-rank on thesis AND entry timing. Composite alone says what is worth
+        # owning but nothing about whether now is a sane moment to buy it, so
+        # the queue put "extended 20% above the 8 EMA, not ready" ahead of
+        # "pullback into the 8/21 EMA zone, buyable dip" (SNDK vs ETN,
+        # 2026-08-17). Order matters because the loop works the queue serially
+        # and the session is finite: better setups should be reached first.
+        #
+        # Not a filter — every candidate stays in the queue, only the order
+        # changes. Names the brief never scored keep their composite rank.
+        try:
+            from api.app.report.brief_wiring import blended_rank_key, entry_rank_map
+            escores = await entry_rank_map()
+            if escores:
+                w = float(get_settings().MORNING_ENTRY_RANK_WEIGHT)
+                before = [c[2] for c in candidates[:5]]
+                candidates.sort(
+                    key=lambda c: blended_rank_key(c[3], escores.get(c[2].upper()), w),
+                    reverse=True,
+                )
+                after = [c[2] for c in candidates[:5]]
+                if before != after:
+                    logger.info(
+                        "auto-entry: re-ranked on entry timing (weight %.0f%%) — "
+                        "top5 %s -> %s", w * 100, before, after)
+        except Exception as e:
+            logger.debug("auto-entry: entry-score ranking unavailable: %s", e)
+
         return candidates
 
 
@@ -914,6 +942,24 @@ async def _process_leaps_only(
 
     conviction_factor, conviction_meta = await _manager_conviction(symbol)
 
+    # Morning brief -> sizing. The 08:45 report was built for a human to read
+    # and trade from; with entries automated its judgment has to reach this
+    # decision or it is a newsletter the system ignores. Two bounded tilts, both
+    # fail-neutral (1.0) when the brief is missing, stale, or silent on this
+    # name — see report/brief_wiring.py for why only these two are wired.
+    posture_factor, brief_idea_factor, brief_meta = 1.0, 1.0, {}
+    if get_settings().MORNING_BRIEF_WIRED:
+        try:
+            from api.app.report.brief_wiring import brief_factors
+            posture_factor, brief_idea_factor, brief_meta = await brief_factors(symbol)
+            if posture_factor != 1.0 or brief_idea_factor != 1.0:
+                logger.info(
+                    "auto-entry: %s morning brief — posture %s (%s) x%.2f, idea read x%.2f",
+                    symbol, brief_meta.get("posture_score"), brief_meta.get("posture_label"),
+                    posture_factor, brief_idea_factor)
+        except Exception as e:
+            logger.debug("auto-entry: morning-brief factors unavailable for %s: %s", symbol, e)
+
     # Correlation-aware haircut: a candidate that moves with the existing book
     # adds concentration, not a new bet — size it DOWN (never block). Fail-open.
     corr_factor, avg_corr = 1.0, None
@@ -929,9 +975,16 @@ async def _process_leaps_only(
 
     nav = await _fetch_nav(ib)
     # Size on the LEAP's full per-share cost (×100 = per contract).
+    #
+    # sizing_factor stacks the DAMPENERS (macro regime, correlation haircut,
+    # portfolio posture) and is applied last inside _size_pmcc_contracts, after
+    # the absolute $ cap. conviction_factor carries the BOOSTS (smart money,
+    # brief idea read) and lifts the %-of-NAV target before that cap, so no
+    # combination of boosts can breach PMCC_MAX_DOLLARS.
     n_contracts = _size_pmcc_contracts(
         net_debit_per_spread=leap_px, nav=nav,
-        sizing_factor=sizing_factor * corr_factor, conviction_factor=conviction_factor)
+        sizing_factor=sizing_factor * corr_factor * posture_factor,
+        conviction_factor=conviction_factor * brief_idea_factor)
     if n_contracts <= 0:
         logger.info("auto-entry LEAPS: %s sized to 0 (macro=%s)", symbol, macro_regime)
         return False
