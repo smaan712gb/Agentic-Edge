@@ -316,6 +316,66 @@ def _latest_run_per_theme(
     return latest
 
 
+def build_entry_execution_config(
+    *, bid: Optional[float], ask: Optional[float], mid: float,
+) -> tuple[Any, dict[str, Any]]:
+    """(ExecutionConfig, audit_dict) derived from THIS contract's live quote.
+
+    Pure apart from reading Settings. Nothing here is a constant applied to
+    every order: a 0.4%-wide megacap LEAP and a 6%-wide small-cap LEAP need
+    different patience and different step sizes, and the previous fixed
+    180s/5c pair suited neither — it produced 13 abandons in 14 orders on
+    2026-08-17 because the algo simply ran out of budget before it could cross.
+
+    Adaptive terms, all keyed off the observed spread:
+      * timeout   — BASE + spread_pct x PER_SPREAD, clamped to MAX. A wide,
+                    illiquid contract is given proportionally longer to work.
+      * walk step — a fraction of the spread, floored at the exchange minimum
+                    tick. A flat 5c is a sane step on a $2 spread and 32
+                    pointless crawls on a $16 one.
+      * cap       — LEAP_ENTRY_CAP_PCT of the half-spread. At 1.0 that is the
+                    ask; the caller separately passes fair_value_ceiling = ask
+                    so the order can pay the offer but never through it.
+      * drift     — abandon-on-mid-drift disabled by default: once the entry is
+                    decided, the name moving while we queue is not a reason to
+                    cancel.
+    """
+    from tradingagents.strategies.execution import ExecutionConfig
+    s = get_settings()
+
+    spread = 0.0
+    if bid and ask and ask > 0 and bid > 0 and ask >= bid:
+        spread = float(ask) - float(bid)
+    spread_pct = (spread / mid) if (mid and mid > 0 and spread > 0) else 0.0
+
+    timeout = min(
+        float(s.LEAP_ENTRY_TIMEOUT_MAX_SEC),
+        float(s.LEAP_ENTRY_TIMEOUT_BASE_SEC)
+        + spread_pct * float(s.LEAP_ENTRY_TIMEOUT_PER_SPREAD_SEC),
+    )
+    step_cents = max(
+        int(s.LEAP_ENTRY_MIN_STEP_CENTS),
+        int(round(spread * float(s.LEAP_ENTRY_STEP_PCT_OF_SPREAD) * 100)),
+    )
+    cfg = ExecutionConfig(
+        initial_offset_cents=step_cents,
+        walk_increment_cents=step_cents,
+        walk_interval_sec=float(s.LEAP_ENTRY_WALK_INTERVAL_SEC),
+        max_offset_pct_of_spread=float(s.LEAP_ENTRY_CAP_PCT),
+        timeout_sec=timeout,
+        abandon_on_mid_drift_pct=s.LEAP_ENTRY_MID_DRIFT_ABANDON_PCT,
+    )
+    audit = {
+        "bid": bid, "ask": ask, "mid": mid,
+        "spread": round(spread, 4), "spread_pct": round(spread_pct, 5),
+        "timeout_sec": round(timeout, 1), "step_cents": step_cents,
+        "cap_pct_of_half_spread": float(s.LEAP_ENTRY_CAP_PCT),
+        "priority": s.LEAP_ENTRY_ADAPTIVE_PRIORITY,
+        "drift_abandon_pct": s.LEAP_ENTRY_MID_DRIFT_ABANDON_PCT,
+    }
+    return cfg, audit
+
+
 def _one_order_per_symbol(
     rows: list[tuple[str, str, float]],
     run_to_theme: dict[str, str],
@@ -960,17 +1020,29 @@ async def _process_leaps_only(
                      f"@ ~${leap_px:.2f} (LEAPS-only, long calls)")
 
     fvc = cand.leap.ask if (cand.leap.ask and cand.leap.ask > 0) else round(leap_px * 1.05, 2)
-    # Institutional execution: IBKR Adaptive algo works the order toward mid,
-    # capped near mid (LEAP_ENTRY_CAP_PCT of the half-spread) so we get price
-    # improvement without paying through the cap. Disciplined — abandons if the
-    # market won't come to us, rather than crossing the full spread.
+    # The DECISION is already made by the time we get here. Execution is the
+    # algo's job, and the spread is a cost of the position rather than a veto on
+    # it — on a multi-year hold half a spread paid once is amortised away, while
+    # abandoning leaves no position at all.
+    #
+    # Every parameter is derived from THIS contract's live quote (see
+    # build_entry_execution_config); none is a fixed constant. The old inline
+    # 5c/5c/180s produced 13 abandons in 14 orders on 2026-08-17 by giving a
+    # wide, illiquid LEAP the same budget as a tight megacap one.
     _s = get_settings()
-    exec_cfg = ExecutionConfig(initial_offset_cents=5, walk_increment_cents=5,
-                               walk_interval_sec=5,
-                               # 180s (was 120): the Adaptive algo works toward
-                               # mid over minutes; a short budget made us abandon
-                               # before the fill landed (then reconcile caught it).
-                               max_offset_pct_of_spread=_s.LEAP_ENTRY_CAP_PCT, timeout_sec=180)
+    exec_cfg, _exec_audit = build_entry_execution_config(
+        bid=getattr(cand.leap, "bid", None),
+        ask=getattr(cand.leap, "ask", None),
+        mid=leap_px,
+    )
+    logger.info(
+        "auto-entry LEAPS: %s execution plan — spread %.2f (%.2f%%), cap %.0f%% of "
+        "half-spread, step %dc, timeout %.0fs, priority=%s",
+        symbol, _exec_audit["spread"], _exec_audit["spread_pct"] * 100,
+        _exec_audit["cap_pct_of_half_spread"] * 100, _exec_audit["step_cents"],
+        _exec_audit["timeout_sec"], _exec_audit["priority"],
+    )
+    walking_cfg["execution_plan"] = _exec_audit
     try:
         result = await submit_single_leg_option(
             ibkr=ib, conid=cand.leap.conid, contracts=n_contracts,
@@ -1405,8 +1477,18 @@ def _size_pmcc_contracts(
     # exceeded even when conviction × quant both boost.
     target = min(nav * PMCC_TARGET_PCT_NAV * max(conviction_factor, 1.0) * max(quant_factor, 0.0),
                  PMCC_MAX_DOLLARS) * sizing_factor
-    n = int(target / (net_debit_per_spread * 100))
-    return max(1, n)
+    # Round to NEAREST, not down. Truncating cost expensive contracts up to a
+    # full position: MU at $51,400/contract against a $96,201 target is 1.87
+    # contracts, and int() made that 1 — 3.7% of NAV against a 7% target, a 47%
+    # shortfall that never surfaced as an error. The dearer the contract the
+    # worse it got, so the truncation bit hardest on exactly the high-conviction
+    # names it should size up.
+    #
+    # This is a long-term book, so landing slightly above target on a multi-year
+    # hold is preferable to systematically under-deploying it. floor(x + 0.5)
+    # rather than round(), which is banker's rounding and would send 2.5 -> 2.
+    raw = target / (net_debit_per_spread * 100)
+    return max(1, int(raw + 0.5))
 
 
 async def _try_stock_fallback(

@@ -150,8 +150,59 @@ class Settings(BaseSettings):
     # GLW got $0.58 of room on a $90.92 mid, STX $2.24 on $505.45. 0.50 matches
     # what the sell-to-close path already uses and is still under half the
     # spread; the walker still abandons rather than paying through it.
-    LEAP_ENTRY_CAP_PCT: float = 0.50
-    LEAP_ENTRY_ADAPTIVE_PRIORITY: str = "Normal"
+    #
+    # 0.50 was STILL not enough: MU abandoned at cap $548.09 against a $544.17
+    # mid — $3.92 of room, 0.72% of premium — because the cap is a fraction of
+    # the HALF-spread, so on a ~2.9%-wide LEAP, half of half is under 1%. 13 of
+    # 14 orders abandoned unfilled across the 2026-08-17 session.
+    #
+    # 1.0 = willing to pay up to the far touch (mid + a full half-spread = the
+    # ask). This IS a real recurring cost — roughly half the spread per entry —
+    # and it is the price of actually building the book instead of papering the
+    # tape with orders that never fill. Two things still bound it: the Adaptive
+    # algo works toward mid first and only pays up if it must, and
+    # submit_single_leg_option passes fair_value_ceiling = the ask, so it can
+    # never pay THROUGH the offer.
+    #
+    # Lower back toward 0.5 once fills are landing, to recover the spread.
+    LEAP_ENTRY_CAP_PCT: float = 1.0
+    # Once the system has DECIDED to enter, execution is the algo's job and the
+    # spread is a COST OF THE POSITION, not a reason to walk away. This is a
+    # multi-year book: half a spread paid once is amortised over the whole hold,
+    # while an abandoned order means no position at all. 13 of 14 orders on
+    # 2026-08-17 abandoned over spread width — the expensive outcome was not the
+    # spread, it was the empty book.
+    #
+    # 'Urgent' lets IBKR's Adaptive algo cross promptly instead of working
+    # patiently toward mid and expiring unfilled. Combined with a cap of 1.0
+    # (mid + a full half-spread = the ask) and fair_value_ceiling = the ask, the
+    # order pays the offer if it must but can never pay THROUGH it.
+    LEAP_ENTRY_ADAPTIVE_PRIORITY: str = "Urgent"
+    # Abandon if the mid drifts this far from where it sat at construction.
+    # None = never — a decided entry should not be cancelled because the name
+    # moved while we were queuing for it. (ExecutionConfig defaults this to
+    # 0.05, a second abandon trigger the entry path never set explicitly.)
+    LEAP_ENTRY_MID_DRIFT_ABANDON_PCT: Optional[float] = None
+
+    # ----- Adaptive entry execution timing ----------------------------
+    # Nothing here is a fixed constant applied to every contract: the values are
+    # DERIVED per order from the live quote, because a 0.4%-wide megacap LEAP
+    # and a 6%-wide small-cap LEAP need different patience and different step
+    # sizes. A single hardcoded 180s / 5c pair suited neither.
+    #
+    # timeout = BASE + spread_pct x PER_SPREAD, clamped to MAX.
+    #   0.5% spread -> 120 + 15  = 135s
+    #   3.0% spread -> 120 + 90  = 210s
+    #   8.0% spread -> 120 + 240 = 360s
+    LEAP_ENTRY_TIMEOUT_BASE_SEC: float = 120.0
+    LEAP_ENTRY_TIMEOUT_PER_SPREAD_SEC: float = 3000.0
+    LEAP_ENTRY_TIMEOUT_MAX_SEC: float = 600.0
+    # Walk step as a fraction of the spread rather than a fixed 5c: on a $2
+    # spread 5c is a reasonable step, on a $16 spread it is 32 no-op crawls.
+    # Floored at the 5c exchange minimum tick for options over $3.
+    LEAP_ENTRY_STEP_PCT_OF_SPREAD: float = 0.10
+    LEAP_ENTRY_MIN_STEP_CENTS: int = 5
+    LEAP_ENTRY_WALK_INTERVAL_SEC: float = 5.0
 
     # ----- Manager conviction → entry sizing tilt ---------------------
     # Names that tracked legendary investors hold (cross-fund confirmed) get

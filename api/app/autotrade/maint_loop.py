@@ -482,6 +482,27 @@ async def _adopt_orphan_leaps(ibkr_positions: list[dict]) -> int:
         )).all()
         owned_syms = {(r[0] or "").upper() for r in owned_rows}
         owned_conids = {int((cfg or {}).get("leap_conid") or 0) for _sym, cfg in owned_rows}
+
+        # ALSO claim conids referenced by intents in a NON-active state. An
+        # abandoned/error intent whose contract is actually held is not an
+        # orphan — _reconcile_orphan_pmcc_intents flips exactly those back to
+        # 'filled' once it sees the conid in the account.
+        #
+        # Without this the two recovery paths race and both win (NBIS,
+        # 2026-08-17): the walker never wrote its outcome, the stuck-intent
+        # watchdog marked the intent abandoned at ~10 min, which removed it from
+        # the active filter above; the adopter then saw a live position with no
+        # active intent and created a SECOND intent for it; the reconciler later
+        # flipped the first back to filled. Both ended up 'filled' on the same 5
+        # contracts, so an exit would have tried to sell 10 against a 5-lot.
+        claimed_rows = (await s.execute(
+            select(TradeIntent.walking_config)
+            .where(TradeIntent.status.notin_(["closed"]))
+        )).all()
+        for (cfg,) in claimed_rows:
+            cid = int((cfg or {}).get("leap_conid") or 0)
+            if cid:
+                owned_conids.add(cid)
         theme_syms = {
             (r[0] or "").upper() for r in (await s.execute(
                 select(ThemeSymbol.symbol).where(ThemeSymbol.symbol.in_(syms)))).all() if r[0]

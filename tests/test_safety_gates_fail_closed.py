@@ -233,3 +233,75 @@ def test_manual_exit_endpoint_handles_the_production_structure():
     src = inspect.getsource(admin.manual_exit_position)
     assert 'structure == "leap_only"' in src
     assert "operator=True" in src
+
+
+# ---------------------------------------------------------------------------
+# Entry execution: decided orders execute, and nothing is hardcoded
+# ---------------------------------------------------------------------------
+
+
+def test_execution_params_scale_with_the_spread():
+    """A wide illiquid LEAP and a tight megacap must not get the same budget.
+
+    The old path pinned initial_offset=5c, increment=5c, timeout=180s inline for
+    every contract. On 2026-08-17 that produced 13 abandons in 14 orders: 5c is
+    a sane step on a $2 spread and 32 pointless crawls on a $16 one, and 180s
+    ran out before the algo could cross a wide market.
+    """
+    from api.app.autotrade.entry_loop import build_entry_execution_config
+
+    tight_cfg, tight = build_entry_execution_config(bid=99.8, ask=100.2, mid=100.0)
+    wide_cfg, wide = build_entry_execution_config(bid=87.0, ask=92.2, mid=89.6)
+
+    assert wide["spread_pct"] > tight["spread_pct"]
+    assert wide_cfg.timeout_sec > tight_cfg.timeout_sec, "wider spread needs more time"
+    assert wide_cfg.walk_increment_cents > tight_cfg.walk_increment_cents
+
+
+def test_step_never_below_the_exchange_minimum_tick():
+    """Options over $3 have a 5c minimum tick — a smaller step is a no-op walk."""
+    from api.app.autotrade.entry_loop import build_entry_execution_config
+
+    cfg, _ = build_entry_execution_config(bid=99.99, ask=100.01, mid=100.0)
+    assert cfg.initial_offset_cents >= 5
+    assert cfg.walk_increment_cents >= 5
+
+
+def test_timeout_is_clamped():
+    """An absurd spread must not produce an unbounded working order."""
+    from api.app.config import get_settings
+    from api.app.autotrade.entry_loop import build_entry_execution_config
+
+    cfg, _ = build_entry_execution_config(bid=1.0, ask=99.0, mid=50.0)
+    assert cfg.timeout_sec <= float(get_settings().LEAP_ENTRY_TIMEOUT_MAX_SEC)
+
+
+def test_a_decided_entry_is_not_abandoned_on_spread_or_drift():
+    """Once the decision is made, execution is the algo's job.
+
+    The spread is a cost of the position, not a veto on it — on a multi-year
+    hold half a spread paid once amortises away, while abandoning leaves no
+    position at all. Two abandon triggers had to go: the fractional-spread cap
+    (now the full half-spread, i.e. the ask) and abandon-on-mid-drift, which
+    ExecutionConfig defaults to 0.05 and the entry path never set.
+    """
+    from api.app.config import get_settings
+    from api.app.autotrade.entry_loop import build_entry_execution_config
+
+    s = get_settings()
+    cfg, audit = build_entry_execution_config(bid=509.0, ask=525.0, mid=517.0)
+
+    assert cfg.max_offset_pct_of_spread >= 1.0, "must be willing to pay the offer"
+    assert cfg.abandon_on_mid_drift_pct is None, "a decided entry must not cancel on drift"
+    assert s.LEAP_ENTRY_ADAPTIVE_PRIORITY == "Urgent"
+    # The cap resolves to exactly the ask — pays the offer, never through it.
+    assert audit["mid"] + (audit["ask"] - audit["bid"]) / 2 == 525.0
+
+
+def test_missing_quote_degrades_to_a_sane_plan():
+    """No bid/ask (after hours) must still produce a usable config, not a crash."""
+    from api.app.autotrade.entry_loop import build_entry_execution_config
+
+    cfg, audit = build_entry_execution_config(bid=None, ask=None, mid=100.0)
+    assert audit["spread_pct"] == 0.0
+    assert cfg.timeout_sec > 0 and cfg.walk_increment_cents >= 5
