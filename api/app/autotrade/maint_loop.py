@@ -115,12 +115,31 @@ async def _tick() -> None:
     except Exception as e:
         logger.warning("maint loop: stuck-run watchdog failed: %s", e)
 
-    if not settings.AUTOTRADE_ENABLED:
-        return
-    async with db_session() as s:
-        state = await s.get(SystemState, 1)
-        if state is None or not state.autotrade_enabled:
-            return
+    # KILL SWITCH = "place no orders", NOT "stop watching the book".
+    #
+    # This used to `return` here, which silently disabled the ENTIRE exit layer:
+    # no orphan adoption, no exit-pressure scoring, no 8-K/thesis-break
+    # detection, no phantom reconcile — while `start-all.ps1 disarm` advertises
+    # itself as "emergency: pause entries" and circuit_breaker's docstring
+    # promises "the maintenance/exit loop is unaffected". Disarming during an
+    # incident therefore blinded position management at the worst moment.
+    #
+    # Safe to continue instead: EVERY order-placing path in this module already
+    # re-checks `_autotrade_active()` independently — _execute_off_theme_close,
+    # _execute_stock_exit, _execute_stock_trim, _flag_pmcc_close (downgrades
+    # auto-execute to flag+alert), _execute_auto_short_call_close/_roll, and
+    # _execute_auto_leap_forward_roll. With the switch off the loop observes,
+    # adopts, scores and ALERTS, but cannot trade.
+    trading_enabled = bool(settings.AUTOTRADE_ENABLED)
+    if trading_enabled:
+        async with db_session() as s:
+            state = await s.get(SystemState, 1)
+            trading_enabled = bool(state is not None and state.autotrade_enabled)
+    if not trading_enabled:
+        logger.info(
+            "maint loop: kill switch OFF — running in OBSERVE-ONLY mode "
+            "(positions still monitored, exits flagged + alerted, no orders placed)"
+        )
 
     # RTH only — no maintenance actions outside US trading hours.
     if gate_rth() is not None:
@@ -2024,7 +2043,8 @@ async def _execute_stock_exit(*, intent: TradeIntent, qty: float, reason: str, e
 
 async def _flag_pmcc_close(*, intent: TradeIntent, reason: str, kind: str,
                            auto_execute: Optional[bool] = None,
-                           close_qty: Optional[int] = None) -> None:
+                           close_qty: Optional[int] = None,
+                           operator: bool = False) -> None:
     """Close a LEAP: SELL-TO-CLOSE the long call outright, walked toward the bid
     through the single-leg executor.
 
@@ -2052,7 +2072,15 @@ async def _flag_pmcc_close(*, intent: TradeIntent, reason: str, kind: str,
 
     # Re-check the kill switch immediately before an AUTO close/trim so a
     # mid-tick disable halts within one order. Flag-only still records/alerts.
-    if auto_execute and not await _autotrade_active():
+    #
+    # `operator=True` bypasses this: the kill switch exists to stop AUTONOMOUS
+    # trading, and an authenticated operator pressing "close this position" is
+    # the opposite of autonomous. Downgrading it to a flag would mean the manual
+    # exit silently does nothing precisely when the switch is off — i.e. during
+    # the incident you disarmed for. Same reasoning for the daily close cap below.
+    if operator:
+        auto_execute = True
+    elif auto_execute and not await _autotrade_active():
         logger.info("maint: kill switch active — flagging instead of auto-closing %s", intent.symbol)
         auto_execute = False
 
@@ -2137,7 +2165,7 @@ async def _flag_pmcc_close(*, intent: TradeIntent, reason: str, kind: str,
         )
         return
 
-    if await _maintenance_cap_hit("close"):
+    if not operator and await _maintenance_cap_hit("close"):
         await alert(level="warning",
                     title=f"LEAP close skipped (daily cap): {intent.symbol}",
                     body=reason)
@@ -3045,8 +3073,14 @@ async def _execute_stock_trim(
 
 
 async def _maintenance_cap_hit(kind: str) -> bool:
-    """True if today's count of `kind` actions has hit the daily cap."""
-    from api.app.autotrade.auto_gate import DEFAULT_CAPS
+    """True if today's count of `kind` actions has hit the daily cap.
+
+    A ``None`` cap means NO LIMIT and returns False immediately, skipping the
+    COUNT query. Both maintenance caps are uncapped as of 2026-08-17: they
+    throttled risk REDUCTION, so with entries unlimited an 8-close ceiling
+    would strand positions the exit logic had already decided to close.
+    """
+    from api.app.autotrade.auto_gate import DEFAULT_CAPS, _capped
     from sqlalchemy import func, or_
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     if kind == "close":
@@ -3056,11 +3090,13 @@ async def _maintenance_cap_hit(kind: str) -> bool:
             AutoAction.action_type == "pmcc_close_filled",
             AutoAction.action_type == "leap_trim_filled",
         )
-        cap = DEFAULT_CAPS["AUTO_MAX_CLOSES_PER_DAY"]
+        cap = _capped(DEFAULT_CAPS, "AUTO_MAX_CLOSES_PER_DAY")
     elif kind == "roll":
         action_filter = AutoAction.action_type.like("pmcc_roll_filled")
-        cap = DEFAULT_CAPS["AUTO_MAX_ROLLS_PER_DAY"]
+        cap = _capped(DEFAULT_CAPS, "AUTO_MAX_ROLLS_PER_DAY")
     else:
+        return False
+    if cap is None:
         return False
     async with db_session() as s:
         n = (

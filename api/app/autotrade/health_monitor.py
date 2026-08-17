@@ -48,6 +48,16 @@ _STUCK_SUBMIT_MIN = 10          # 'submitting' longer than this is wedged
 _SIGNAL_STALE_HOURS = 36        # newest done run older than this = stale
 _MARGIN_WARN_BUFFER = 0.05      # warn this far ABOVE the breaker's hard floor
 
+# Process start. The maint-loop liveness check compares against the newest
+# heartbeat IN THE DB, which after a restart still belongs to the previous run —
+# so a healthy boot pages CRITICAL ("heartbeat 10083 min old") ~8 seconds in,
+# before the loop's first tick has had any chance to write one. Crying wolf on
+# every start is what trains an operator to scroll past the alert that matters;
+# this system already lost 78h of exit coverage inside that noise.
+_BOOT_TS = datetime.now(timezone.utc)
+# Maint loop sleeps 15s then ticks every 300s, so give it two full cycles.
+_BOOT_GRACE_MIN = 11.0
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -231,12 +241,70 @@ async def run_health_check() -> dict[str, Any]:
                 ).scalar_one_or_none()
             age_min = None if last_hb is None else (_utcnow() - _aware(last_hb)).total_seconds() / 60.0
             metrics["maint_heartbeat_age_min"] = None if age_min is None else round(age_min, 1)
-            if age_min is None or age_min > 15.0:
+            uptime_min = (_utcnow() - _BOOT_TS).total_seconds() / 60.0
+            metrics["uptime_min"] = round(uptime_min, 1)
+            if uptime_min < _BOOT_GRACE_MIN:
+                # Still inside the boot window — the newest heartbeat is the
+                # PREVIOUS process's, which says nothing about this one.
+                metrics["maint_liveness"] = f"grace ({uptime_min:.1f}/{_BOOT_GRACE_MIN:.0f} min)"
+            elif age_min is None or age_min > 15.0:
                 add("critical", "Maintenance loop appears STALLED",
                     f"newest maint heartbeat is {('never' if age_min is None else f'{age_min:.0f} min')} old "
                     f"(expect ≤5 min during RTH) — exits may not be firing. Check the loop/supervisor.")
     except Exception as e:
         add("warning", "Maint-loop liveness check failed", str(e))
+
+    # --- 5c. Rotation-detector freshness --------------------------------
+    # The entry/exit loops ignore rotation flags older than ROTATION_MAX_AGE_HOURS
+    # (stale flags describe a market that no longer exists). That fail-open is
+    # correct, but it means a sweep that has stopped running leaves the book with
+    # NO rotation protection at all — and nothing else would say so. The sweep
+    # itself takes ~80 min per pass, so a single failure is easy to miss.
+    try:
+        from ..db import ThemeRotation
+        async with db_session() as s:
+            newest = (
+                await s.execute(select(func.max(ThemeRotation.computed_at)))
+            ).scalar_one_or_none()
+        max_age_h = float(getattr(settings, "ROTATION_MAX_AGE_HOURS", 6.0))
+        rot_age_h = None if newest is None else (
+            (_utcnow() - _aware(newest)).total_seconds() / 3600.0)
+        metrics["rotation_age_h"] = None if rot_age_h is None else round(rot_age_h, 1)
+        if rot_age_h is None:
+            add("warning", "Rotation detector has never run",
+                "No theme_rotation rows exist — new entries are NOT rotation-gated.")
+        elif rot_age_h > max_age_h:
+            add("warning", "Rotation signals are STALE — book is un-gated",
+                f"Newest rotation state is {rot_age_h:.1f}h old (ignored above "
+                f"{max_age_h:.0f}h). Entries are proceeding with NO rotation "
+                f"protection and exits get no rotation pressure. Check the sweep.")
+    except Exception as e:
+        add("warning", "Rotation freshness check failed", str(e))
+
+    # --- 5d. Macro volatility guardrail is actually reading ---------------
+    # A blind macro read classifies as 'calm' -> sizing x1.0, which looks
+    # identical to a genuinely quiet tape. If the guardrail is inert, that must
+    # be stated, not inferred.
+    try:
+        async with db_session() as s:
+            row = (
+                await s.execute(
+                    select(AutoAction.payload)
+                    .where(AutoAction.action_type.like("macro_regime_%"))
+                    .order_by(AutoAction.timestamp.desc()).limit(1)
+                )
+            ).scalar_one_or_none()
+        if isinstance(row, dict):
+            blind = row.get("vix") is None and row.get("spx_change_pct") is None
+            metrics["macro_vix"] = row.get("vix")
+            metrics["macro_blind"] = blind
+            if blind:
+                add("critical", "Macro volatility guardrail is BLIND",
+                    "No VIX and no SPX from broker or fallback — regime defaults "
+                    "to 'calm' (sizing x1.0), so elevated/defensive/panic can "
+                    "never fire and entries size full into any tape.")
+    except Exception as e:
+        add("warning", "Macro-guardrail check failed", str(e))
 
     # --- 6. Signal freshness --------------------------------------------
     try:

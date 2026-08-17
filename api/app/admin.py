@@ -311,6 +311,35 @@ async def manual_exit_position(
             )
         return {"ok": True, "intent_id": intent_id, "action": "stock_exit_submitted"}
 
+    if structure == "leap_only":
+        # LEAPS-only is the PRODUCTION structure, and this endpoint used to fall
+        # through to the 400 below for it — so every flag-only exit alert
+        # ("close via /api/admin/positions/exit/{id} if you agree") pointed the
+        # operator at a route that rejected the entire live book. Sell-to-close
+        # the long call through the same walker the maintenance loop uses.
+        from .positions import _ibkr
+        from .autotrade.maint_loop import _flag_pmcc_close
+        try:
+            await _ibkr()
+        except Exception as e:
+            raise HTTPException(503, f"IBKR not reachable: {e}")
+        async with db_session() as s:
+            i = await s.get(TradeIntent, intent_id)
+            if i is None:
+                raise HTTPException(404, "intent not found")
+            # operator=True: this IS the explicit confirmation, so it bypasses
+            # the kill-switch downgrade and the daily close cap — both of which
+            # govern AUTONOMOUS exits, not a human pressing the button.
+            await _flag_pmcc_close(
+                intent=i, reason="operator manual close", kind="operator",
+                auto_execute=True, operator=True,
+            )
+        async with db_session() as s:
+            i = await s.get(TradeIntent, intent_id)
+            return {"ok": True, "intent_id": intent_id, "action": "leap_close_submitted",
+                    "status": i.status if i else None,
+                    "position_state": i.position_state if i else None}
+
     if structure in ("pmcc", "pmcc_sequenced"):
         from .positions import _ibkr
         from tradingagents.strategies.execution import (
@@ -443,7 +472,13 @@ async def list_managed_positions(
             await s.execute(
                 select(TradeIntent)
                 .where(TradeIntent.status.in_(["filled", "submitted"]))
-                .where(TradeIntent.position_state.in_(["pmcc_full", "leap_pending"]))
+                # Must match the maintenance loop's active-state set. 'leap_open'
+                # (the filled bare-LEAP state, i.e. the entire LEAPS-only book)
+                # and 'leap_open_naked'/'closing' were missing, so the kill-switch
+                # UI rendered an EMPTY position list on a fully-invested account —
+                # the worst possible time to believe you hold nothing.
+                .where(TradeIntent.position_state.in_(
+                    ["pmcc_full", "leap_pending", "leap_open", "leap_open_naked", "closing"]))
                 .order_by(TradeIntent.created_at.desc())
             )
         ).scalars().all()

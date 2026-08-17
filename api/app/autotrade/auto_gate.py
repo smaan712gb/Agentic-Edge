@@ -40,23 +40,53 @@ logger = logging.getLogger(__name__)
 # Daily caps — overridable via Settings.
 # ---------------------------------------------------------------------------
 
+# ``None`` means NO LIMIT — every check below skips when its cap is None.
+#
+# UNCAPPED DEPLOYMENT (operator decision, 2026-08-17). The entry-side throughput
+# and capital caps are off by instruction. Note what this does NOT remove: the
+# dual kill switch, the entry circuit breaker, macro/rotation/tape/sector gates,
+# and NAV fail-closed sizing all still apply. What it does remove is any bound
+# on how many entries are placed, how fast, or how much premium is deployed.
+#
+# For a long-call book premium paid IS max loss, and long options are fully paid
+# so no margin call can interrupt it. Buying power is not a substitute limit:
+# IBKR reports ~4x NAV of Reg-T buying power, which is stock-margin capacity and
+# cannot be spent on premium at all.
 DEFAULT_CAPS = {
-    "AUTO_MAX_TRADES_PER_DAY":           50,
-    # Operator wants aggressive deployment of buying power: 12 entries/day,
-    # 80% of NAV deployable. PMCCs are defined-risk so the buying-power
-    # consumption is bounded by net debit, not gross notional.
-    "AUTO_MAX_NEW_ENTRIES_PER_DAY":      12,
-    "AUTO_MAX_CAPITAL_DEPLOYED_PER_DAY": 0.80,
-    # Maintenance-loop caps: hard upper bound on rolls/closes per day.
-    # Roll debits also capped as a fraction of NAV so a defensive day
-    # doesn't burn through equity defending challenged shorts.
-    "AUTO_MAX_ROLLS_PER_DAY":            8,
-    "AUTO_MAX_CLOSES_PER_DAY":           8,
-    "AUTO_MAX_ROLL_DEBITS_PER_DAY":      0.02,
-    "AUTO_PER_SYMBOL_ACTIONS_PER_DAY":   3,    # bumped: entry + roll + close possible
-    "AUTO_MIN_INTERVAL_BETWEEN_ACTIONS": 5,
+    "AUTO_MAX_TRADES_PER_DAY":           None,
+    "AUTO_MAX_NEW_ENTRIES_PER_DAY":      None,
+    "AUTO_MAX_CAPITAL_DEPLOYED_PER_DAY": None,
+    # Maintenance-loop caps — also uncapped (2026-08-17), and for a different
+    # reason than the entry caps above: these limit RISK REDUCTION.
+    #
+    # A close cap is a restriction working against the operator. With entries
+    # now unlimited the asymmetry became untenable: the book could open any
+    # number of positions in a day but auto-close only 8, so a rotation or
+    # thesis break hitting a dozen names would leave four of them unmanaged
+    # until the next session. Removing these strictly increases the system's
+    # ability to cut exposure, which is the opposite trade-off from uncapping
+    # entries.
+    "AUTO_MAX_ROLLS_PER_DAY":            None,
+    "AUTO_MAX_CLOSES_PER_DAY":           None,
+    "AUTO_MAX_ROLL_DEBITS_PER_DAY":      None,
+    "AUTO_PER_SYMBOL_ACTIONS_PER_DAY":   None,
+    "AUTO_MIN_INTERVAL_BETWEEN_ACTIONS": None,
+    # NOT part of the uncapping — this is the automation-error breaker, not a
+    # trading limit. It still trips the kill switch on 3 consecutive system
+    # errors so a malfunctioning loop can't run unattended.
     "AUTO_CIRCUIT_BREAKER_FAIL_COUNT":   3,
 }
+
+
+def _capped(caps: dict[str, Any], key: str) -> Optional[float]:
+    """Return the numeric cap for ``key``, or None when it is unlimited.
+
+    Centralises the "None means no limit" contract so a missing key and an
+    explicitly-uncapped one behave identically, and so no call site has to
+    remember the check.
+    """
+    v = caps.get(key)
+    return None if v is None else float(v)
 
 
 @dataclass
@@ -150,6 +180,9 @@ async def _gate_strategy_budget(
     """
     caps = caps or DEFAULT_CAPS
     start, now = _today_window()
+    _max_entries = _capped(caps, "AUTO_MAX_NEW_ENTRIES_PER_DAY")
+    _max_sym = _capped(caps, "AUTO_PER_SYMBOL_ACTIONS_PER_DAY")
+    _min_iv_cap = _capped(caps, "AUTO_MIN_INTERVAL_BETWEEN_ACTIONS")
 
     # Count passed actions today, but exclude *informational* rows that
     # don't represent trade attempts. Maintenance loops emit alerts,
@@ -194,13 +227,14 @@ async def _gate_strategy_budget(
             )
         )
     ).scalar_one()
-    if passed_today >= caps["AUTO_MAX_TRADES_PER_DAY"]:
+    _max_trades = _capped(caps, "AUTO_MAX_TRADES_PER_DAY")
+    if _max_trades is not None and passed_today >= _max_trades:
         return GateFailure(
             "strategy_budget",
-            f"daily trade cap hit ({passed_today}/{caps['AUTO_MAX_TRADES_PER_DAY']})",
+            f"daily trade cap hit ({passed_today}/{_max_trades:.0f})",
         )
 
-    if is_new_entry:
+    if is_new_entry and _max_entries is not None:
         new_entries_today = (
             await session.execute(
                 _exclude_bookkeeping(
@@ -212,13 +246,13 @@ async def _gate_strategy_budget(
                 )
             )
         ).scalar_one()
-        if new_entries_today >= caps["AUTO_MAX_NEW_ENTRIES_PER_DAY"]:
+        if _max_entries is not None and new_entries_today >= _max_entries:
             return GateFailure(
                 "strategy_budget",
-                f"daily new-entry cap hit ({new_entries_today}/{caps['AUTO_MAX_NEW_ENTRIES_PER_DAY']})",
+                f"daily new-entry cap hit ({new_entries_today}/{_max_entries:.0f})",
             )
 
-    if symbol is not None:
+    if symbol is not None and _max_sym is not None:
         sym_today = (
             await session.execute(
                 _exclude_bookkeeping(
@@ -230,7 +264,7 @@ async def _gate_strategy_budget(
                 )
             )
         ).scalar_one()
-        if sym_today >= caps["AUTO_PER_SYMBOL_ACTIONS_PER_DAY"]:
+        if _max_sym is not None and sym_today >= _max_sym:
             return GateFailure(
                 "strategy_budget",
                 f"per-symbol cap hit for {symbol} ({sym_today})",
@@ -248,12 +282,12 @@ async def _gate_strategy_budget(
             )
         )
     ).scalar_one()
-    if last_passed_ts is not None:
+    if _min_iv_cap is not None and last_passed_ts is not None:
         # SQLite returns naive datetimes for timezone columns — normalise.
         if last_passed_ts.tzinfo is None:
             last_passed_ts = last_passed_ts.replace(tzinfo=timezone.utc)
         elapsed = (now - last_passed_ts).total_seconds()
-        min_iv = caps["AUTO_MIN_INTERVAL_BETWEEN_ACTIONS"]
+        min_iv = _min_iv_cap
         if elapsed < min_iv:
             return GateFailure(
                 "strategy_budget",
@@ -261,7 +295,8 @@ async def _gate_strategy_budget(
             )
 
     # Daily capital deployed (entries) and roll debits (maintenance)
-    if is_new_entry and nav > 0 and estimated_capital_pct > 0:
+    _max_cap_pct = _capped(caps, "AUTO_MAX_CAPITAL_DEPLOYED_PER_DAY")
+    if _max_cap_pct is not None and is_new_entry and nav > 0 and estimated_capital_pct > 0:
         # Sum capital deployed today across passed entries.
         # Capital is recorded in payload.net_debit_pct_nav (best-effort).
         rows = (
@@ -276,10 +311,10 @@ async def _gate_strategy_budget(
         for p in rows:
             if isinstance(p, dict):
                 deployed += float(p.get("net_debit_pct_nav") or 0.0)
-        if deployed + estimated_capital_pct > caps["AUTO_MAX_CAPITAL_DEPLOYED_PER_DAY"]:
+        if deployed + estimated_capital_pct > _max_cap_pct:
             return GateFailure(
                 "strategy_budget",
-                f"daily capital cap hit ({deployed:.4f} + {estimated_capital_pct:.4f} > {caps['AUTO_MAX_CAPITAL_DEPLOYED_PER_DAY']:.4f})",
+                f"daily capital cap hit ({deployed:.4f} + {estimated_capital_pct:.4f} > {_max_cap_pct:.4f})",
             )
 
     return None

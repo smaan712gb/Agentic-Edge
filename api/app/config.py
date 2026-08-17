@@ -143,7 +143,14 @@ class Settings(BaseSettings):
     # LEAP entry execution (institutional): IBKR Adaptive algo working the
     # order toward mid, capped at mid + LEAP_ENTRY_CAP_PCT × half-spread
     # (near mid — won't pay through). Priority: Patient|Normal|Urgent.
-    LEAP_ENTRY_CAP_PCT: float = 0.30
+    # Fraction of the half-spread the Adaptive algo may work above mid before
+    # abandoning. 0.30 was too tight to ever fill: on 2026-08-17 all five orders
+    # walked to their cap unfilled, because 30% of a half-spread is well under
+    # 1% of premium on contracts trading at $90-$500 with wide LEAP spreads —
+    # GLW got $0.58 of room on a $90.92 mid, STX $2.24 on $505.45. 0.50 matches
+    # what the sell-to-close path already uses and is still under half the
+    # spread; the walker still abandons rather than paying through it.
+    LEAP_ENTRY_CAP_PCT: float = 0.50
     LEAP_ENTRY_ADAPTIVE_PRIORITY: str = "Normal"
 
     # ----- Manager conviction → entry sizing tilt ---------------------
@@ -201,6 +208,30 @@ class Settings(BaseSettings):
     # tighten exit-pressure sensitivity. Low-regret — never dumps a loser.
     ROTATION_DETECTOR_ENABLED: bool = True
     ROTATION_MIN_SIGNALS: int = 2               # require confirmation
+    # Freshness ceiling on a persisted rotation flag. Rotation is a read of
+    # where money is moving NOW, so a stale flag is wrong evidence, not weak
+    # evidence — after downtime it halts entries on conditions that already
+    # reversed (2026-08-17: 9-day-old flags blocked 17 candidates on an
+    # accumulation day). Older rows are ignored (fail-open); the sweep runs
+    # every 30 min during RTH, so a real rotation is re-flagged within a tick.
+    # Sized to cover an intraday gap but NOT an overnight/weekend one.
+    ROTATION_MAX_AGE_HOURS: float = 6.0
+    # A rotation call must rest on evidence of INSTITUTIONS MOVING, not on price
+    # alone. rs_breakdown and breadth_deterioration are both pure price/trend
+    # reads over overlapping names, so any ordinary 3-5% pullback trips both and
+    # a "2-of-3" rule flags the theme. Requiring at least one institutional
+    # signal (options-flow distribution / 13F-13D selling / bearish news) is what
+    # separates "this dipped" from "money is leaving".
+    ROTATION_REQUIRE_INSTITUTIONAL: bool = True
+    # Rotation is a multi-day phenomenon. Demand the same call on N consecutive
+    # sweeps before acting, so a single noisy reading can never halt entries.
+    ROTATION_CONFIRM_SWEEPS: int = 2
+    # Fraction of a theme's names showing fresh institutional selling (tracked
+    # 13F trim/exit or a 13D/G reduction) for the signal to trip.
+    ROTATION_INSTITUTIONAL_SELL_FRAC: float = 0.25
+    # Fraction of a theme's names carrying bearish news in the lookback window.
+    ROTATION_NEWS_BEARISH_FRAC: float = 0.25
+    ROTATION_NEWS_LOOKBACK_DAYS: int = 7
     ROTATION_BREADTH_BELOW_MA_PCT: float = 0.60  # breadth-signal trip threshold
     # Exit-pressure delta injected for a held name in a rotating theme. Maps
     # via the rotation subscore (25 -> max subscore, weight 0.15 ≈ +15 pts of
@@ -291,7 +322,7 @@ class Settings(BaseSettings):
     # (VRT + ANET, 2026-07-09 — both abandoned ~12:10 ET, never retried).
     # Non-abandoned outcomes (filled, ineligible, error) still never retry.
     ENTRY_ABANDON_RETRY_COOLDOWN_MIN: int = 120
-    ENTRY_MAX_ORDER_ATTEMPTS_PER_DAY: int = 2
+    ENTRY_MAX_ORDER_ATTEMPTS_PER_DAY: Optional[int] = None   # None = retry a name as often as it re-qualifies
     # Correlation-aware sizing: a candidate highly correlated to the EXISTING
     # book adds concentration, not diversification — "you own 20 stocks but 5
     # bets". Sizes DOWN (0.5× / 0.75×), never blocks: a haircut, not a gate.
@@ -321,7 +352,18 @@ class Settings(BaseSettings):
     # ----- Toggles ----------------------------------------------------
     USE_MOCK_RUN: bool = False
     MOCK_DATA: bool = False
-    CORS_ALLOWED_ORIGINS: str = "http://localhost:3000"
+    # MUST include the port start-all.ps1 actually serves the dashboard on.
+    # It launches `npm run dev -- -p 3001`, while this defaulted to :3000 only —
+    # so Next.js served the page fine and then EVERY browser call to the API was
+    # rejected with "400 Disallowed CORS origin". The dashboard rendered as an
+    # empty shell (no positions, no equity, no runs), which reads as a frontend
+    # that won't start rather than a CORS mismatch.
+    # 3000 is kept for a plain `npm run dev`, and the 127.0.0.1 forms because a
+    # browser treats them as different origins from localhost.
+    CORS_ALLOWED_ORIGINS: str = (
+        "http://localhost:3001,http://127.0.0.1:3001,"
+        "http://localhost:3000,http://127.0.0.1:3000"
+    )
 
     # ----- Automation (deploy-time half of the dual kill switch) ------
     # Always defaults to False. Flipping requires both this env var AND
@@ -357,7 +399,33 @@ class Settings(BaseSettings):
     # Max total exposure to a single underlying as a fraction of NAV — caps
     # pyramiding (held + proposed premium). 0.15 ≈ allows ~one add on a
     # normal ~7%-of-NAV starter before it's capped.
-    ENTRY_MAX_NAME_PCT_OF_NAV: float = 0.15
+    # ------------------------------------------------------------------
+    # UNCAPPED DEPLOYMENT (operator decision, 2026-08-17)
+    #
+    # Every entry-side limit below is set to None = NO LIMIT, on the operator's
+    # explicit instruction. Read this before changing any of them back.
+    #
+    # What this means concretely for a LEAPS-only (long-call) book: premium paid
+    # IS the maximum loss. Long calls are fully paid, so there is no margin loan,
+    # no margin call, and therefore NO broker-side mechanism that halts the book
+    # at any level of loss. Buying power does not constrain this: IBKR reports
+    # ~4x NAV of Reg-T buying power, but that is stock-margin capacity and can
+    # never be spent on premium — the spendable figure is AvailableFunds.
+    #
+    # With these off, nothing bounds single-name concentration, per-theme
+    # concentration, or total premium at risk. All themes in this universe are
+    # one correlated AI/compute supply-chain graph, so a systemic drawdown is
+    # not diversified away by holding many names within it.
+    #
+    # Still in force (deliberately NOT part of this change):
+    #   * the dual kill switch (env + DB)
+    #   * the entry circuit breaker — intraday NAV drop / margin cushion / blind
+    #     broker; halts NEW entries only, never closes positions
+    #   * macro regime sizing (panic -> sizing_factor 0 blocks entries)
+    #   * rotation, tape and sector-regime entry gates
+    #   * NAV fail-closed: an unreadable NAV still sizes to zero
+    # ------------------------------------------------------------------
+    ENTRY_MAX_NAME_PCT_OF_NAV: Optional[float] = None
     # Free-funds (dry-powder) cushion to REMAIN after an entry. For a fully-paid
     # LONG-options book this is a deployment/reserve policy, NOT a margin-safety
     # line — long calls can't be margin-called, and the real safety floor is the
@@ -365,19 +433,19 @@ class Settings(BaseSettings):
     # a different metric that stays ~100% here). Operator set 0.10 (max deploy,
     # 2026-07-01) — total premium-at-risk is still bounded by the aggregate
     # (AUTO_MAX_GROSS_PREMIUM_PCT_NAV), per-theme, and per-name caps.
-    ENTRY_MIN_MARGIN_CUSHION: float = 0.10
+    ENTRY_MIN_MARGIN_CUSHION: Optional[float] = None   # None = no free-funds floor
     # AGGREGATE exposure ceiling: total open LEAP premium (= total max-loss for a
     # long-call book) across ALL names as a fraction of NAV. The per-name cap
     # bounds single-name blowups; THIS bounds the whole correlated book so a
     # systemic AI-compute drawdown can't take the entire account. 1.0 = never
     # hold more premium-at-risk than NAV. Checked before every entry, fails
     # closed on an unreadable NAV/positions.
-    AUTO_MAX_GROSS_PREMIUM_PCT_NAV: float = 1.0
+    AUTO_MAX_GROSS_PREMIUM_PCT_NAV: Optional[float] = None   # None = no aggregate premium ceiling
     # Per-THEME concentration: max open premium in any one theme as a fraction of
     # NAV. Themes are highly correlated (one AI/compute supply-chain graph), so
     # this stops a dozen 15%-of-NAV names in one theme becoming a single 100%-of-
     # NAV bet. 0.40 = ≤40% of NAV in any single theme.
-    AUTO_MAX_THEME_PREMIUM_PCT_NAV: float = 0.40
+    AUTO_MAX_THEME_PREMIUM_PCT_NAV: Optional[float] = None   # None = no per-theme ceiling
     # Minimum scorecard composite required to auto-enter. A weak "Buy" (e.g. a
     # degraded/noisy run) must not auto-trade real money identically to a strong
     # one. Sizing already scales with conviction; this is the floor below which

@@ -152,7 +152,16 @@ async def _tick() -> None:
     try:
         from api.app.positions import _ibkr
         from .circuit_breaker import check_entry_breaker
-        ib_for_breaker = await _ibkr()
+        # Resolve the provider separately from the breaker evaluation. A connect
+        # failure must still reach check_entry_breaker (as ib=None) so the
+        # breaker LATCHES on a broker outage — wrapping both in one try meant a
+        # failed _ibkr() skipped the breaker entirely, and the 2026-08-08..10
+        # outage ran 78h with entry_breaker_tripped=False.
+        try:
+            ib_for_breaker = await _ibkr()
+        except Exception as e:
+            logger.warning("auto-entry: broker unreachable (%s) — evaluating breaker blind", e)
+            ib_for_breaker = None
         halt_reason = await check_entry_breaker(ib_for_breaker)
         if halt_reason is not None:
             logger.warning("auto-entry: circuit breaker halts new entries — %s", halt_reason)
@@ -307,6 +316,65 @@ def _latest_run_per_theme(
     return latest
 
 
+def _one_order_per_symbol(
+    rows: list[tuple[str, str, float]],
+    run_to_theme: dict[str, str],
+    existing: set[tuple[str, str]],
+    attempted: set[str],
+) -> tuple[list[tuple[str, str, str, float]], dict[str, int]]:
+    """Filter scored rows to at most ONE candidate per ticker. Pure + testable.
+
+    A symbol that appears in several themes is one position, not one position
+    per theme — but it produces one TickerScore row per theme run, and every row
+    used to become its own ``_process_one`` call inside the same tick. Nothing
+    downstream caught the repeat: the ``attempted`` set is computed once BEFORE
+    the loop and never updated as fills land within it, the gate's per-symbol
+    cap allows 3 actions/day, and the per-name NAV cap only bites after ~2x.
+    Observed 2026-08-17 — MU (ai-memory-wall + ai-storage), MRVL, SNDK, and ETN
+    (4 themes) each queued more than once in a single tick.
+
+    ``rows`` must be composite-desc, so the first occurrence of a symbol is its
+    strongest theme read; that one is kept and the rest dropped. Adding to a
+    working name still happens deliberately via the pullback-add path over time
+    — it must not happen as duplicate orders seconds apart at the same price.
+
+    Returns ``(candidates, collapsed)`` where ``collapsed`` maps symbol -> how
+    many rows it had, for operator-visible logging.
+    """
+    out: list[tuple[str, str, str, float]] = []
+    seen: set[str] = set()
+    collapsed: dict[str, int] = {}
+    for run_id, sym, composite in rows:
+        if (run_id, sym) in existing or sym in attempted:
+            continue
+        key = (sym or "").upper()
+        if key in seen:
+            collapsed[key] = collapsed.get(key, 1) + 1
+            continue
+        seen.add(key)
+        out.append((run_id, run_to_theme[run_id], sym, composite))
+    return out, collapsed
+
+
+def rotation_flag_is_fresh(
+    computed_at: Optional[datetime], max_age_hours: float,
+    *, now: Optional[datetime] = None,
+) -> bool:
+    """True if a persisted rotation flag is recent enough to act on. Pure.
+
+    Rotation is a read of where money is moving *now*, so an old flag is wrong
+    evidence rather than weak evidence. A missing timestamp is treated as fresh
+    (fail-open) so a schema gap can't silently disable the detector.
+    """
+    if computed_at is None:
+        return True
+    if computed_at.tzinfo is None:
+        # SQLite returns naive datetimes for timezone-aware columns.
+        computed_at = computed_at.replace(tzinfo=timezone.utc)
+    ref = now or datetime.now(timezone.utc)
+    return (ref - computed_at).total_seconds() / 3600.0 <= max_age_hours
+
+
 async def _find_unprocessed_buys() -> list[tuple[str, str, str, float]]:
     """Return (run_id, theme_id, symbol, composite) for un-traded Buy decisions
     on the LATEST completed run per theme within ENTRY_RUN_LOOKBACK_HOURS.
@@ -387,7 +455,9 @@ async def _find_unprocessed_buys() -> list[tuple[str, str, str, float]]:
         for sym, outcome, ts in attempt_rows:
             by_symbol.setdefault(sym, []).append((outcome, ts))
         cooldown = timedelta(minutes=get_settings().ENTRY_ABANDON_RETRY_COOLDOWN_MIN)
-        max_attempts = int(get_settings().ENTRY_MAX_ORDER_ATTEMPTS_PER_DAY)
+        # None = retry as often as the name re-qualifies (uncapped, 2026-08-17).
+        _ma = get_settings().ENTRY_MAX_ORDER_ATTEMPTS_PER_DAY
+        max_attempts = None if _ma is None else int(_ma)
         now = datetime.now(timezone.utc)
         attempted: set[str] = set()
         for sym, tries in by_symbol.items():
@@ -397,7 +467,7 @@ async def _find_unprocessed_buys() -> list[tuple[str, str, str, float]]:
             last_ts = max(ts for _, ts in tries)
             if last_ts.tzinfo is None:
                 last_ts = last_ts.replace(tzinfo=timezone.utc)
-            if len(tries) >= max_attempts or (now - last_ts) < cooldown:
+            if (max_attempts is not None and len(tries) >= max_attempts) or (now - last_ts) < cooldown:
                 attempted.add(sym)
             else:
                 logger.info(
@@ -406,11 +476,16 @@ async def _find_unprocessed_buys() -> list[tuple[str, str, str, float]]:
                     len(tries),
                 )
 
-        return [
-            (r[0], run_to_theme[r[0]], r[1], float(r[2] or 0))
-            for r in rows
-            if (r[0], r[1]) not in existing and r[1] not in attempted
-        ]
+        candidates, collapsed = _one_order_per_symbol(
+            [(r[0], r[1], float(r[2] or 0)) for r in rows],
+            run_to_theme, existing, attempted,
+        )
+        if collapsed:
+            logger.info(
+                "auto-entry: collapsed multi-theme duplicates to one order each — %s",
+                ", ".join(f"{k}×{v}" for k, v in sorted(collapsed.items())),
+            )
+        return candidates
 
 
 async def _process_one(
@@ -833,12 +908,14 @@ async def _process_leaps_only(
         _acct = await ib.get_account_summary()
         _avail = float(_acct.get("AvailableFunds") or 0)
         _netliq = float(_acct.get("NetLiquidation") or nav)
-        _room = _avail - get_settings().ENTRY_MIN_MARGIN_CUSHION * _netliq
+        _floor = get_settings().ENTRY_MIN_MARGIN_CUSHION
+        # None = no reserve requirement; the whole available balance is deployable.
+        _room = _avail - (float(_floor) * _netliq if _floor is not None else 0.0)
         _max_by_margin = int(_room / (leap_px * 100)) if leap_px > 0 else 0
         if 0 < _max_by_margin < n_contracts:
             logger.info("auto-entry LEAPS: %s size-to-fit margin room: %d -> %d contracts "
                         "(avail $%.0f, floor %.0f%%)", symbol, n_contracts, _max_by_margin,
-                        _avail, get_settings().ENTRY_MIN_MARGIN_CUSHION * 100)
+                        _avail, (float(_floor) * 100 if _floor is not None else 0.0))
             n_contracts = _max_by_margin
             total_cost = round(leap_px * n_contracts * 100, 2)
     except Exception as e:
@@ -932,11 +1009,24 @@ async def _process_leaps_only(
             if i:
                 i.status = "abandoned" if result.status == "abandoned" else "rejected"
                 i.position_state = "abandoned"
+                # Keep the broker's order id on a NON-fill too. The walker sets
+                # result.order_id at placement, so an abandoned order always has
+                # one — we just weren't storing it, leaving every abandon with
+                # ibkr_order_id=None and no way to trace it back to IBKR.
+                # That reference matters most exactly here: an abandon means we
+                # asked IBKR to cancel a LIVE, working order, and the cancel is
+                # confirmed best-effort. If it filled late (the race
+                # _reconcile_leap_qty exists to catch), this id is the only
+                # thread back to the fill. Without it a late fill becomes an
+                # unattributable orphan position.
+                if result.order_id:
+                    i.ibkr_order_id = str(result.order_id)
             await record_auto_action(
                 s, loop="entry", action_type="open_leap", gate_result=gate, symbol=symbol,
                 intent_id=intent_id,
                 payload={"run_id": run_id, "status": result.status, "reason": result.error},
-                outcome=result.status)
+                outcome=result.status,
+                ibkr_order_id=str(result.order_id) if result.order_id else None)
 
     if result.status == "filled":
         await alert(level="info", title=f"LEAP filled: {symbol}",
@@ -1172,9 +1262,24 @@ async def _check_entry_caps(*, ib: Any, symbol: str, new_cost: float, nav: float
     the entry rather than placing it blind.
     """
     s = get_settings()
-    # Fail closed: never size or gate on a blind/failed NAV read.
+    # Fail closed: never size or gate on a blind/failed NAV read. Kept even when
+    # every cap is off — a blind NAV means we cannot reason about the account at
+    # all, which is a data-integrity stop, not an exposure limit.
     if nav <= 0:
         return "NAV unreadable — blocking entry (fail closed)"
+
+    # UNCAPPED DEPLOYMENT (operator decision, 2026-08-17): with all five limits
+    # set to None there is nothing left to evaluate, so skip the broker round
+    # trips entirely rather than fetching positions + account on every entry to
+    # compare against nothing.
+    _name_cap = s.ENTRY_MAX_NAME_PCT_OF_NAV
+    _gross_cap = s.AUTO_MAX_GROSS_PREMIUM_PCT_NAV
+    _theme_cap = s.AUTO_MAX_THEME_PREMIUM_PCT_NAV
+    _cushion_floor = s.ENTRY_MIN_MARGIN_CUSHION
+    _daily_cap = get_settings_cap("AUTO_MAX_CAPITAL_DEPLOYED_PER_DAY")
+    if all(c is None for c in (_name_cap, _gross_cap, _theme_cap, _cushion_floor, _daily_cap)):
+        return None
+
     try:
         positions = await ib.get_positions()
     except Exception as e:
@@ -1188,18 +1293,18 @@ async def _check_entry_caps(*, ib: Any, symbol: str, new_cost: float, nav: float
     gross_cost = sum(_prem(p) for p in held)
 
     # 1. Per-name concentration.
-    if (name_cost + new_cost) / nav > s.ENTRY_MAX_NAME_PCT_OF_NAV:
+    if _name_cap is not None and (name_cost + new_cost) / nav > _name_cap:
         return (f"per-name cap: {symbol} would be {(name_cost + new_cost) / nav:.0%} of NAV "
-                f"(cap {s.ENTRY_MAX_NAME_PCT_OF_NAV:.0%}; held ${name_cost:,.0f} + new ${new_cost:,.0f})")
+                f"(cap {_name_cap:.0%}; held ${name_cost:,.0f} + new ${new_cost:,.0f})")
 
     # 2. AGGREGATE gross premium-at-risk across the whole (correlated) book.
-    if (gross_cost + new_cost) / nav > s.AUTO_MAX_GROSS_PREMIUM_PCT_NAV:
+    if _gross_cap is not None and (gross_cost + new_cost) / nav > _gross_cap:
         return (f"aggregate exposure cap: total open premium would be "
                 f"{(gross_cost + new_cost) / nav:.0%} of NAV "
-                f"(cap {s.AUTO_MAX_GROSS_PREMIUM_PCT_NAV:.0%}; held ${gross_cost:,.0f} + new ${new_cost:,.0f})")
+                f"(cap {_gross_cap:.0%}; held ${gross_cost:,.0f} + new ${new_cost:,.0f})")
 
     # 3. Per-theme concentration (correlated cluster).
-    if theme_id:
+    if theme_id and _theme_cap is not None:
         try:
             from api.app.db import ThemeSymbol
             async with db_session() as sess:
@@ -1209,10 +1314,10 @@ async def _check_entry_caps(*, ib: Any, symbol: str, new_cost: float, nav: float
                     )).all() if r[0]
                 }
             theme_cost = sum(_prem(p) for p in held if (p.get("symbol") or "").upper() in theme_syms)
-            if (theme_cost + new_cost) / nav > s.AUTO_MAX_THEME_PREMIUM_PCT_NAV:
+            if (theme_cost + new_cost) / nav > _theme_cap:
                 return (f"theme concentration cap: {theme_id} would be "
                         f"{(theme_cost + new_cost) / nav:.0%} of NAV "
-                        f"(cap {s.AUTO_MAX_THEME_PREMIUM_PCT_NAV:.0%})")
+                        f"(cap {_theme_cap:.0%})")
         except Exception as e:
             logger.debug("theme-cap check failed for %s/%s: %s", symbol, theme_id, e)
 
@@ -1220,6 +1325,8 @@ async def _check_entry_caps(*, ib: Any, symbol: str, new_cost: float, nav: float
     #    FILLED entries' recorded net_debit_pct_nav; block if this entry pushes
     #    the day past the ceiling.
     try:
+        if _daily_cap is None:
+            raise _SkipDailyCap
         start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         async with db_session() as sess:
             rows = (await sess.execute(
@@ -1230,14 +1337,17 @@ async def _check_entry_caps(*, ib: Any, symbol: str, new_cost: float, nav: float
             )).scalars().all()
         deployed = sum(float(p.get("net_debit_pct_nav") or 0.0) for p in rows if isinstance(p, dict))
         new_pct = new_cost / nav
-        cap = get_settings_cap("AUTO_MAX_CAPITAL_DEPLOYED_PER_DAY")
-        if deployed + new_pct > cap:
+        if deployed + new_pct > _daily_cap:
             return (f"daily capital cap: {deployed:.0%} deployed + {new_pct:.0%} new "
-                    f"> {cap:.0%}/day")
+                    f"> {_daily_cap:.0%}/day")
+    except _SkipDailyCap:
+        pass
     except Exception as e:
         logger.debug("daily-capital cap check failed for %s: %s", symbol, e)
 
     # 5. Free-funds cushion after the buy.
+    if _cushion_floor is None:
+        return None
     try:
         acct = await ib.get_account_summary()
         netliq = float(acct.get("NetLiquidation") or 0)
@@ -1247,16 +1357,26 @@ async def _check_entry_caps(*, ib: Any, symbol: str, new_cost: float, nav: float
     if netliq <= 0:
         return "account NetLiquidation unreadable — blocking entry (fail closed)"
     cushion_after = (avail - new_cost) / netliq
-    if cushion_after < s.ENTRY_MIN_MARGIN_CUSHION:
+    if cushion_after < _cushion_floor:
         return (f"margin headroom: entry would leave {cushion_after:.1%} cushion "
-                f"(min {s.ENTRY_MIN_MARGIN_CUSHION:.0%}; avail ${avail:,.0f} - cost ${new_cost:,.0f})")
+                f"(min {_cushion_floor:.0%}; avail ${avail:,.0f} - cost ${new_cost:,.0f})")
     return None
 
 
-def get_settings_cap(name: str) -> float:
+class _SkipDailyCap(Exception):
+    """Control-flow sentinel: the daily-capital cap is uncapped, skip its block.
+
+    A distinct type so the surrounding ``except Exception`` (which exists to keep
+    a cap-check failure from blocking an entry) cannot swallow it and silently
+    mask a genuine error in the same block.
+    """
+
+
+def get_settings_cap(name: str) -> Optional[float]:
     """Read a numeric cap from auto_gate.DEFAULT_CAPS (single source of truth)."""
     from .auto_gate import DEFAULT_CAPS
-    return float(DEFAULT_CAPS[name])
+    v = DEFAULT_CAPS.get(name)
+    return None if v is None else float(v)
 
 
 def _size_pmcc_contracts(
@@ -1524,6 +1644,9 @@ async def _daily_cap_exhausted() -> bool:
     """
     from .auto_gate import DEFAULT_CAPS
     from sqlalchemy import func
+    cap = DEFAULT_CAPS.get("AUTO_MAX_NEW_ENTRIES_PER_DAY")
+    if cap is None:
+        return False   # uncapped — never short-circuit the candidate queue
     today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     async with db_session() as s:
         from api.app.db import AutoAction
@@ -1539,4 +1662,4 @@ async def _daily_cap_exhausted() -> bool:
                 .where(~AutoAction.action_type.like("%_hold"))
             )
         ).scalar_one()
-    return n >= DEFAULT_CAPS["AUTO_MAX_NEW_ENTRIES_PER_DAY"]
+    return n >= cap

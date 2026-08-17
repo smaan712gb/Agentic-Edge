@@ -120,13 +120,52 @@ def test_premium_reconcile_is_per_share_not_divided_again():
 # Config safety gates
 # ---------------------------------------------------------------------------
 
-def test_new_risk_caps_present():
+def test_exposure_caps_are_uncapped_by_operator_decision():
+    """Exposure caps are OFF by explicit instruction (2026-08-17).
+
+    This previously asserted numeric ceilings on per-name / per-theme / total
+    premium. The operator removed them deliberately, so the test now pins the
+    contract that replaced them: ``None`` means no limit, and every consumer
+    must treat it that way rather than crashing on a comparison or silently
+    coercing it to 0 (which would block ALL entries instead of allowing them).
+
+    Set a number here again to restore a ceiling — the checks read the value
+    straight from Settings, so that is the only change required.
+    """
     from api.app.config import get_settings
     s = get_settings()
-    assert 0 < s.AUTO_MAX_GROSS_PREMIUM_PCT_NAV <= 2.0
-    assert 0 < s.AUTO_MAX_THEME_PREMIUM_PCT_NAV <= 1.0
+    for name in ("AUTO_MAX_GROSS_PREMIUM_PCT_NAV", "AUTO_MAX_THEME_PREMIUM_PCT_NAV",
+                 "ENTRY_MAX_NAME_PCT_OF_NAV", "ENTRY_MIN_MARGIN_CUSHION"):
+        v = getattr(s, name)
+        assert v is None or v > 0, (
+            f"{name}={v!r}: use None for 'no limit'. A 0 would read as a "
+            f"zero-tolerance ceiling and block every entry."
+        )
+
+
+def test_uncapped_means_the_gate_skips_not_crashes():
+    """A None cap must short-circuit the comparison, never reach it."""
+    from api.app.autotrade.auto_gate import DEFAULT_CAPS, _capped
+
+    assert _capped(DEFAULT_CAPS, "AUTO_MAX_NEW_ENTRIES_PER_DAY") is None
+    assert _capped(DEFAULT_CAPS, "AUTO_MAX_TRADES_PER_DAY") is None
+    assert _capped(DEFAULT_CAPS, "AUTO_MIN_INTERVAL_BETWEEN_ACTIONS") is None
+    assert _capped(DEFAULT_CAPS, "AUTO_PER_SYMBOL_ACTIONS_PER_DAY") is None
+    # A missing key behaves identically to an explicitly-uncapped one.
+    assert _capped(DEFAULT_CAPS, "NO_SUCH_CAP") is None
+    # The automation-error breaker is NOT a trading cap and stays armed.
+    assert _capped(DEFAULT_CAPS, "AUTO_CIRCUIT_BREAKER_FAIL_COUNT") == 3.0
+
+
+def test_risk_controls_that_survive_the_uncapping():
+    """Uncapping exposure must not have disarmed the non-cap protections."""
+    from api.app.config import get_settings
+    s = get_settings()
     assert s.ENTRY_MIN_COMPOSITE >= 0
     assert 0 < s.LEAP_CATASTROPHIC_STOP_PCT < 1.0
+    assert s.BREAKER_ENABLED is True
+    assert 0 < s.BREAKER_INTRADAY_NAV_DROP_PCT < 1.0
+    assert s.AUTOTRADE_ENABLED in (True, False)   # dual kill switch still read
 
 def test_live_mode_requires_explicit_ack():
     from api.app.config import Settings
@@ -253,3 +292,30 @@ def test_news_bearish_requires_short_language_for_notable_name():
 def test_news_short_ttl_config():
     from api.app.config import get_settings
     assert get_settings().NOTABLE_SHORT_NEWS_TTL_DAYS > 0
+
+
+def test_exit_side_caps_are_uncapped_too():
+    """Close/roll caps throttled RISK REDUCTION, not risk-taking.
+
+    With entries unlimited, an 8-close/day ceiling meant the book could open any
+    number of positions but auto-close only eight — so a rotation or thesis
+    break hitting a dozen names would strand four of them unmanaged until the
+    next session. Uncapping these strictly increases the ability to cut
+    exposure, the opposite trade-off from uncapping entries.
+    """
+    from api.app.autotrade.auto_gate import DEFAULT_CAPS, _capped
+
+    assert _capped(DEFAULT_CAPS, "AUTO_MAX_CLOSES_PER_DAY") is None
+    assert _capped(DEFAULT_CAPS, "AUTO_MAX_ROLLS_PER_DAY") is None
+    assert _capped(DEFAULT_CAPS, "AUTO_MAX_ROLL_DEBITS_PER_DAY") is None
+
+
+def test_maintenance_cap_check_short_circuits_when_uncapped():
+    """An uncapped kind must return False without touching the database."""
+    import asyncio
+
+    from api.app.autotrade.maint_loop import _maintenance_cap_hit
+
+    assert asyncio.run(_maintenance_cap_hit("close")) is False
+    assert asyncio.run(_maintenance_cap_hit("roll")) is False
+    assert asyncio.run(_maintenance_cap_hit("nonsense")) is False

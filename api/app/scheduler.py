@@ -53,9 +53,17 @@ _CBA_JOB_ID = "closing_accumulation_hourly"
 _CBA_CRON = "0 10-17 * * 1-5"
 
 _ROTATION_JOB_ID = "theme_rotation_sweep"
-# Every 30 min during RTH — rotation is a multi-day signal, but a half-hour
-# cadence catches a fresh flag quickly without hammering data providers.
-_ROTATION_CRON = "15,45 9-16 * * 1-5"
+# 4x/day during RTH, deliberately slow. Rotation is a MULTI-DAY institutional
+# move; sampling it every few minutes just measures normal intraday pullbacks
+# and manufactures flags that aren't real. The previous 30-min cron was also
+# fictional in practice — one sweep takes ~80 min, so with max_instances=1 most
+# fires were dropped and the true cadence was ~90 min by accident rather than
+# by design. This states the intent explicitly and leaves no overlap.
+#
+# Pairs with ROTATION_CONFIRM_SWEEPS: a theme must look like it's rotating on
+# consecutive sweeps before entries are halted, so confirmation takes hours (as
+# a multi-day signal should) instead of one noisy reading.
+_ROTATION_CRON = "5 10,12,14,16 * * 1-5"
 
 _NEWS_JOB_ID = "chokepoint_news_sweep"
 # Hourly during US RTH + an hour either side, Mon-Fri. News flows during the

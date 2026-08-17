@@ -64,7 +64,20 @@ async def check_entry_breaker(ib: Any) -> Optional[str]:
     excess: Optional[float] = None
     maint: Optional[float] = None
     account_ok = False
+
+    # ib=None means the caller could not even construct/connect a provider. That
+    # is the most severe form of "flying blind" and MUST latch — previously the
+    # caller's own try/except swallowed the connect failure before this function
+    # ran, so during the 2026-08-08..10 outage (9,007 failed reconnects) the
+    # breaker stayed un-latched and reported tripped=False on every health line.
+    # Entries were still skipped, but no latch, no audit row, and no forced
+    # operator re-arm before trading resumed.
+    if ib is None:
+        reason = "broker unreachable (no connection) — pausing new entries"
+
     try:
+        if ib is None:
+            raise RuntimeError("no broker connection")
         summary = await ib.get_account_summary()
         netliq = _f(summary, "NetLiquidation")
         # ExcessLiquidity is the TRUE distance-to-margin-call. For a long-only,
@@ -78,7 +91,8 @@ async def check_entry_breaker(ib: Any) -> Optional[str]:
         maint = _f(summary, "MaintMarginReq")
         account_ok = True
     except Exception as e:
-        reason = f"account read failed ({e}) — pausing new entries"
+        if reason is None:
+            reason = f"account read failed ({e}) — pausing new entries"
 
     # Connection staleness — don't open new positions blind. BUT a successful
     # account read above already proves the socket is live THIS tick, so only
