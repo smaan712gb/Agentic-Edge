@@ -227,6 +227,14 @@ async def _tick() -> None:
     # simply because cash exists: at 62% delta-adjusted exposure in a 60-75%
     # target band, the correct action is HOLD even with $840k idle.
     # Fail-open — no decision, or a stale one, leaves the per-name path intact.
+    # The HALT decision is computed inside the try, but ACTED ON outside it.
+    # With the return inside the try/except, any error between the log line and
+    # the return — an audit write, a DB hiccup — was swallowed and the tick
+    # carried straight on to buy. Observed 2026-08-18 11:13: the loop logged
+    # "portfolio says HOLD ... No new risk this tick" and then bought ONTO and
+    # CEG in the same tick. A control-flow decision must never be cancellable
+    # by an error handler.
+    _portfolio_halt: Optional[dict[str, Any]] = None
     if get_settings().PORTFOLIO_LAYER_ENABLED:
         try:
             from api.app.portfolio.daily import load_todays_decision
@@ -236,30 +244,38 @@ async def _tick() -> None:
                 _exp = float((_pd.get("exposure") or {}).get("delta_adjusted_pct") or 0)
                 _band = _pd.get("target_band") or [0, 1]
                 if _instr in ("hold", "reduce"):
-                    logger.info(
-                        "auto-entry: portfolio says %s — exposure %.1f%% vs target "
-                        "%.0f-%.0f%% (state=%s). No new risk this tick.",
-                        _instr.upper(), _exp * 100, _band[0] * 100, _band[1] * 100,
-                        _pd.get("state"))
-                    today = datetime.now(timezone.utc).replace(
-                        hour=0, minute=0, second=0, microsecond=0)
-                    async with db_session() as s:
-                        already = (await s.execute(
-                            select(AutoAction.id)
-                            .where(AutoAction.action_type == "entry_blocked_portfolio")
-                            .where(AutoAction.timestamp >= today).limit(1))).first()
-                        if already is None:
-                            await record_auto_action(
-                                s, loop="entry", action_type="entry_blocked_portfolio",
-                                gate_result=None,
-                                payload={"instruction": _instr, "state": _pd.get("state"),
-                                         "exposure_pct": _exp, "target_band": _band},
-                                outcome="blocked")
-                    return
-                logger.info("auto-entry: portfolio says ADD — exposure %.1f%% vs "
-                            "target %.0f-%.0f%%", _exp * 100, _band[0] * 100, _band[1] * 100)
+                    _portfolio_halt = {"instruction": _instr, "state": _pd.get("state"),
+                                       "exposure_pct": _exp, "target_band": _band}
+                else:
+                    logger.info("auto-entry: portfolio says ADD — exposure %.1f%% vs "
+                                "target %.0f-%.0f%%", _exp * 100,
+                                _band[0] * 100, _band[1] * 100)
         except Exception as e:
             logger.debug("auto-entry: portfolio decision unavailable (%s) — continuing", e)
+
+    if _portfolio_halt is not None:
+        logger.info(
+            "auto-entry: portfolio says %s — exposure %.1f%% vs target %.0f-%.0f%% "
+            "(state=%s). No new risk this tick.",
+            _portfolio_halt["instruction"].upper(),
+            _portfolio_halt["exposure_pct"] * 100,
+            _portfolio_halt["target_band"][0] * 100,
+            _portfolio_halt["target_band"][1] * 100, _portfolio_halt["state"])
+        try:
+            today = datetime.now(timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0)
+            async with db_session() as _s:
+                already = (await _s.execute(
+                    select(AutoAction.id)
+                    .where(AutoAction.action_type == "entry_blocked_portfolio")
+                    .where(AutoAction.timestamp >= today).limit(1))).first()
+                if already is None:
+                    await record_auto_action(
+                        _s, loop="entry", action_type="entry_blocked_portfolio",
+                        gate_result=None, payload=_portfolio_halt, outcome="blocked")
+        except Exception as e:  # noqa: BLE001 — audit failure must not un-halt
+            logger.warning("auto-entry: could not record portfolio halt: %s", e)
+        return
 
     # Live tape gate — the intraday pulse acting on the desk (NEW BUYING only;
     # exits are untouched by design). Distribution across OUR universe halts

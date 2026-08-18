@@ -140,3 +140,62 @@ def test_trim_rounds_down():
 
 def test_no_trim_without_a_reduction():
     assert tactical_trim_quantity(held_qty=10, reduce_fraction=0.0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Control flow: a halt must not be cancellable by an error handler
+# ---------------------------------------------------------------------------
+
+
+def test_portfolio_halt_returns_outside_the_try_block():
+    """The halt is DECIDED inside try/except but ACTED ON outside it.
+
+    With the return inside the try, any error between the log line and the
+    return — an audit write, a DB hiccup — was swallowed by the except and the
+    tick carried straight on to buy. Observed live 2026-08-18 11:13: the loop
+    logged "portfolio says HOLD ... No new risk this tick" and then bought ONTO
+    and CEG in the same tick, because recording the audit row raised.
+
+    A control-flow decision must never be cancellable by an error handler.
+    """
+    import inspect
+
+    from api.app.autotrade import entry_loop
+
+    src = inspect.getsource(entry_loop._tick)
+    assert "_portfolio_halt" in src, "halt must be captured as state, not acted on inline"
+
+    # The audit write may fail; the return must still happen.
+    halt_block = src.split("if _portfolio_halt is not None:")[1]
+    audit_try = halt_block.split("return")[0]
+    assert "except" in audit_try, "the audit write is guarded"
+    assert "audit failure must not un-halt" in halt_block or "un-halt" in halt_block
+
+
+def test_halt_is_recorded_but_recording_is_not_required():
+    """Auditing a halt is best-effort; halting is not.
+
+    Checked structurally: inside the halt block there must be a `return` at the
+    block's own indentation level (8 spaces), i.e. a sibling of the try — not
+    nested inside it where an exception could skip it.
+    """
+    import inspect
+    import textwrap
+
+    from api.app.autotrade import entry_loop
+
+    src = textwrap.dedent(inspect.getsource(entry_loop._tick))
+    lines = src.splitlines()
+    start = next(i for i, ln in enumerate(lines)
+                 if "if _portfolio_halt is not None:" in ln)
+    # Walk to the end of the block: the next line at the same indent or less.
+    body = []
+    for ln in lines[start + 1:]:
+        if ln.strip() and not ln.startswith("        "):
+            break
+        body.append(ln)
+    sibling_returns = [ln for ln in body if ln.rstrip() == "        return"]
+    assert sibling_returns, (
+        "the halt must return at the block's own level, not inside the try — "
+        "otherwise an audit-write error skips the return and the tick buys"
+    )
