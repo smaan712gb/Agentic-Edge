@@ -243,7 +243,15 @@ async def _tick() -> None:
                 _instr = str(_pd.get("instruction") or "hold")
                 _exp = float((_pd.get("exposure") or {}).get("delta_adjusted_pct") or 0)
                 _band = _pd.get("target_band") or [0, 1]
-                if _instr in ("hold", "reduce"):
+                if _instr == "no_decision":
+                    # The index could not be built. That is an absence of an
+                    # opinion, not an opinion to stand down — fall back to the
+                    # per-name gates exactly as a stale decision does.
+                    logger.warning(
+                        "auto-entry: portfolio has NO DECISION (%s) — per-name "
+                        "gates only, no exposure target in force",
+                        ", ".join(_pd.get("degraded") or []) or "index unavailable")
+                elif _instr in ("hold", "reduce"):
                     _portfolio_halt = {"instruction": _instr, "state": _pd.get("state"),
                                        "exposure_pct": _exp, "target_band": _band}
                 else:

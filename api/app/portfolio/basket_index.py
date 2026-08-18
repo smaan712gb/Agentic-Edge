@@ -608,6 +608,22 @@ async def build_basket_index(
             state.notes.append("QQQ unavailable — relative strength is blind")
     except Exception as e:  # noqa: BLE001
         state.notes.append(f"benchmark fetch failed: {e}")
+
+    # The index is the sole input to the daily portfolio decision, so a silent
+    # collapse in constituent coverage is a portfolio-level blindness. Recorded
+    # against its own history rather than a threshold: losing 3 of 73 names is
+    # routine, losing 60 of 73 is an outage, and only the history knows which
+    # this is.
+    try:
+        from ..autotrade.feed_integrity import observe
+        await observe("portfolio.basket_index",
+                      coverage=(len(per_symbol) / len(symbols)) if symbols else None,
+                      numeric=(state.close if state.close is not None else 0.0),
+                      subjects=len(symbols),
+                      extra={"weekly_bars": len(state.weekly),
+                             "benchmark_bars": len(state.benchmark_weekly)})
+    except Exception as e:  # noqa: BLE001 — observation must never break the build
+        logger.debug("basket: integrity observation failed: %s", e)
     return state
 
 

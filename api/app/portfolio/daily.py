@@ -70,20 +70,95 @@ async def load_todays_decision() -> Optional[dict[str, Any]]:
         return None
 
 
-async def compute_daily_decision(ib: Any) -> dict[str, Any]:
-    """Build the whole picture and resolve it to one instruction."""
-    from .basket_index import build_basket_index, sma
-    from .exposure import compute_book_exposure
+# Weekly bars below which there is no decision to make. A 20-week average, a
+# 14-period ATR and a pivot structure all need history; under this the gates
+# are not being cautious, they are reading noise.
+MIN_WEEKS_FOR_DECISION = 30
+
+INSTRUCTION_NO_DECISION = "no_decision"
+
+
+def evidence_missing(idx: Any) -> list[str]:
+    """Reasons the index cannot support a decision at all. Pure.
+
+    The distinction this draws is between weak evidence and absent evidence,
+    and it is the difference between a defensive posture and a destructive one.
+    Every score in the framework treats an uncomputable input as zero — correct
+    when one input is missing, catastrophic when they all are, because a total
+    data outage then scores regime 0/4, exhaustion 0 and selling-exhaustion 0,
+    which classifies as ``exhaustion_rotation`` with a 60-75% band and returns
+    REDUCE for any book above 75%.
+
+    That is not hypothetical: FMP began returning 401 mid-session on
+    2026-08-18, and an empty IndexState was verified to produce exactly that
+    instruction. A revoked API key would have told the fund to sell.
+
+    'No data' must therefore be its own answer, distinct from 'the evidence
+    says be defensive'.
+    """
+    missing: list[str] = []
+    if idx is None:
+        return ["no index"]
+    if not getattr(idx, "weekly", None):
+        missing.append("no weekly series")
+    elif len(idx.weekly) < MIN_WEEKS_FOR_DECISION:
+        missing.append(f"only {len(idx.weekly)} weekly bars "
+                       f"(need {MIN_WEEKS_FOR_DECISION})")
+    if getattr(idx, "close", None) is None:
+        missing.append("no index close")
+    if not getattr(idx, "weekly_atr", None):
+        missing.append("no weekly ATR")
+    if not getattr(idx, "n_constituents", 0):
+        missing.append("no constituents returned bars")
+    return missing
+
+
+def evaluate_index(
+    idx: Any, *, exposure_pct: float, previous_state: Optional[str] = None,
+) -> dict[str, Any]:
+    """Weekly evidence to one instruction. Pure, given an ``IndexState``.
+
+    Split out from ``compute_daily_decision`` so that the backtest evaluates
+    THIS function rather than a reimplementation of it. A harness that scores a
+    parallel copy of the rules measures the copy: it can pass while production
+    fails, and every threshold it endorses is endorsed for code that is not the
+    code being run. Point-in-time replay therefore truncates an IndexState and
+    calls straight into here.
+
+    Everything the gates need is read off the IndexState's own series, so an
+    IndexState carrying only bars up to week *t* yields exactly the decision the
+    system would have taken in that week — no lookahead is possible, because
+    there is nothing later in the object to look at.
+    """
+    from .basket_index import sma
     from .gates import (
         accumulation_gate, exhaustion_score, selling_exhaustion_score, trim_gate,
         weekly_regime_score,
     )
     from .state import classify_state, resolve
 
-    s = get_settings()
-    idx = await build_basket_index(
-        lookback_days=int(getattr(s, "PORTFOLIO_INDEX_LOOKBACK_DAYS", 1100)))
-    book = await compute_book_exposure(ib)
+    # Absent evidence is not defensive evidence. Returning an instruction here
+    # would be an opinion manufactured from nothing, and the state machine's
+    # worst case is that it manufactures a REDUCE.
+    gaps = evidence_missing(idx)
+    if gaps:
+        return {
+            "instruction": INSTRUCTION_NO_DECISION,
+            "state": "unknown",
+            "target_band": [None, None],
+            "degraded": gaps,
+            "index": (idx.to_dict() if hasattr(idx, "to_dict") else {}),
+            "regime": {"score": None, "max_score": 4, "components": {}, "unknown": gaps},
+            "exhaustion": {"score": None, "conditions": {}},
+            "selling_exhaustion": {"score": None, "conditions": {}},
+            "accumulation_gate": {"action": "hold", "blocked_by": gaps},
+            "trim_gate": {"action": "hold", "blocked_by": gaps},
+            "portfolio_state": {"state": "unknown", "action": INSTRUCTION_NO_DECISION,
+                                "current_exposure": round(exposure_pct, 4),
+                                "reasons": ["index unavailable — no decision taken"]},
+            "confluence_levels": [],
+        }
+
     wk = idx.weekly
 
     ma20 = sma(wk, 20)
@@ -134,33 +209,20 @@ async def compute_daily_decision(ib: Any) -> dict[str, Any]:
         confluence_at_resistance=conf, extension_atr=idx.extension_atr(),
         exhaustion=exhaustion, deterioration_persists=bool(rs is not None and rs < 0))
 
-    prev = await load_todays_decision()
-    prev_state = (prev or {}).get("state")
-
     target_state, why = classify_state(
         theme_broken=False,      # structural break is an operator call, not a gate
         regime_score=regime.score, exhaustion=exhaustion.score,
         selling_exhaustion=selling.score,
         accumulation_ready=(accum.action == "accumulate"),
         trim_ready=(trim.action == "trim"))
-    ps = resolve(current_exposure=book.exposure_pct, target_state=target_state,
-                 previous_state=prev_state)
+    ps = resolve(current_exposure=exposure_pct, target_state=target_state,
+                 previous_state=previous_state)
     ps.reasons.extend(why)
 
     return {
-        "as_of": datetime.now(timezone.utc).isoformat(),
         "instruction": ps.action,
         "state": ps.state,
         "target_band": [ps.target_low, ps.target_high],
-        "exposure": {
-            "delta_adjusted_pct": round(book.exposure_pct, 4),
-            "premium_pct": round(book.premium_pct, 4),
-            "leverage": round(book.leverage, 3),
-            "nav": round(book.nav, 2),
-            "notional": round(book.notional, 2),
-            "sleeves": book.sleeve_pct(),
-            "degraded": book.degraded,
-        },
         "index": idx.to_dict(),
         "regime": regime.to_dict(),
         "exhaustion": exhaustion.to_dict(),
@@ -170,6 +232,32 @@ async def compute_daily_decision(ib: Any) -> dict[str, Any]:
         "portfolio_state": ps.to_dict(),
         "confluence_levels": conf_hits,
     }
+
+
+async def compute_daily_decision(ib: Any) -> dict[str, Any]:
+    """Build the whole picture and resolve it to one instruction."""
+    from .basket_index import build_basket_index
+    from .exposure import compute_book_exposure
+
+    s = get_settings()
+    idx = await build_basket_index(
+        lookback_days=int(getattr(s, "PORTFOLIO_INDEX_LOOKBACK_DAYS", 1100)))
+    book = await compute_book_exposure(ib)
+
+    prev = await load_todays_decision()
+    d = evaluate_index(idx, exposure_pct=book.exposure_pct,
+                       previous_state=(prev or {}).get("state"))
+    d["as_of"] = datetime.now(timezone.utc).isoformat()
+    d["exposure"] = {
+        "delta_adjusted_pct": round(book.exposure_pct, 4),
+        "premium_pct": round(book.premium_pct, 4),
+        "leverage": round(book.leverage, 3),
+        "nav": round(book.nav, 2),
+        "notional": round(book.notional, 2),
+        "sleeves": book.sleeve_pct(),
+        "degraded": book.degraded,
+    }
+    return d
 
 
 def _rs_was_positive(idx: Any) -> Optional[bool]:
@@ -218,6 +306,21 @@ async def dispatch_daily_decision(ib: Any) -> dict[str, Any]:
             payload=d, outcome=d["instruction"])
 
     idx, exp = d["index"], d["exposure"]
+
+    # A decision that could not be taken is an incident, not a decision. It is
+    # alerted at critical because the underlying cause is always a broken data
+    # path, and the fund spends the next day with no portfolio-level opinion.
+    if d["instruction"] == INSTRUCTION_NO_DECISION:
+        gaps = ", ".join(d.get("degraded") or []) or "unknown"
+        await alert(
+            level="critical",
+            title="Portfolio decision UNAVAILABLE — index could not be built",
+            body=(f"No portfolio-level instruction today: {gaps}. The loops fall "
+                  f"back to per-name behaviour; no exposure target is in force. "
+                  f"Check the market-data provider."))
+        logger.error("portfolio decision UNAVAILABLE — %s", gaps)
+        return d
+
     await alert(
         level="info",
         title=f"Portfolio decision — {d['instruction'].upper()} ({d['state']})",
