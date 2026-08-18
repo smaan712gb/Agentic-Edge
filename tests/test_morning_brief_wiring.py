@@ -153,13 +153,17 @@ def _report():
             {"symbol": "MU", "composite": 7.8,
              "analyst": {"upside_pct": 54.0, "pt_consensus": 1562.0,
                          "n_up_30d": 0, "n_down_30d": 0},
-             "institutional": {"label": "constructive"},
+             # Key MUST match build_morning_report, which stores this as
+             # "institutional_read". The fixture previously said "institutional",
+             # so the test passed while production silently extracted None for
+             # every idea and the institutional lean never reached sizing.
+             "institutional_read": {"label": "constructive"},
              "entry": {"score": 71.0, "label": "good setup", "reasons": [
                  {"ok": True, "text": "perfect EMA stack (8>21>50>100>200)"},
                  {"ok": False, "text": "extended 8% above the 8 EMA — chase risk"},
              ]}},
             {"symbol": "etn", "composite": 7.4,
-             "analyst": {}, "institutional": {},
+             "analyst": {}, "institutional_read": {},
              "entry": {"score": 82.0, "label": "good setup", "reasons": []}},
         ],
         # Must NOT be persisted — large, and no gate can act on it.
@@ -198,3 +202,20 @@ def test_slice_survives_a_degraded_report():
     """Every report section is best-effort and may come back as {'error': ...}."""
     sl = brief_decision_slice({"top_ideas": {"error": "boom"}, "posture": None})
     assert sl["ideas"] == {} and sl["posture_score"] is None
+
+
+def test_slice_reads_the_key_the_report_actually_writes():
+    """Guard the exact mismatch that made this silent.
+
+    build_morning_report does `idea["institutional_read"] = ...`. Extracting
+    `idea["institutional"]` returns None for every idea, so the institutional
+    lean drops out of idea_sizing_factor with no error anywhere — the tilt just
+    quietly runs on two inputs instead of three.
+    """
+    import inspect
+
+    from api.app.report import morning
+    from api.app.report.brief_wiring import brief_decision_slice
+
+    assert 'idea["institutional_read"]' in inspect.getsource(morning._enrich_one_idea)         or 'institutional_read' in inspect.getsource(morning),         "report no longer writes institutional_read — update the extractor"
+    assert "institutional_read" in inspect.getsource(brief_decision_slice)

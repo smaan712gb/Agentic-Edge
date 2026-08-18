@@ -52,7 +52,8 @@ _BREADTH_SYMBOL_CAP = 12   # per theme, by insertion order
 # everywhere. That is how a routine dip halted 17 entries on 2026-08-17.
 _PRICE_SIGNALS = frozenset({"rs_breakdown", "breadth_deterioration"})
 _INSTITUTIONAL_SIGNALS = frozenset(
-    {"flow_distribution", "institutional_selling", "news_negative"})
+    {"flow_distribution", "institutional_selling", "news_negative",
+     "dark_pool_distribution"})
 
 
 def _mean(vals: list[float]) -> Optional[float]:
@@ -225,6 +226,55 @@ async def _news_negative_signal(
     return bool(len(syms) >= 3 and len(hit_syms) >= 2 and frac >= min_fraction), detail
 
 
+async def _dark_pool_signal(
+    symbols: list[str], min_fraction: float, min_imbalance: float,
+) -> tuple[bool, dict[str, Any]]:
+    """Clustered off-exchange DISTRIBUTION across a theme's names.
+
+    Block prints are where institutions move size without showing it on the
+    lit book, so a theme being quietly distributed off-exchange is rotation in
+    its most literal form — and it typically precedes the price breakdown that
+    rs_breakdown and breadth_deterioration only see afterwards.
+
+    Uses the SIGNED imbalance, not gross notional: a name can print enormous
+    off-exchange volume while being accumulated. Measured 2026-08-18 — FN
+    +0.59 (accumulation) against ONTO -1.00 and AAOI -0.40 (distribution) on
+    the same session; gross volume would have ranked all three together.
+
+    Fail-open: the feed being unavailable must never manufacture a rotation
+    call, so an error yields False.
+    """
+    hits: list[str] = []
+    evaluated = 0
+    detail: dict[str, Any] = {}
+    try:
+        from tradingagents.dataflows.providers.unusual_whales import UnusualWhalesProvider
+        uw = UnusualWhalesProvider()
+        for sym in symbols[:_BREADTH_SYMBOL_CAP]:
+            try:
+                dp = await uw.dark_pool_pressure(sym, hours=24)
+            except Exception:  # noqa: BLE001 — one bad name must not kill the sweep
+                continue
+            imb = dp.get("imbalance")
+            if imb is None:
+                continue
+            evaluated += 1
+            detail[sym] = round(float(imb), 3)
+            if float(imb) <= -abs(min_imbalance):
+                hits.append(sym)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("rotation: dark-pool signal unavailable: %s", e)
+        return False, {"error": str(e)}
+
+    frac = (len(hits) / evaluated) if evaluated else 0.0
+    out = {"distributed": sorted(hits), "evaluated": evaluated,
+           "fraction": round(frac, 2), "imbalances": detail,
+           "min_imbalance": min_imbalance}
+    # Require a genuine cluster: one distributed name is a single seller, a
+    # majority of the theme is the theme being rotated out of.
+    return bool(evaluated >= 3 and len(hits) >= 2 and frac >= min_fraction), out
+
+
 async def run_rotation_sweep() -> dict[str, Any]:
     """Recompute rotation state for every theme. Alerts on new flags."""
     settings = get_settings()
@@ -331,6 +381,20 @@ async def run_rotation_sweep() -> dict[str, Any]:
         except Exception as e:
             logger.debug("rotation: institutional-sell signal failed for %s: %s", theme_id, e)
 
+        # --- Signal 6: clustered off-exchange distribution -------------------
+        try:
+            dp_hit, dp_detail = await _dark_pool_signal(
+                symbols,
+                float(getattr(settings, "ROTATION_DARKPOOL_FRAC", 0.5)),
+                float(getattr(settings, "ROTATION_DARKPOOL_MIN_IMBALANCE", 0.25)))
+            evidence["dark_pool"] = dp_detail
+            if int(dp_detail.get("evaluated") or 0) >= 3:
+                measured_inst = True
+            if dp_hit:
+                tripped.append("dark_pool_distribution")
+        except Exception as e:
+            logger.debug("rotation: dark-pool signal failed for %s: %s", theme_id, e)
+
         # --- Signal 5: clustered bearish news across the theme's names -------
         try:
             news_hit, news_detail = await _news_negative_signal(
@@ -383,7 +447,7 @@ async def run_rotation_sweep() -> dict[str, Any]:
             streak = streak + 1 if candidate else 0
             flagged = candidate and streak >= confirm_needed
             # Score reflects the 5-signal set now, not the old 3.
-            score = round(len(tripped) / 5.0, 3)
+            score = round(len(tripped) / 6.0, 3)
             evidence["candidate_streak"] = streak
             evidence["confirm_needed"] = confirm_needed
             evidence["institutional_signals"] = institutional

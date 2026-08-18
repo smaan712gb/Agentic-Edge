@@ -130,7 +130,8 @@ def test_families_are_disjoint_and_complete():
     assert _PRICE_SIGNALS.isdisjoint(_INSTITUTIONAL_SIGNALS)
     assert _PRICE_SIGNALS == {"rs_breakdown", "breadth_deterioration"}
     assert _INSTITUTIONAL_SIGNALS == {
-        "flow_distribution", "institutional_selling", "news_negative"}
+        "flow_distribution", "institutional_selling", "news_negative",
+        "dark_pool_distribution"}
 
 
 def test_sweep_actually_enforces_the_institutional_requirement():
@@ -208,3 +209,51 @@ def test_degraded_sweep_alerts_the_operator():
 
     src = inspect.getsource(rotation_detector.run_rotation_sweep)
     assert "Rotation sweep degraded" in src
+
+
+# ---------------------------------------------------------------------------
+# Off-exchange distribution (2026-08-18)
+# ---------------------------------------------------------------------------
+
+
+def test_dark_pool_is_an_institutional_signal_not_a_price_one():
+    """Block prints are institutions moving size off the lit book — a pullback
+    cannot manufacture them, so it belongs in the family that can authorise a
+    rotation call."""
+    assert "dark_pool_distribution" in _INSTITUTIONAL_SIGNALS
+    assert "dark_pool_distribution" not in _PRICE_SIGNALS
+
+
+def test_dark_pool_alone_still_cannot_flag():
+    """One institutional signal is evidence, not confirmation."""
+    assert _decide(["dark_pool_distribution"]) is False
+
+
+def test_dark_pool_can_confirm_a_price_break():
+    """Price weakness + off-exchange distribution is a real rotation call."""
+    assert _decide(["rs_breakdown", "dark_pool_distribution"]) is True
+
+
+def test_sweep_uses_the_signed_imbalance_not_gross_notional():
+    """Gross off-exchange notional ranks market cap; only the buy/sell split
+    distinguishes accumulation from distribution. Measured 2026-08-18: FN
+    +0.59 accumulating vs ONTO -1.00 distributing on the same session."""
+    import inspect
+
+    from api.app.autotrade import rotation_detector
+
+    src = inspect.getsource(rotation_detector._dark_pool_signal)
+    assert "imbalance" in src
+    assert "dark_pool_pressure" in src, "must use the signed helper"
+
+
+def test_score_denominator_tracks_the_signal_count():
+    """Six signals now — the score must not still divide by five."""
+    import inspect
+
+    from api.app.autotrade import rotation_detector
+
+    src = inspect.getsource(rotation_detector.run_rotation_sweep)
+    assert "len(tripped) / 6.0" in src
+    n_signals = len(_PRICE_SIGNALS) + len(_INSTITUTIONAL_SIGNALS)
+    assert n_signals == 6

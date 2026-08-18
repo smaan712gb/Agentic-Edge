@@ -51,6 +51,12 @@ _Z_CANDIDATE_KEYS: tuple[str, ...] = (
     "flow_imbalance",
     "gamma_sign_num",
     "dark_pool_notional",
+    # Directional, and the one that actually carries information: gross
+    # off-exchange notional z-scores mostly to market cap, whereas the
+    # buy/sell imbalance says whether that size was accumulation or
+    # distribution.
+    "dark_pool_imbalance",
+    "dark_pool_net_notional",
 )
 
 
@@ -199,6 +205,8 @@ async def _flow_features(symbol: str) -> dict[str, Optional[float]]:
     dark_pool_notional (wires the previously-unused dark-pool method)."""
     out: dict[str, Optional[float]] = {
         "flow_imbalance": None, "gamma_sign_num": None, "dark_pool_notional": None,
+        "dark_pool_net_notional": None, "dark_pool_imbalance": None,
+        "dark_pool_prints": None,
     }
     # Reuse the same UW context the regime read uses — proven path.
     try:
@@ -213,18 +221,25 @@ async def _flow_features(symbol: str) -> dict[str, Optional[float]]:
         out["gamma_sign_num"] = {"positive": 1.0, "negative": -1.0, "neutral": 0.0}.get(sign)
     except Exception as e:
         logger.debug("research: UW flow context failed for %s: %s", symbol, e)
-    # Dark-pool prints — net off-exchange notional in the last 24h.
+    # Dark-pool prints — SIGNED off-exchange pressure in the last 24h.
+    #
+    # This used to sum gross notional, which says only that size traded
+    # off-exchange. A name can print enormous volume while being distributed;
+    # only the side tells you which. dark_pool_pressure classifies each print
+    # against the NBBO at execution (at/above ask = buy, at/below bid = sell)
+    # and returns a normalised -1..+1 imbalance.
+    #
+    # It was also reading a route that never existed (404 on every call), so
+    # this feature was None for every symbol and the quant overlay dropped
+    # z_dark_pool_notional as zero-variance. Both are fixed.
     try:
         from tradingagents.dataflows.providers.unusual_whales import UnusualWhalesProvider
         uw = UnusualWhalesProvider()
-        since = datetime.now(timezone.utc) - timedelta(hours=24)
-        prints = await uw.get_dark_pool_prints(symbol, since)
-        notional = 0.0
-        for p in prints or []:
-            px = float(p.get("price") or 0.0)
-            sz = float(p.get("size") or p.get("volume") or 0.0)
-            notional += px * sz
-        out["dark_pool_notional"] = round(notional, 0)
+        dp = await uw.dark_pool_pressure(symbol, hours=24)
+        out["dark_pool_notional"] = dp.get("total_notional")
+        out["dark_pool_net_notional"] = dp.get("net_notional")
+        out["dark_pool_imbalance"] = dp.get("imbalance")
+        out["dark_pool_prints"] = dp.get("n_prints")
     except Exception as e:
         logger.debug("research: dark-pool read failed for %s: %s", symbol, e)
     return out

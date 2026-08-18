@@ -163,7 +163,10 @@ def brief_decision_slice(report: dict[str, Any]) -> dict[str, Any]:
             if not sym:
                 continue
             analyst = it.get("analyst") if isinstance(it.get("analyst"), dict) else {}
-            inst = it.get("institutional") if isinstance(it.get("institutional"), dict) else {}
+            # The report stores this under "institutional_read"; reading
+            # "institutional" silently yielded None for every idea, so the
+            # institutional lean never reached the sizing tilt (2026-08-18).
+            inst = it.get("institutional_read") if isinstance(it.get("institutional_read"), dict) else {}
             entry = it.get("entry") if isinstance(it.get("entry"), dict) else {}
             # Keep only the FAILED checks: on a 10-idea brief the full reason
             # list is hundreds of strings, and what a later audit needs to know

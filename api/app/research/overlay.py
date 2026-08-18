@@ -41,7 +41,11 @@ logger = logging.getLogger("agentic_edge.research")
 PRIOR_WEIGHTS: dict[str, float] = {
     "z_theme_centrality":          1.0,
     "z_smartmoney_theme_confirm":  0.8,
-    "z_dark_pool_notional":        0.5,
+    # Directional off-exchange pressure. Gross notional is kept at a much
+    # lower weight because cross-sectionally it ranks market cap, not
+    # conviction; the buy/sell imbalance is the signal.
+    "z_dark_pool_imbalance":       0.5,
+    "z_dark_pool_notional":        0.1,
     "z_momentum_60d":              0.4,
     "z_flow_imbalance":            0.4,
     "z_momentum_20d":              0.3,

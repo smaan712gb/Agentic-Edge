@@ -283,6 +283,13 @@ class Settings(BaseSettings):
     # Fraction of a theme's names carrying bearish news in the lookback window.
     ROTATION_NEWS_BEARISH_FRAC: float = 0.25
     ROTATION_NEWS_LOOKBACK_DAYS: int = 7
+    # Off-exchange distribution: block prints are where institutions move size
+    # without showing it on the lit book, so a theme being quietly distributed
+    # there is rotation in its most literal form — and it usually precedes the
+    # price breakdown the technical signals only see afterwards. Uses the SIGNED
+    # imbalance; gross off-exchange notional ranks market cap, not conviction.
+    ROTATION_DARKPOOL_MIN_IMBALANCE: float = 0.25   # per-name sell-side skew
+    ROTATION_DARKPOOL_FRAC: float = 0.5             # share of the theme distributed
     ROTATION_BREADTH_BELOW_MA_PCT: float = 0.60  # breadth-signal trip threshold
     # Exit-pressure delta injected for a held name in a rotating theme. Maps
     # via the rotation subscore (25 -> max subscore, weight 0.15 ≈ +15 pts of
