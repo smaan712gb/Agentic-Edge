@@ -46,6 +46,12 @@ logger = logging.getLogger("agentic_edge.portfolio")
 # is a tight cluster on a calm index and meaningless on a violent one.
 _CONFLUENCE_BAND_ATR = 0.5
 
+# Minimum daily bars for a symbol to enter the index. Low on purpose: chained
+# returns admit a new listing from its second bar, and every long-lookback
+# measure (20/50-week averages, breadth) excludes it on its own until it has
+# the history. Setting this high instead silently drops real holdings.
+_MIN_BARS_FOR_CONSTITUENT = 15
+
 
 # ---------------------------------------------------------------------------
 # Bars
@@ -213,6 +219,19 @@ class IndexState:
     close: Optional[float] = None
     levels: dict[str, float] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
+    # Participation: what fraction of constituents are above their own weekly
+    # averages. The index can rise on a handful of names; this is what says
+    # whether the COMPLEX is advancing.
+    breadth_above_w10: Optional[float] = None
+    breadth_above_w20: Optional[float] = None
+    breadth_above_w50: Optional[float] = None
+    breadth_history: list[float] = field(default_factory=list)   # weekly % >w20
+    # Cap-weighted twin. A cap-weighted index at new highs while the
+    # equal-weighted one is not IS the breadth divergence, and it is invisible
+    # in either series alone.
+    cap_weighted_weekly: list[Bar] = field(default_factory=list)
+    # Benchmark for relative strength (QQQ), same weekly grid.
+    benchmark_weekly: list[Bar] = field(default_factory=list)
 
     def extension_atr(self, anchor: Optional[float] = None) -> Optional[float]:
         """Distance from ``anchor`` (default weekly 20-SMA) in weekly ATR.
@@ -239,6 +258,46 @@ class IndexState:
         recent_high = max(b.h for b in self.weekly[-13:])
         return (recent_high - self.close) / self.weekly_atr
 
+    def rs_vs_benchmark(self, weeks: int = 13) -> Optional[float]:
+        """Index return minus benchmark return over ``weeks``. Pure read.
+
+        Positive means the complex is being bought relative to the tape, which
+        is the distinction between "everything is down" and "this is being left
+        behind" — the second is rotation, the first is beta.
+        """
+        if len(self.weekly) <= weeks or len(self.benchmark_weekly) <= weeks:
+            return None
+        def _ret(bars: list[Bar]) -> Optional[float]:
+            a, b = bars[-weeks - 1].c, bars[-1].c
+            return (b / a - 1.0) if a else None
+        mine, theirs = _ret(self.weekly), _ret(self.benchmark_weekly)
+        if mine is None or theirs is None:
+            return None
+        return mine - theirs
+
+    def structure_intact(self) -> Optional[bool]:
+        """Higher highs AND higher lows on the recent weekly pivots."""
+        if len(self.weekly) < 20:
+            return None
+        highs, lows = swing_pivots(self.weekly[-26:])
+        if len(highs) < 2 or len(lows) < 2:
+            return None
+        return bool(highs[-1] > highs[-2] and lows[-1] > lows[-2])
+
+    def breadth_divergence(self, weeks: int = 8) -> Optional[bool]:
+        """Index near its recent high while participation is NOT. Pure read.
+
+        The most reliable warning in the whole framework: the basket rises but
+        fewer constituents come with it.
+        """
+        if len(self.weekly) < weeks + 1 or len(self.breadth_history) < weeks + 1:
+            return None
+        px_now, px_max = self.weekly[-1].c, max(b.c for b in self.weekly[-weeks:])
+        br_now, br_max = self.breadth_history[-1], max(self.breadth_history[-weeks:])
+        near_high = px_max > 0 and px_now >= px_max * 0.99
+        breadth_lagging = br_max > 0 and br_now < br_max * 0.90
+        return bool(near_high and breadth_lagging)
+
     def confluence(self, price: Optional[float] = None) -> tuple[int, list[str]]:
         p = price if price is not None else self.close
         if p is None or not self.weekly_atr:
@@ -260,6 +319,13 @@ class IndexState:
             "confluence": conf,
             "confluence_levels": hits,
             "levels": {k: round(v, 3) for k, v in self.levels.items() if v is not None},
+            "breadth_above_w10": self.breadth_above_w10,
+            "breadth_above_w20": self.breadth_above_w20,
+            "breadth_above_w50": self.breadth_above_w50,
+            "rs_vs_qqq_13w": (round(self.rs_vs_benchmark(), 4)
+                              if self.rs_vs_benchmark() is not None else None),
+            "structure_intact": self.structure_intact(),
+            "breadth_divergence": self.breadth_divergence(),
             "notes": self.notes,
         }
 
@@ -429,7 +495,13 @@ async def _fetch_daily(symbols: list[str], lookback_days: int) -> dict[str, list
                     ))
                 except (KeyError, TypeError, ValueError):
                     continue
-            if len(bars) > 50:
+            # A recent listing is a legitimate constituent, not an error. SKHY
+            # (Nasdaq ADR, listed ~2026-07) carries ~21 bars; chained returns
+            # let it join from its first full week instead of being dropped.
+            # It is still excluded automatically from any measure needing more
+            # history — a 20-week SMA simply returns None for it, so it drops
+            # out of breadth rather than distorting it.
+            if len(bars) >= _MIN_BARS_FOR_CONSTITUENT:
                 out[sym] = sorted(bars, key=lambda b: b.d)
 
         # Bounded concurrency: fast, without opening 72 sockets at once.
@@ -481,4 +553,88 @@ async def build_basket_index(
     state.weekly_atr = atr(state.weekly, period=14)
     state.close = state.weekly[-1].c if state.weekly else None
     state.levels = compute_levels(state.weekly)
+
+    # --- participation -----------------------------------------------------
+    # Computed per constituent on its OWN weekly series, not against the index,
+    # so this measures how many names are individually in uptrends rather than
+    # how they aggregate.
+    weekly_by_symbol = {sym: to_weekly(bars) for sym, bars in per_symbol.items()}
+    for label, period, attr in (("w10", 10, "breadth_above_w10"),
+                                ("w20", 20, "breadth_above_w20"),
+                                ("w50", 50, "breadth_above_w50")):
+        above = tot = 0
+        for wk in weekly_by_symbol.values():
+            m = sma(wk, period)
+            if m is None or not wk:
+                continue
+            tot += 1
+            if wk[-1].c > m:
+                above += 1
+        if tot:
+            setattr(state, attr, round(above / tot, 4))
+
+    # Breadth history (% above own 20w SMA), so divergence can be detected.
+    if state.weekly:
+        n_hist = min(26, len(state.weekly))
+        hist: list[float] = []
+        for back in range(n_hist - 1, -1, -1):
+            above = tot = 0
+            for wk in weekly_by_symbol.values():
+                seg = wk[: len(wk) - back] if back else wk
+                m = sma(seg, 20)
+                if m is None or not seg:
+                    continue
+                tot += 1
+                if seg[-1].c > m:
+                    above += 1
+            hist.append(round(above / tot, 4) if tot else 0.0)
+        state.breadth_history = hist
+
+    # --- cap-weighted twin, for the divergence read ------------------------
+    try:
+        caps = await _market_caps(sorted(per_symbol))
+        if caps:
+            state.cap_weighted_weekly = to_weekly(
+                build_index_series(per_symbol, weights=caps))
+    except Exception as e:  # noqa: BLE001
+        logger.debug("basket: cap-weighted series unavailable: %s", e)
+
+    # --- benchmark ---------------------------------------------------------
+    try:
+        bench = await _fetch_daily(["QQQ"], lookback_days)
+        if "QQQ" in bench:
+            state.benchmark_weekly = to_weekly(bench["QQQ"])
+        else:
+            state.notes.append("QQQ unavailable — relative strength is blind")
+    except Exception as e:  # noqa: BLE001
+        state.notes.append(f"benchmark fetch failed: {e}")
     return state
+
+
+async def _market_caps(symbols: list[str]) -> dict[str, float]:
+    """Market caps for the cap-weighted twin. Missing names fall back to 1.0,
+    which degrades that constituent to equal weight rather than dropping it."""
+    from tradingagents.dataflows.providers.fmp import FmpProvider
+
+    out: dict[str, float] = {}
+    fmp = FmpProvider()
+    try:
+        for i in range(0, len(symbols), 40):
+            chunk = symbols[i:i + 40]
+            body = await fmp._http.get_json(
+                "/stable/batch-quote",
+                params={"symbols": ",".join(chunk), "apikey": fmp._api_key})
+            for r in (body or []):
+                try:
+                    sym = str(r.get("symbol", "")).upper()
+                    cap = r.get("marketCap")
+                    if sym and cap:
+                        out[sym] = float(cap)
+                except (TypeError, ValueError):
+                    continue
+    finally:
+        try:
+            await fmp.aclose()
+        except Exception:  # noqa: BLE001
+            pass
+    return out
