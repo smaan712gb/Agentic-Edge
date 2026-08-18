@@ -521,6 +521,42 @@ async def trigger_reconcile(
 
 
 # ---------------------------------------------------------------------------
+# Portfolio decision
+# ---------------------------------------------------------------------------
+
+
+@router.post("/portfolio/decide-now")
+async def portfolio_decide_now(
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    """Recompute and persist the portfolio-level decision immediately.
+
+    The decision is normally taken once, post-close, on completed bars — that
+    cadence is deliberate and unchanged. This exists for the case the cadence
+    cannot cover: the RULES changed since the stored decision was taken, so it
+    is not stale data but a stale verdict, and waiting for the next scheduled
+    run means a day spent executing a decision the system no longer holds.
+
+    Uses exactly the same code path as the scheduled job, so an operator
+    refresh and a cron refresh cannot diverge. Never trades: it writes an
+    instruction that the loops then read.
+    """
+    _require_admin(x_admin_token)
+    from .portfolio.daily import dispatch_daily_decision
+    from .positions import _ibkr
+
+    d = await dispatch_daily_decision(await _ibkr())
+    return {
+        "instruction": d.get("instruction"), "state": d.get("state"),
+        "target_band": d.get("target_band"),
+        "exposure": d.get("exposure"), "degraded": d.get("degraded"),
+        "accumulation_gate": d.get("accumulation_gate"),
+        "trim_gate": d.get("trim_gate"), "regime": d.get("regime"),
+        "as_of": d.get("as_of"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Closing-Bell Accumulation
 # ---------------------------------------------------------------------------
 
