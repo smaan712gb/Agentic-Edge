@@ -369,6 +369,14 @@ class Settings(BaseSettings):
     # 62.6% in real exposure, so every gate keyed off premium was working
     # against a denominator understating risk by 22 points of NAV.
     PORTFOLIO_LAYER_ENABLED: bool = True
+    # Target bands on DELTA-ADJUSTED exposure, per state. A long-dated call
+    # carries the delta of far more stock than the premium paid for it, so a
+    # fully-invested LEAPS book measures well above 100% by construction — the
+    # live book read 122.9% on 2026-08-18 at 76.9% premium and 1.60x leverage.
+    # Defaults live in portfolio.state.DEFAULT_TARGET_BANDS; set any subset
+    # here to override. Kept in settings because it is a risk limit, and a risk
+    # limit that needs a code change to adjust is one nobody adjusts.
+    PORTFOLIO_TARGET_BANDS: dict[str, list[float]] = {}
     # ~3 years, so the weekly series carries a 50-week average and a stable ATR.
     PORTFOLIO_INDEX_LOOKBACK_DAYS: int = 1100
     # Staleness ceiling on the persisted daily decision, same discipline as the

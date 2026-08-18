@@ -223,7 +223,8 @@ def evaluate_index(
         accumulation_ready=(accum.action == "accumulate"),
         trim_ready=(trim.action == "trim"))
     ps = resolve(current_exposure=exposure_pct, target_state=target_state,
-                 previous_state=previous_state)
+                 previous_state=previous_state,
+                 accumulation_confirmed=(accum.action == "accumulate"))
     ps.reasons.extend(why)
 
     return {

@@ -45,13 +45,50 @@ STATE_THEME_BREAK = "theme_break"
 STATE_ORDER = [STATE_ACCUMULATION, STATE_FULL, STATE_MATURE,
                STATE_EXHAUSTION, STATE_THEME_BREAK]
 
-TARGET_BANDS: dict[str, tuple[float, float]] = {
-    STATE_ACCUMULATION: (1.00, 1.10),
-    STATE_FULL: (0.90, 1.00),
-    STATE_MATURE: (0.80, 0.90),
-    STATE_EXHAUSTION: (0.60, 0.75),
-    STATE_THEME_BREAK: (0.0, 0.40),
+# Bands are on DELTA-ADJUSTED exposure, and that unit is why these numbers are
+# not the 90-100% a cash-equity book would use. A long-dated call carries the
+# delta of far more stock than the premium paid for it, so a fully-invested
+# LEAPS book measures well above 100% by construction: on 2026-08-18 the book
+# read 76.9% premium at 1.60x leverage — 122.9% delta-adjusted.
+#
+# The original bands topped out at 110%, which put a normally-invested book
+# permanently above every band. The consequence was not conservatism but
+# paralysis: the state machine returned reduce or hold on every tick, so the
+# accumulation gate could fire on a genuine dislocation — thesis intact, no
+# rotation — and never be allowed to act on it. That is the opposite of the
+# intended behaviour, which is to keep buying dips while the thesis holds.
+#
+# Calibrated so a fully-invested book sits INSIDE full_participation rather
+# than above it, leaving accumulation genuine headroom to deploy into a
+# dislocation. Overridable in settings because this is a risk limit, and a risk
+# limit that requires a code change to adjust is one nobody adjusts.
+DEFAULT_TARGET_BANDS: dict[str, tuple[float, float]] = {
+    STATE_ACCUMULATION: (1.40, 1.60),
+    STATE_FULL: (1.15, 1.40),
+    STATE_MATURE: (1.00, 1.15),
+    STATE_EXHAUSTION: (0.70, 1.00),
+    STATE_THEME_BREAK: (0.0, 0.50),
 }
+
+
+def target_bands() -> dict[str, tuple[float, float]]:
+    """Bands in force, from settings when configured. Never raises."""
+    try:
+        from ..config import get_settings
+        cfg = getattr(get_settings(), "PORTFOLIO_TARGET_BANDS", None)
+        if isinstance(cfg, dict) and cfg:
+            out = dict(DEFAULT_TARGET_BANDS)
+            for k, v in cfg.items():
+                if k in out and isinstance(v, (list, tuple)) and len(v) == 2:
+                    out[k] = (float(v[0]), float(v[1]))
+            return out
+    except Exception:  # noqa: BLE001 — a bad override must not break the decision
+        pass
+    return dict(DEFAULT_TARGET_BANDS)
+
+
+# Retained for callers that read the module attribute directly.
+TARGET_BANDS = DEFAULT_TARGET_BANDS
 
 
 @dataclass
@@ -126,7 +163,8 @@ def classify_state(
     return STATE_EXHAUSTION, reasons
 
 
-def step_toward(current_state: Optional[str], target_state: str) -> str:
+def step_toward(current_state: Optional[str], target_state: str,
+                *, immediate: Optional[set[str]] = None) -> str:
     """Move at most ONE state toward the target. Pure.
 
     A signal that is right will still be right tomorrow, and a signal that is
@@ -137,6 +175,15 @@ def step_toward(current_state: Optional[str], target_state: str) -> str:
     the move is immediate rather than staged.
     """
     if target_state == STATE_THEME_BREAK or current_state is None:
+        return target_state
+    if immediate and target_state in immediate:
+        # A confirmed accumulation signal is a discrete event, not drift, and
+        # it already carries its own damping: the gate deploys 25/25/50 across
+        # three stages with confirmation required between them. Making the
+        # STATE crawl toward it as well damps the same signal twice, and a
+        # dislocation is usually over before a two-step crawl arrives. The
+        # one-step rule still governs every reduction and all ordinary drift,
+        # which is where whipsaw actually costs money.
         return target_state
     if current_state == target_state:
         return target_state
@@ -153,6 +200,7 @@ def resolve(
     target_state: str,
     previous_state: Optional[str] = None,
     tolerance: float = 0.02,
+    accumulation_confirmed: bool = False,
 ) -> PortfolioState:
     """Target band and the resulting instruction. Pure.
 
@@ -162,8 +210,10 @@ def resolve(
     crossing. Trim-and-rebuy churn is the most reliable way to bleed a
     portfolio that is directionally correct.
     """
-    state = step_toward(previous_state, target_state)
-    lo, hi = TARGET_BANDS[state]
+    state = step_toward(
+        previous_state, target_state,
+        immediate=({STATE_ACCUMULATION} if accumulation_confirmed else None))
+    lo, hi = target_bands()[state]
     reasons: list[str] = []
     if state != target_state:
         reasons.append(f"stepping {previous_state} -> {state} (target {target_state}, "

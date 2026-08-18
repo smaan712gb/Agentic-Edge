@@ -18,13 +18,49 @@ from api.app.portfolio.state import (
 
 def test_even_the_defensive_state_stays_substantially_invested():
     """The thesis is a multi-year supercycle — being flat during it is the
-    larger error, so the risk-off band still holds 60-75%."""
+    larger error, so even the risk-off band still holds 70-100%."""
     lo, hi = TARGET_BANDS[STATE_EXHAUSTION]
-    assert lo == 0.60 and hi == 0.75
+    assert lo == 0.70 and hi == 1.00
 
 
 def test_theme_break_is_the_only_state_that_goes_near_flat():
-    assert TARGET_BANDS[STATE_THEME_BREAK][1] <= 0.40
+    assert TARGET_BANDS[STATE_THEME_BREAK][1] <= 0.50
+
+
+def test_bands_accommodate_a_leveraged_leaps_book():
+    """Bands are on DELTA-ADJUSTED exposure, and a long-dated call carries the
+    delta of far more stock than its premium — so a fully-invested LEAPS book
+    reads well above 100% by construction. The live book was 122.9% at 76.9%
+    premium and 1.60x leverage.
+
+    The original bands topped out at 110%, which placed a normally-invested
+    book above EVERY band. That produced paralysis rather than caution: the
+    machine returned reduce or hold on every tick, so the accumulation gate
+    could fire on a real dislocation and never be allowed to act."""
+    lo, hi = TARGET_BANDS[STATE_FULL]
+    assert lo <= 1.229 <= hi, "a fully-invested book must sit INSIDE full_participation"
+    # Contiguous by design — accumulation begins where full participation ends,
+    # so there is no exposure level that belongs to no state.
+    assert TARGET_BANDS[STATE_ACCUMULATION][0] >= hi
+    assert TARGET_BANDS[STATE_ACCUMULATION][1] > hi, "accumulation needs real headroom"
+
+
+def test_a_fully_invested_book_is_hold_not_reduce():
+    """The regression. At 122.9% the old bands said REDUCE on a book that was
+    simply invested."""
+    ps = resolve(current_exposure=1.229, target_state=STATE_FULL,
+                 previous_state=STATE_FULL)
+    assert ps.action == "hold"
+
+
+def test_a_confirmed_dislocation_can_still_add_from_fully_invested():
+    """What the operator asked for: keep buying dips while the thesis holds.
+    A confirmed accumulation signal on an already fully-invested book must
+    reach ADD, not stall at the top of the current band."""
+    ps = resolve(current_exposure=1.229, target_state=STATE_ACCUMULATION,
+                 previous_state=STATE_FULL, accumulation_confirmed=True)
+    assert ps.state == STATE_ACCUMULATION
+    assert ps.action == "add"
 
 
 def test_one_step_per_day_in_both_directions():
@@ -49,16 +85,16 @@ def test_first_run_adopts_the_target_directly():
 def test_inside_the_band_is_hold_not_a_trade():
     """Acting on every drift produces trim-and-rebuy churn, which pays spread
     on each crossing and bleeds a book that is directionally right."""
-    ps = resolve(current_exposure=0.66, target_state=STATE_EXHAUSTION,
+    ps = resolve(current_exposure=0.85, target_state=STATE_EXHAUSTION,
                  previous_state=STATE_EXHAUSTION)
     assert ps.action == "hold" and ps.in_band
 
 
 def test_tolerance_prevents_edge_oscillation():
-    ps = resolve(current_exposure=0.76, target_state=STATE_EXHAUSTION,
+    ps = resolve(current_exposure=1.01, target_state=STATE_EXHAUSTION,
                  previous_state=STATE_EXHAUSTION)
     assert ps.action == "hold", "1pt past the edge is inside tolerance"
-    ps2 = resolve(current_exposure=0.80, target_state=STATE_EXHAUSTION,
+    ps2 = resolve(current_exposure=1.05, target_state=STATE_EXHAUSTION,
                   previous_state=STATE_EXHAUSTION)
     assert ps2.action == "reduce"
 
@@ -70,17 +106,39 @@ def test_below_band_adds_and_above_band_reduces():
                    previous_state=STATE_EXHAUSTION).action == "reduce"
 
 
-def test_the_live_2026_08_18_reading():
-    """62.1% exposure in a 60-75% band with a weak-but-intact regime is HOLD —
-    the book is already positioned correctly, which is a different answer from
-    'the tape gate blocked you'."""
+def test_a_weak_regime_without_a_dislocation_is_still_defensive():
+    """A weak regime and no confirmed dislocation classifies defensive. Under
+    bands sized for a leveraged book, 62.1% is BELOW even that band — so the
+    answer is add, not hold. Being under-invested in an intact supercycle is
+    the larger error, which is the whole premise of the band design."""
     state, _ = classify_state(theme_broken=False, regime_score=1, exhaustion=2,
                               selling_exhaustion=3, accumulation_ready=False,
                               trim_ready=False)
     assert state == STATE_EXHAUSTION
     ps = resolve(current_exposure=0.621, target_state=state,
                  previous_state=STATE_EXHAUSTION)
-    assert ps.action == "hold"
+    assert ps.action == "add"
+
+
+def test_the_live_2026_08_18_dislocation_reads_add():
+    """The reading the operator flagged: macro selloff, thesis intact, no
+    rotation, sellers exhausting. The gate fired and the book was already
+    fully invested at 122.9% — this must still resolve to ADD."""
+    state, _ = classify_state(theme_broken=False, regime_score=1, exhaustion=2,
+                              selling_exhaustion=3, accumulation_ready=True,
+                              trim_ready=False)
+    assert state == STATE_ACCUMULATION
+    ps = resolve(current_exposure=1.229, target_state=state,
+                 previous_state=STATE_FULL, accumulation_confirmed=True)
+    assert ps.action == "add"
+
+
+def test_reductions_are_still_damped_one_step_at_a_time():
+    """The immediate-step exemption is for confirmed accumulation only. Every
+    reduction and all ordinary drift keep the one-step rule, which is where
+    whipsaw actually costs money."""
+    assert step_toward(STATE_ACCUMULATION, STATE_EXHAUSTION,
+                       immediate={STATE_ACCUMULATION}) == STATE_FULL
 
 
 def test_weak_regime_with_intact_thesis_is_defensive_not_out():
