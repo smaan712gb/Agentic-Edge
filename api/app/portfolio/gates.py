@@ -233,6 +233,7 @@ def accumulation_gate(
     *,
     theme_score_positive: bool,
     regime: RegimeScore,
+    volatility_pct: Optional[float],
     confluence: int,
     correction_atr: Optional[float],
     breadth_deterioration_stopped: bool,
@@ -241,23 +242,61 @@ def accumulation_gate(
     strong_weekly_reversal: bool = False,
     closed_above_reversal_high: bool = False,
     rs_restored_positive: bool = False,
-    min_regime: int = 3,
-    min_confluence: int = 5,
-    min_correction_atr: float = 1.5,
+    min_volatility_pct: float = 0.084,
     min_selling_exhaustion: int = 2,
 ) -> GateDecision:
     """Deploy reserved tactical capital into a portfolio-level dislocation.
 
-    ALL six conditions must hold. This is intentionally hard to satisfy: the
-    cost of missing one dislocation is an opportunity, while the cost of
-    deploying the reserve into the first down week of a real theme break is the
-    reserve itself.
+    Two conditions must hold: the complex is in a genuinely high-volatility
+    state, and there is evidence sellers are finishing. Both were selected by
+    measurement rather than intuition, replacing a six-condition conjunction
+    that was verified never to fire.
+
+    HOW THIS WAS CHOSEN. Candidate conditions were screened by point-in-time
+    replay over 6,863 weeks and eight complexes (``research.gate_backtest``),
+    fitted on five baskets and validated on three never used for selection —
+    hypergrowth, china_tech, and ai_infra, the live book. Forward 13-week
+    return against the unconditional baseline:
+
+        condition                       dev      holdout   baskets +ve
+        volatility + selling exhaustion +5.8%    +5.0%        3/3
+        volatility alone                +6.4%    +5.6%        3/3
+        + correction>=1.5ATR            +4.2%    +3.3%        2/3
+        + breadth_deterioration_stopped +3.1%    +1.8%        2/3
+        + regime>=3                     fires ONCE in 4,892 weeks
+
+    Dev and holdout agreeing to within a point is what distinguishes this from
+    the alternative that was rejected. A drawdown-based condition scored +2.7%
+    on dev but decayed to nothing on holdout, went NEGATIVE at 52 weeks, and
+    its entire remaining edge came from one basket — the survivorship-biased
+    live book — while the two holdout complexes that genuinely broke showed
+    +0.3% and +0.2%. Buying a deep drawdown pays only if the thesis holds,
+    which is the one thing the rule cannot know.
+
+    WHY THE OLD GATE COULD NOT WORK. ``regime>=3`` requires an intact weekly
+    uptrend while the other conditions require a dislocation, and a dislocation
+    destroys the regime score by construction — so the conjunction was close to
+    self-contradictory. That, not the confluence threshold, was the deeper
+    fault. Separately, ``min_confluence=5`` was the CEILING, not a high bar:
+    ``compute_levels`` emits exactly five families and ``confluence_at`` counts
+    distinct families, so it demanded all five align inside half a weekly ATR.
+
+    WHY AN ABSOLUTE VOLATILITY THRESHOLD. A self-calibrating version — top
+    quintile of the complex's own trailing three years — was tested and is
+    WORSE (holdout +1.0%, 2/3 baskets), because a relative threshold also fires
+    in a calm complex having a mildly active week. What carries the edge is
+    absolute stress, so this is a deliberate exception to preferring
+    self-referential thresholds, made because the measurement says so.
+
+    Robustness: 77 distinct firing episodes in the holdout, 62% with positive
+    13-week returns, against 61% across 170 dev episodes. Not one crash
+    inflating a week count.
 
     Staging deliberately buys some exposure BEFORE confirmation and more after,
     which avoids both waiting until the recovery is obvious and committing
     everything to the first bounce:
 
-        stage 1   25%   the six conditions align
+        stage 1   25%   both conditions align
         stage 2   25%   a strong weekly reversal follows
         stage 3   50%   close above the reversal week's high, OR weekly
                         relative strength turns positive again
@@ -265,48 +304,26 @@ def accumulation_gate(
     ``stage_completed`` is what has already been deployed this cycle, so the
     caller advances one step at a time and never re-deploys a stage.
 
-    MEASURED BEHAVIOUR — point-in-time replay over 6,863 weeks across eight
-    complexes and ~19 years (``research.gate_backtest``):
-
-        fires at confluence>=5 :      0
-        weeks reaching confluence 5 : 1.8%
-
-    ``min_confluence=5`` is the CEILING, not a high bar: ``compute_levels``
-    emits exactly five families (ma, pivot, vwap, range, fib) and
-    ``confluence_at`` counts distinct families, so >=5 demands that all five
-    align inside half a weekly ATR simultaneously. Combined with five further
-    conditions the gate is unsatisfiable in practice, which is why it has never
-    fired live either.
-
-    Loosening it is NOT supported by the same replay. Reconstructed at every
-    threshold, forward 13-week returns after a would-be signal are BELOW the
-    unconditional baseline at each one:
-
-        confluence>=1   44 fires   -1.8% vs baseline
-        confluence>=2   31 fires   -3.9%
-        confluence>=3   13 fires   -7.4%
-
-    So the conjunction does not identify better-than-average entries even when
-    it is loose enough to fire. That is consistent with the fund's own thesis:
-    in a complex that compounds, an always-invested book is a high bar, and a
-    rule that sits out most weeks to time dislocations gives up more than it
-    recovers. Left as-is deliberately, and reported monthly rather than
-    retuned — the threshold is an operator decision.
     """
     checks = {
         "theme_score_positive": theme_score_positive,
-        f"regime>={min_regime}": regime.score >= min_regime,
-        f"confluence>={min_confluence}": confluence >= min_confluence,
-        f"correction>={min_correction_atr}ATR": (
-            correction_atr is not None and correction_atr >= min_correction_atr),
-        "breadth_deterioration_stopped": breadth_deterioration_stopped,
+        f"volatility>={min_volatility_pct:.3f}": (
+            volatility_pct is not None and volatility_pct >= min_volatility_pct),
         f"selling_exhaustion>={min_selling_exhaustion}": (
             selling_exhaustion.score >= min_selling_exhaustion),
     }
     blocked = [k for k, v in checks.items() if not v]
+    # Regime, confluence, correction and breadth are still MEASURED and
+    # recorded — they remain useful for reading a decision after the fact —
+    # but they are no longer required. Each was tested and each cost holdout
+    # edge; see the docstring.
     detail = {"checks": checks, "regime": regime.to_dict(),
               "selling_exhaustion": selling_exhaustion.to_dict(),
-              "confluence": confluence, "correction_atr": correction_atr}
+              "volatility_pct": volatility_pct,
+              "observed_not_required": {
+                  "regime_score": regime.score, "confluence": confluence,
+                  "correction_atr": correction_atr,
+                  "breadth_deterioration_stopped": breadth_deterioration_stopped}}
 
     if blocked:
         return GateDecision(action=ACTION_HOLD, blocked_by=blocked, detail=detail,

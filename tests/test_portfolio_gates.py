@@ -158,12 +158,17 @@ def test_none_is_treated_as_not_met():
 
 
 def _ok_accum(**kw):
+    """A firing case under the evidence-selected contract: elevated volatility
+    plus evidence sellers are finishing. Regime, confluence, correction and
+    breadth are still passed and still recorded — they are simply no longer
+    required, each having cost holdout edge when tested as a condition."""
     base = dict(
         theme_score_positive=True,
         regime=weekly_regime_score(close=110, ma_w20=100, ma_w20_rising=True,
                                    rs_vs_benchmark=0.02, breadth_above_w20=0.6,
                                    structure_intact=True),
-        confluence=6, correction_atr=1.8, breadth_deterioration_stopped=True,
+        volatility_pct=0.11, confluence=6, correction_atr=1.8,
+        breadth_deterioration_stopped=True,
         selling_exhaustion=selling_exhaustion_score(
             breadth_washout=True, down_volume_spike_fading=True,
             correlation_spike=None, declines_shrinking=None, stopped_making_lows=None),
@@ -172,7 +177,7 @@ def _ok_accum(**kw):
     return accumulation_gate(**base)
 
 
-def test_all_six_conditions_deploy_first_quarter():
+def test_both_conditions_deploy_first_quarter():
     d = _ok_accum()
     assert d.action == ACTION_ACCUMULATE
     assert d.stage == 1 and d.deploy_fraction == 0.25
@@ -180,26 +185,57 @@ def test_all_six_conditions_deploy_first_quarter():
 
 @pytest.mark.parametrize("kw,blocked", [
     ({"theme_score_positive": False}, "theme_score_positive"),
-    ({"confluence": 4}, "confluence>=5"),
-    ({"correction_atr": 1.2}, "correction>=1.5ATR"),
-    ({"breadth_deterioration_stopped": False}, "breadth_deterioration_stopped"),
+    ({"volatility_pct": 0.04}, "volatility>="),
+    ({"volatility_pct": None}, "volatility>="),
+    ({"selling_exhaustion": selling_exhaustion_score(
+        breadth_washout=True, down_volume_spike_fading=None, correlation_spike=None,
+        declines_shrinking=None, stopped_making_lows=None)}, "selling_exhaustion>=2"),
 ])
-def test_any_single_failure_blocks(kw, blocked):
-    """ALL six must hold. Missing a dislocation costs an opportunity; deploying
-    the reserve into the first week of a theme break costs the reserve."""
+def test_any_required_failure_blocks(kw, blocked):
     d = _ok_accum(**kw)
     assert d.action == ACTION_HOLD
     assert any(blocked in b for b in d.blocked_by)
 
 
-def test_weak_regime_blocks_even_on_a_deep_correction():
-    """A deep fall in a broken regime is a falling knife, not a dislocation."""
+def test_a_weak_regime_no_longer_blocks():
+    """THE regression that matters. Requiring regime>=3 alongside dislocation
+    conditions made the gate self-contradictory — a dislocation destroys the
+    regime score by construction — and it fired ONCE in 4,892 replayed weeks.
+    A washed-out complex with sellers finishing must now be able to deploy."""
     weak = weekly_regime_score(close=90, ma_w20=100, ma_w20_rising=False,
                                rs_vs_benchmark=-0.05, breadth_above_w20=0.2,
                                structure_intact=False)
-    d = _ok_accum(regime=weak, correction_atr=3.0)
-    assert d.action == ACTION_HOLD
-    assert any("regime" in b for b in d.blocked_by)
+    d = _ok_accum(regime=weak)
+    assert weak.score == 0
+    assert d.action == ACTION_ACCUMULATE
+
+
+def test_confluence_no_longer_blocks():
+    """min_confluence=5 was the CEILING of a 5-family measure, so it demanded
+    perfect alignment and was reached in 1.8% of weeks."""
+    assert _ok_accum(confluence=0).action == ACTION_ACCUMULATE
+
+
+def test_a_shallow_correction_no_longer_blocks():
+    assert _ok_accum(correction_atr=0.1).action == ACTION_ACCUMULATE
+
+
+def test_superseded_conditions_are_still_recorded():
+    """They stopped being requirements, not measurements — a decision has to
+    remain readable after the fact."""
+    obs = _ok_accum(confluence=3, correction_atr=0.4).detail["observed_not_required"]
+    assert obs["confluence"] == 3
+    assert obs["correction_atr"] == 0.4
+    assert "regime_score" in obs and "breadth_deterioration_stopped" in obs
+
+
+def test_volatility_threshold_is_absolute_not_relative():
+    """A self-calibrating version (top quintile of the complex's own trailing
+    three years) was tested and is worse: holdout +1.0% and 2/3 baskets, versus
+    +5.0% and 3/3. A relative threshold also fires in a calm complex having a
+    mildly active week; absolute stress is what carries the edge."""
+    assert _ok_accum(volatility_pct=0.0839).action == ACTION_HOLD
+    assert _ok_accum(volatility_pct=0.0841).action == ACTION_ACCUMULATE
 
 
 def test_staging_advances_one_step_at_a_time():

@@ -193,6 +193,52 @@ class WeekResult:
     correction_atr: Optional[float] = None
     exposure: float = 1.0
     fwd: dict[int, Optional[float]] = field(default_factory=dict)
+    # Candidate inputs for a replacement location condition. Captured for every
+    # week whether or not any gate used them, so a new candidate can be scored
+    # against twenty years of history without another pass over the providers.
+    feat: dict[str, Optional[float]] = field(default_factory=dict)
+
+
+def _candidate_features(idx: Any, wk: list, breadth: list[float], t: int) -> dict:
+    """Measurements a location condition could plausibly key off.
+
+    Deliberately a wide, cheap net rather than a considered shortlist: the
+    point of having twenty years is to let the data reject candidates, and a
+    shortlist chosen first would just be the same intuition that produced
+    ``confluence >= 5``.
+    """
+    close = wk[-1].c
+    a = idx.weekly_atr or 0.0
+    f: dict[str, Optional[float]] = {}
+
+    def _atr_dist(level: Optional[float]) -> Optional[float]:
+        return ((close - level) / a) if (level is not None and a) else None
+
+    f["ext_ma20_atr"] = _atr_dist(idx.levels.get("ma_w20"))
+    f["ext_ma50_atr"] = _atr_dist(idx.levels.get("ma_w50"))
+    f["ext_ma10_atr"] = _atr_dist(idx.levels.get("ma_w10"))
+    f["ext_range_low_atr"] = _atr_dist(idx.levels.get("range_low"))
+    f["breadth"] = breadth[t]
+    f["breadth_chg_4w"] = (breadth[t] - breadth[t - 4]) if t >= 4 else None
+    f["breadth_chg_13w"] = (breadth[t] - breadth[t - 13]) if t >= 13 else None
+    f["atr_pct"] = (a / close) if close else None
+    f["atr_chg_13w"] = None
+    if t >= 13:
+        from ..portfolio.basket_index import atr as _atr
+        prior = _atr(wk[: t - 12], period=14)
+        if prior:
+            f["atr_chg_13w"] = (a / prior - 1.0) if a else None
+    # Drawdown from the running 52-week high, in ATR and in percent.
+    win = wk[-52:] if len(wk) >= 52 else wk
+    hi = max(b.h for b in win)
+    f["dd_from_52w_high_pct"] = (close / hi - 1.0) if hi else None
+    f["dd_from_52w_high_atr"] = ((hi - close) / a) if a else None
+    f["weeks_since_52w_high"] = float(
+        len(win) - 1 - max(range(len(win)), key=lambda i: win[i].h))
+    # Momentum over the horizons the weekly framework already thinks in.
+    for n in (4, 13, 26):
+        f[f"ret_{n}w"] = (close / wk[-n - 1].c - 1.0) if len(wk) > n and wk[-n - 1].c else None
+    return f
 
 
 def replay_basket(
@@ -266,6 +312,7 @@ def replay_basket(
             extension_atr=d["index"].get("extension_atr"),
             correction_atr=d["index"].get("correction_atr"),
             exposure=exposure,
+            feat=_candidate_features(idx, wk, breadth_all, t),
         )
         for h in HORIZONS:
             r.fwd[h] = ((weekly[t + h].c / wk[-1].c - 1.0)
@@ -399,8 +446,15 @@ async def _basket_symbols(b: Basket) -> list[str]:
                        for r in (await s.execute(select(ThemeSymbol.symbol))).all() if r[0]})
 
 
-async def replay_one(b: Basket, *, lookback_days: int) -> tuple[list[WeekResult], dict[str, Any]]:
-    """Fetch, assemble and replay one basket."""
+async def replay_one(
+    b: Basket, *, lookback_days: int, bars_cache: Optional[dict[str, Any]] = None,
+) -> tuple[list[WeekResult], dict[str, Any]]:
+    """Fetch, assemble and replay one basket.
+
+    ``bars_cache`` lets a caller fetch once and replay many times. Candidate
+    selection needs dozens of passes over the same twenty years, and refetching
+    130 symbols for each is both slow and a pointless load on the provider.
+    """
     from ..portfolio.basket_index import _fetch_daily, build_index_series, to_weekly
 
     symbols = await _basket_symbols(b)
@@ -410,7 +464,14 @@ async def replay_one(b: Basket, *, lookback_days: int) -> tuple[list[WeekResult]
         meta["skipped"] = "no symbols"
         return [], meta
 
-    per_symbol = await _fetch_daily(symbols, lookback_days)
+    cached = (bars_cache or {}).get(b.key) if bars_cache is not None else None
+    if cached is not None:
+        per_symbol, bench_pre = cached["per_symbol"], cached["bench"]
+    else:
+        per_symbol = await _fetch_daily(symbols, lookback_days)
+        bench_pre = await _fetch_daily([b.benchmark], lookback_days)
+        if bars_cache is not None:
+            bars_cache[b.key] = {"per_symbol": per_symbol, "bench": bench_pre}
     meta["with_bars"] = len(per_symbol)
     if len(per_symbol) < 5:
         meta["skipped"] = f"only {len(per_symbol)} constituents returned bars"
@@ -420,8 +481,7 @@ async def replay_one(b: Basket, *, lookback_days: int) -> tuple[list[WeekResult]
     weekly = to_weekly(daily)
     meta["weekly_bars"] = len(weekly)
 
-    bench = await _fetch_daily([b.benchmark], lookback_days)
-    bench_weekly = to_weekly(bench[b.benchmark]) if b.benchmark in bench else []
+    bench_weekly = to_weekly(bench_pre[b.benchmark]) if b.benchmark in bench_pre else []
     if not bench_weekly:
         meta["warning"] = f"{b.benchmark} unavailable — relative strength blind"
 

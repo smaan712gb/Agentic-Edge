@@ -201,9 +201,16 @@ def evaluate_index(
     conf, conf_hits = idx.confluence()
     breadth_stopped = bool(len(bh) > 1 and bh[-1] >= bh[-2])
 
+    # Weekly ATR as a fraction of the index level: how violently the complex is
+    # actually moving, in units comparable across baskets and eras. Selected by
+    # replay over 6,863 weeks as the only location-style condition whose edge
+    # survived a three-basket holdout — see accumulation_gate's docstring.
+    vol_pct = ((idx.weekly_atr / idx.close)
+               if (idx.weekly_atr and idx.close) else None)
+
     accum = accumulation_gate(
-        theme_score_positive=True, regime=regime, confluence=conf,
-        correction_atr=idx.correction_atr(),
+        theme_score_positive=True, regime=regime, volatility_pct=vol_pct,
+        confluence=conf, correction_atr=idx.correction_atr(),
         breadth_deterioration_stopped=breadth_stopped, selling_exhaustion=selling)
     trim = trim_gate(
         confluence_at_resistance=conf, extension_atr=idx.extension_atr(),
