@@ -1,0 +1,32 @@
+{
+  "as_of": "2026-08-18",
+  "n_constituents": 72,
+  "close": 658.625,
+  "weekly_atr": 73.487,
+  "weekly_bars": 158,
+  "extension_atr": 0.2,
+  "correction_atr": 1.86,
+  "confluence": 2,
+  "confluence_levels": [
+    "ma_w10",
+    "ma_w20",
+    "vwap_from_high"
+  ],
+  "levels": {
+    "ma_w10": 647.452,
+    "ma_w20": 643.825,
+    "ma_w50": 479.406,
+    "pivot_high": 794.998,
+    "pivot_low": 523.747,
+    "vwap_from_low": 475.369,
+    "vwap_from_high": 659.728,
+    "range_high": 794.998,
+    "range_low": 523.747,
+    "fib_382": 583.594,
+    "fib_500": 518.291,
+    "fib_618": 452.988
+  },
+  "notes": [
+    "1 symbol(s) without bars: ['SKHY']"
+  ]
+}
