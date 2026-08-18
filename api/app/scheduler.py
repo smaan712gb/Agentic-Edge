@@ -108,6 +108,23 @@ _OVERLAY_RECAL_JOB_ID = "quant_overlay_recalibrate"
 # prior toward measured predictiveness. Fully autonomous self-tuning.
 _OVERLAY_RECAL_CRON = "15 17 * * 1-5"
 
+_GATE_BACKTEST_JOB_ID = "gate_backtest_revalidate"
+# 03:40 ET on the first Saturday of each month. Re-runs the point-in-time
+# replay of the portfolio gates across eight complexes and ~19 years, and
+# alerts if a gate has stopped firing or its measured edge has decayed.
+#
+# Monthly rather than on demand because the failure it guards against is
+# gradual: a threshold that was reachable when it was set drifts out of reach
+# as volatility regimes change, and nothing about a gate that quietly stops
+# firing looks different from a market that stopped qualifying. The first
+# replay found exactly that — confluence>=5 requires all five level families
+# to align inside half an ATR, which happens in under 2% of weeks, so the
+# accumulation gate fired zero times in 6,863 weeks.
+#
+# Weekend and pre-dawn because it makes ~130 provider calls and must never
+# compete with a session job for the rate budget.
+_GATE_BACKTEST_CRON = "40 3 1-7 * 6"
+
 _PORTFOLIO_JOB_ID = "portfolio_daily_decision"
 # 16:20 ET — after the close, before the 16:30 feature snapshot. Deliberately
 # ONCE a day and on closing data: re-deciding strategic exposure intraday is
@@ -250,6 +267,15 @@ async def start_scheduler() -> None:
             id=_PORTFOLIO_JOB_ID, replace_existing=True,
             misfire_grace_time=900, max_instances=1, coalesce=True,
         )
+    # Monthly gate re-validation. Reports, never retunes — a threshold change
+    # is an operator decision, and a harness allowed to move its own thresholds
+    # is a harness fitting itself to the last regime it saw.
+    _SCHEDULER.add_job(
+        _run_gate_backtest_job,
+        trigger=CronTrigger.from_crontab(_GATE_BACKTEST_CRON, timezone="America/New_York"),
+        id=_GATE_BACKTEST_JOB_ID, replace_existing=True,
+        misfire_grace_time=3600, max_instances=1, coalesce=True,
+    )
     # Morning Report — daily CIO brief pushed through the alert fan-out.
     # Always-on decision-support; never trades.
     _SCHEDULER.add_job(
@@ -566,6 +592,40 @@ async def _run_portfolio_decision_job() -> None:
         logger.info("portfolio decision tick: %s (%s)", d["instruction"], d["state"])
     except Exception as e:
         logger.exception("portfolio decision tick failed: %s", e)
+
+
+async def _run_gate_backtest_job() -> None:
+    """Monthly: re-validate the portfolio gates against ~19 years of history.
+
+    Alerts on the two ways a gate stops being useful, which look identical from
+    outside and are opposite in cause: it no longer fires at all, or it fires
+    and no longer predicts anything.
+    """
+    try:
+        from .autotrade.alerts import alert
+        from .research.gate_backtest import run_gate_backtest
+
+        r = await run_gate_backtest()
+        pooled, dead = r.get("pooled") or {}, []
+        for name, stats in pooled.items():
+            if not stats.get("n"):
+                dead.append(f"{name}: never fires")
+            elif stats.get("edge") is not None and stats["edge"] < 0 and name == "accumulate":
+                dead.append(f"{name}: {stats['n']} fires, edge {stats['edge']:+.1%} "
+                            f"vs baseline")
+        t = r.get("totals") or {}
+        if dead:
+            await alert(
+                level="warning",
+                title="Gate re-validation — a portfolio gate is not earning its place",
+                body=(f"Across {t.get('baskets_replayed')} complexes / "
+                      f"{t.get('weeks_evaluated')} weeks: " + "; ".join(dead) +
+                      ". Thresholds are an operator decision — this reports, "
+                      "it does not retune."))
+        logger.info("gate backtest: %s baskets, %s weeks, %d finding(s)",
+                    t.get("baskets_replayed"), t.get("weeks_evaluated"), len(dead))
+    except Exception as e:
+        logger.exception("gate backtest tick failed: %s", e)
 
 
 async def _run_morning_report_job() -> None:

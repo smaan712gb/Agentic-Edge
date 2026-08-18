@@ -264,6 +264,34 @@ def accumulation_gate(
 
     ``stage_completed`` is what has already been deployed this cycle, so the
     caller advances one step at a time and never re-deploys a stage.
+
+    MEASURED BEHAVIOUR — point-in-time replay over 6,863 weeks across eight
+    complexes and ~19 years (``research.gate_backtest``):
+
+        fires at confluence>=5 :      0
+        weeks reaching confluence 5 : 1.8%
+
+    ``min_confluence=5`` is the CEILING, not a high bar: ``compute_levels``
+    emits exactly five families (ma, pivot, vwap, range, fib) and
+    ``confluence_at`` counts distinct families, so >=5 demands that all five
+    align inside half a weekly ATR simultaneously. Combined with five further
+    conditions the gate is unsatisfiable in practice, which is why it has never
+    fired live either.
+
+    Loosening it is NOT supported by the same replay. Reconstructed at every
+    threshold, forward 13-week returns after a would-be signal are BELOW the
+    unconditional baseline at each one:
+
+        confluence>=1   44 fires   -1.8% vs baseline
+        confluence>=2   31 fires   -3.9%
+        confluence>=3   13 fires   -7.4%
+
+    So the conjunction does not identify better-than-average entries even when
+    it is loose enough to fire. That is consistent with the fund's own thesis:
+    in a complex that compounds, an always-invested book is a high bar, and a
+    rule that sits out most weeks to time dislocations gives up more than it
+    recovers. Left as-is deliberately, and reported monthly rather than
+    retuned — the threshold is an operator decision.
     """
     checks = {
         "theme_score_positive": theme_score_positive,

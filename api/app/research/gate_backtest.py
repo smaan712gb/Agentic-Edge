@@ -443,6 +443,14 @@ async def run_gate_backtest(
     start later — chained index construction lets a name join when it begins
     trading rather than truncating the series to the shortest history.
     """
+    # Force settings to load before any provider is constructed. Providers read
+    # their keys from the process environment at construction, and .env is only
+    # applied by get_settings(); a stale OS-level key otherwise wins silently
+    # and every request fails auth against a key nobody has configured. That
+    # cost an hour of misdiagnosis as a revoked production key.
+    from ..config import get_settings
+    get_settings()
+
     chosen = [b for b in BASKETS if keys is None or b.key in keys]
     all_results: dict[str, list[WeekResult]] = {}
     per_basket: dict[str, Any] = {}
@@ -496,6 +504,54 @@ async def run_gate_backtest(
             logger.warning("backtest: could not persist report: %s", e)
 
     return report
+
+
+def sweep_confluence(
+    all_results: dict[str, list[WeekResult]],
+    thresholds: tuple[int, ...] = (1, 2, 3, 4, 5), horizon: int = 13,
+) -> dict[str, Any]:
+    """What the accumulation gate would have done at each confluence threshold.
+
+    Reconstructed from ``accum_blocked`` rather than by re-running: a week
+    satisfied every non-confluence condition exactly when no other blocker was
+    recorded, so the confluence requirement can be varied after the fact
+    without another pass over twenty years of data.
+
+    The purpose is not to find the threshold with the best number. It is to see
+    whether the gate has any edge at ALL once it is loose enough to fire — a
+    rule that only works at a setting it never reaches has not been shown to
+    work, and a rule whose edge vanishes as soon as it fires never had one.
+    """
+    out: dict[str, Any] = {}
+    for c in thresholds:
+        def pred(r: WeekResult, c: int = c) -> bool:
+            others = [b for b in r.accum_blocked if not b.startswith("confluence")]
+            return not others and r.confluence >= c
+        out[f"confluence>={c}"] = pool_signal(all_results, predicate=pred,
+                                              horizon=horizon)
+    return out
+
+
+def sweep_trim_location(
+    all_results: dict[str, list[WeekResult]],
+    thresholds: tuple[int, ...] = (2, 3, 4, 5), horizon: int = 13,
+) -> dict[str, Any]:
+    """The trim gate's location condition at each confluence threshold.
+
+    Exhaustion and persistence are read from the recorded week rather than
+    reconstructed, so this varies only the half that was found to be binding.
+    A trim signal EARNS its place by being followed by returns BELOW the
+    baseline — if forward returns after a trim match the baseline, the gate is
+    selling for no reason.
+    """
+    out: dict[str, Any] = {}
+    for c in thresholds:
+        def pred(r: WeekResult, c: int = c) -> bool:
+            location = r.confluence >= c or (r.extension_atr or 0) > 2.5
+            return location and r.exhaustion >= 3
+        out[f"confluence>={c}"] = pool_signal(all_results, predicate=pred,
+                                              horizon=horizon)
+    return out
 
 
 def pool_signal(all_results: dict[str, list[WeekResult]], *, predicate,
