@@ -276,6 +276,46 @@ async def _cba_features(symbols: list[str], as_of: datetime) -> dict[str, float]
     return out
 
 
+async def _observe_feature_integrity(rows: dict[str, dict[str, Any]]) -> None:
+    """Record per-feature coverage and magnitude for the integrity monitor.
+
+    Deliberately generic: every numeric feature in the store is observed by the
+    same loop, so a feature added tomorrow is watched from its first snapshot
+    without anyone remembering to wire it up. That is the property that matters
+    — every silently-dead feed found so far was one nobody was watching, and
+    the ones under a hand-written check were fine.
+
+    Two numbers per feature, because the two failure modes are independent.
+    Coverage answers "did the provider answer at all"; summed magnitude answers
+    "did it answer with anything other than zero". The dark-pool 404 broke the
+    first while leaving the second untestable, and the options-flow parse broke
+    the second at full coverage. Either number alone misses one of them.
+    """
+    from ..autotrade.feed_integrity import observe_many
+
+    if not rows:
+        return
+
+    def _num(v: Any) -> Optional[float]:
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    keys: set[str] = set()
+    for r in rows.values():
+        keys.update(k for k, v in r.items() if _num(v) is not None)
+
+    n = len(rows)
+    readings = []
+    for key in sorted(keys):
+        vals = [x for x in (_num(r.get(key)) for r in rows.values()) if x is not None]
+        readings.append({
+            "feed": f"feature.{key}",
+            "coverage": (len(vals) / n) if n else None,
+            "numeric": round(sum(abs(v) for v in vals), 6),
+            "subjects": n,
+        })
+    await observe_many(readings)
+
+
 async def build_snapshot(
     *, as_of: Optional[datetime] = None, with_market: bool = True, with_flow: bool = True,
     max_symbols: int = 200,
@@ -328,6 +368,11 @@ async def build_snapshot(
     cba = await _cba_features(symbols, as_of)
     for sym in symbols:
         rows[sym]["cba_confidence_num"] = cba.get(sym, 0.0)
+
+    # Record what every feature actually returned, before standardisation —
+    # cross_sectional_z would mask a dead feed by rescaling its constant to
+    # zero, which is exactly how z_flow_imbalance came to be silently dropped.
+    await _observe_feature_integrity(rows)
 
     # Cross-sectional standardisation across the universe (history-free rank).
     cross_sectional_z(rows)

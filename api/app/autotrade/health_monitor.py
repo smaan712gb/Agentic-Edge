@@ -327,6 +327,23 @@ async def run_health_check() -> dict[str, Any]:
     except Exception as e:
         add("warning", "Signal-freshness check failed", str(e))
 
+    # --- 7. Feed integrity ----------------------------------------------
+    # Checks 1-6 all answer "is the machine running". They stayed green through
+    # six defects in which the machine ran perfectly and computed garbage — a
+    # dead feed is indistinguishable from a quiet one unless something watches
+    # the DATA rather than the process. 5c and 5d are hand-written instances of
+    # exactly that idea; this is the general form, so the next dead feed does
+    # not need someone to have anticipated it.
+    try:
+        from .feed_integrity import run_feed_integrity_check
+        fi = await run_feed_integrity_check()
+        metrics["feeds_observed"] = fi.get("feeds_observed", 0)
+        metrics["feed_anomalies"] = len(fi.get("anomalies", []))
+        for a in fi.get("anomalies", []):
+            add(a["level"], f"Feed '{a['feed']}' — {a['kind']}", a["detail"])
+    except Exception as e:
+        add("warning", "Feed-integrity check failed", str(e))
+
     # --- Dispatch -------------------------------------------------------
     crit = [f for f in findings if f["level"] == "critical"]
     warn = [f for f in findings if f["level"] == "warning"]

@@ -267,6 +267,19 @@ class Settings(BaseSettings):
     # every 30 min during RTH, so a real rotation is re-flagged within a tick.
     # Sized to cover an intraday gap but NOT an overnight/weekend one.
     ROTATION_MAX_AGE_HOURS: float = 6.0
+
+    # --- Feed integrity -------------------------------------------------
+    # Watches the DATA rather than the process. Every check in the health
+    # monitor stayed green through six defects in which a feed was dead and
+    # the machine around it ran perfectly, so a signal being constant, empty
+    # or late is treated as a fault in its own right. Judged against each
+    # feed's own history, which is why there is nothing here to tune per feed.
+    FEED_INTEGRITY_ENABLED: bool = True
+    # Long enough to span a weekend without the monitor going blind on Monday.
+    FEED_INTEGRITY_WINDOW_HOURS: float = 96.0
+    # A gate that has never fired needs a real sample before that means
+    # anything — a quarter covers several market regimes.
+    FEED_INTEGRITY_GATE_DAYS: float = 90.0
     # A rotation call must rest on evidence of INSTITUTIONS MOVING, not on price
     # alone. rs_breakdown and breadth_deterioration are both pure price/trend
     # reads over overlapping names, so any ordinary 3-5% pullback trips both and
