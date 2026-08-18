@@ -94,6 +94,21 @@ async def check_entry_breaker(ib: Any) -> Optional[str]:
         if reason is None:
             reason = f"account read failed ({e}) — pausing new entries"
 
+    # 2b) Long-only invariant. A short option leg in a LEAPS-only book is not a
+    # risk metric drifting toward a threshold — it is a state that should be
+    # unreachable, and it stays dangerous (undefined loss, margin, assignment)
+    # for as long as it is open. Latch on sight, ahead of every other trigger.
+    if reason is None and account_ok:
+        try:
+            from .position_guard import halt_on_short_options
+            breach = await halt_on_short_options(
+                await ib.get_positions(), source="entry_breaker")
+            if breach:
+                # halt_on_short_options has already latched and paged.
+                return breach
+        except Exception as e:
+            logger.warning("breaker: short-option invariant check failed: %s", e)
+
     # Connection staleness — don't open new positions blind. BUT a successful
     # account read above already proves the socket is live THIS tick, so only
     # consult the heartbeat snapshot when we have no independent confirmation.

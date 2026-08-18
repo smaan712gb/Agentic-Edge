@@ -439,13 +439,22 @@ async def flatten_all(
         sec = str(p.get("secType") or p.get("sec_type") or "").upper()
         conid = int(p.get("conid") or 0)
         try:
-            if sec == "OPT" and conid and qty > 0:
+            if sec == "OPT" and conid:
+                # A SHORT option leg is the position you most need this button
+                # to close — undefined loss, margin, assignment risk — and it
+                # was the one case the old `qty > 0` filter skipped entirely,
+                # so flatten-all left the FN −3 sitting in the account. Buy it
+                # back; sell longs. allow_touch so the order can actually
+                # reach the far side of the book on an emergency exit.
+                side = "SELL" if qty > 0 else "BUY"
                 r = await submit_single_leg_option(
-                    ibkr=ib, conid=conid, contracts=int(abs(qty)), action="SELL",
+                    ibkr=ib, conid=conid, contracts=int(abs(qty)), action=side,
                     config=ExecutionConfig(walk_interval_sec=15, max_offset_pct_of_spread=0.60,
                                            timeout_sec=120),
-                    adaptive_priority="Urgent")
-                closed.append({"symbol": sym, "conid": conid, "qty": qty, "status": r.status})
+                    adaptive_priority="Urgent", allow_touch=True)
+                closed.append({"symbol": sym, "conid": conid, "qty": qty,
+                               "side": side, "status": r.status,
+                               "filled_qty": r.filled_qty})
             elif sec == "STK":
                 side = "SELL" if qty > 0 else "BUY"
                 r2 = await ib.submit_trade(IntentDC(

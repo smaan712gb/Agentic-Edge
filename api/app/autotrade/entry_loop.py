@@ -1816,15 +1816,27 @@ def fmt_money(v: float) -> str:
 
 
 async def _resolve_stuck_intents() -> None:
-    """Mark stuck-in-submitting intents as abandoned + log + alert.
+    """Resolve stuck-in-submitting intents against BROKER TRUTH, then abandon
+    only the ones the broker confirms never filled.
 
     A clean run flips status to 'filled' / 'abandoned' / 'error' before
     returning. If something hangs (rare but observed: walking-limit
     timed out without bubbling, IBKR connection blip mid-walk), the row
     sits in 'submitting' forever and the per-symbol cap blocks retries.
     This watchdog catches those after STUCK_INTENT_TIMEOUT_MIN minutes.
+
+    Why it reads the account first: 'stuck in submitting' and 'filled but the
+    outcome write never landed' look identical from the DB, and the watchdog
+    used to assume the former. FN (2026-08-18) was marked abandoned at 13:45:14
+    against a position the broker had already filled; the orphan reconciler
+    flipped it back 34 seconds later. That 34-second window is a real hazard —
+    an abandoned intent drops out of the active filter, so the orphan ADOPTER
+    can create a second intent for the same contracts and both end up 'filled'
+    on one lot (the NBIS double-claim). Reading the fill state here closes the
+    window instead of racing to repair it afterwards.
     """
     from datetime import timedelta
+    from api.app.db import TradeAuditLog
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=STUCK_INTENT_TIMEOUT_MIN)
     async with db_session() as s:
         rows = (
@@ -1833,25 +1845,99 @@ async def _resolve_stuck_intents() -> None:
                 .where(TradeIntent.updated_at < cutoff)
             )
         ).scalars().all()
-        for i in rows:
+    if not rows:
+        return
+
+    # One position snapshot for the whole batch. None = broker unreadable.
+    held_by_conid: Optional[dict[int, float]] = None
+    try:
+        from api.app.positions import _ibkr
+        ib = await _ibkr()
+        positions = await ib.get_positions()
+        held_by_conid = {}
+        for p in positions or []:
+            cid = int(p.get("conid") or 0)
+            if cid:
+                held_by_conid[cid] = held_by_conid.get(cid, 0.0) + float(p.get("qty") or 0)
+    except Exception as e:
+        logger.warning("watchdog: broker position read failed (%s) — will not abandon blind", e)
+
+    abandoned: list[TradeIntent] = []
+    recovered: list[TradeIntent] = []
+    deferred: list[TradeIntent] = []
+    async with db_session() as s:
+        for stale in rows:
+            i = await s.get(TradeIntent, stale.id)
+            if i is None or i.status != "submitting":
+                continue        # resolved itself while we were reading the account
+            conid = int((i.walking_config or {}).get("leap_conid") or 0)
+
+            if held_by_conid is None:
+                # Blind. Abandoning here is the exact error being fixed: it
+                # asserts "no fill" on no evidence. Leave it submitting; the
+                # next tick re-checks with a live snapshot.
+                deferred.append(i)
+                s.add(TradeAuditLog(
+                    intent_id=i.id, action="watchdog_deferred", outcome="deferred",
+                    payload={"reason": "broker positions unreadable; not abandoning blind",
+                             "stuck_since": str(i.updated_at)}))
+                continue
+
+            qty = held_by_conid.get(conid, 0.0) if conid else 0.0
+            if qty > 0:
+                # It filled — the outcome write is what went missing, not the order.
+                i.status = "filled"
+                i.position_state = "leap_open"
+                i.qty = qty
+                i.leap_qty = int(qty)
+                if i.leap_fill_price is None:
+                    i.leap_fill_price = i.net_debit_target
+                if i.leap_filled_at is None:
+                    i.leap_filled_at = datetime.now(timezone.utc)
+                recovered.append(i)
+                s.add(TradeAuditLog(
+                    intent_id=i.id, action="watchdog_recovered_filled", outcome="filled",
+                    payload={"leap_conid": conid, "broker_qty": qty,
+                             "note": "stuck in submitting but the broker holds the contract — "
+                                     "resolved to filled instead of abandoned so the exit "
+                                     "layer owns it immediately"}))
+                continue
+
             logger.warning(
-                "watchdog: marking stuck intent %s (%s) as abandoned (in submitting since %s)",
-                i.id, i.symbol, i.updated_at,
+                "watchdog: marking stuck intent %s (%s) as abandoned — broker holds "
+                "%g on conid %s (in submitting since %s)",
+                i.id, i.symbol, qty, conid or "?", i.updated_at,
             )
             i.status = "abandoned"
             i.position_state = "abandoned"
-            from api.app.db import TradeAuditLog
+            abandoned.append(i)
             s.add(TradeAuditLog(
                 intent_id=i.id, action="watchdog_abandon",
                 outcome="abandoned",
-                payload={"reason": f"submitting > {STUCK_INTENT_TIMEOUT_MIN}min"},
+                payload={"reason": f"submitting > {STUCK_INTENT_TIMEOUT_MIN}min",
+                         "leap_conid": conid, "broker_qty": qty,
+                         "verified_against_broker": True},
             ))
-        if rows:
-            await alert(
-                level="warning",
-                title=f"Watchdog: {len(rows)} stuck intent(s) abandoned",
-                body=", ".join(f"{i.symbol} ({i.id})" for i in rows),
-            )
+
+    if recovered:
+        await alert(
+            level="warning",
+            title=f"Watchdog: {len(recovered)} stuck intent(s) were actually FILLED",
+            body=", ".join(f"{i.symbol} ({i.id})" for i in recovered),
+        )
+    if abandoned:
+        await alert(
+            level="warning",
+            title=f"Watchdog: {len(abandoned)} stuck intent(s) abandoned",
+            body=", ".join(f"{i.symbol} ({i.id})" for i in abandoned),
+        )
+    if deferred:
+        await alert(
+            level="warning",
+            title=f"Watchdog: {len(deferred)} stuck intent(s) unresolved — broker unreadable",
+            body=("Left in 'submitting' rather than abandoned without evidence: "
+                  + ", ".join(f"{i.symbol} ({i.id})" for i in deferred)),
+        )
 
 
 async def _correlation_haircut(symbol: str) -> tuple[float, Optional[float]]:

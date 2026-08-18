@@ -100,6 +100,23 @@ async def run_health_check() -> dict[str, Any]:
     metrics["live_positions"] = len(live)
     metrics["broker_ok"] = ib_ok
 
+    # --- 1b. Long-only invariant ----------------------------------------
+    # Ranked directly under "broker reachable" because it outranks every
+    # check below it: an undefined-risk short leg in a long-only book is a
+    # worse state than a thin margin cushion or a stale signal, and unlike
+    # those it can never be explained by market conditions.
+    if ib_ok and settings.LEAPS_ONLY:
+        try:
+            from .position_guard import short_option_positions, describe_short_options
+            shorts = short_option_positions(live)
+            metrics["short_options"] = len(shorts)
+            if shorts:
+                add("critical", f"LONG-ONLY BREACH — {len(shorts)} short option position(s)",
+                    f"{describe_short_options(shorts)}. Undefined risk in a long-call-only "
+                    f"book; entries are halted by the breaker. Flatten manually, then re-arm.")
+        except Exception as e:
+            add("warning", "Long-only invariant check failed", str(e))
+
     # --- 2. Kill-switch / breaker state ---------------------------------
     armed = None
     breaker_tripped = None

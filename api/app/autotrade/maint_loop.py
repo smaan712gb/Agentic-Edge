@@ -154,7 +154,26 @@ async def _tick() -> None:
         logger.warning("maint loop: IBKR unavailable (%s); skipping tick", e)
         return
 
-    pos_by_symbol = {(p.get("symbol") or "").upper(): p for p in positions}
+    # HARD INVARIANT, checked before anything else acts on this snapshot: a
+    # LEAPS-only book holds long calls and nothing else. A short option leg
+    # cannot be produced by any path the strategy runs, so its existence means
+    # an order fired against a position that was no longer there. Halt new
+    # orders and page — do not trade on through a breached book.
+    try:
+        from .position_guard import halt_on_short_options
+        await halt_on_short_options(positions, source="maint_loop")
+    except Exception as e:
+        logger.exception("short-option invariant check failed: %s", e)
+
+    # Symbol-keyed for the callers that only know a ticker. Prefer the LONG
+    # option leg when a symbol carries more than one contract: the old
+    # "last row wins" could hand the exit logic a short leg to evaluate.
+    pos_by_symbol: dict[str, dict] = {}
+    for p in positions:
+        sym_k = (p.get("symbol") or "").upper()
+        cur = pos_by_symbol.get(sym_k)
+        if cur is None or (float(p.get("qty") or 0) > 0 >= float(cur.get("qty") or 0)):
+            pos_by_symbol[sym_k] = p
 
     # Keep the Position snapshot table fresh (stocks only) so the research
     # replay harness + dashboard don't read a stale snapshot. Best-effort —
@@ -552,12 +571,23 @@ async def _reconcile_leap_qty(ibkr_positions: list[dict]) -> None:
     broker holds fewer contracts than the intent believes. Catches a trim/close
     that filled after the walker marked it abandoned (late-fill race) so the
     loop never re-trims or manages a stale quantity. Never syncs UP (an increase
-    is a fresh position the orphan-adopt path owns)."""
+    is a fresh position the orphan-adopt path owns).
+
+    A NEGATIVE broker quantity is not a smaller position — it is a different
+    position, on the wrong side of a long-only mandate. The old ``broker_qty > 0``
+    guard skipped those silently, so the FN short (2026-08-18) passed through
+    this reconciler untouched on every tick and was later written off as a
+    phantom. Negative now raises CRITICAL and latches the entry breaker; the
+    intent is left exactly as-is for a human to resolve.
+    """
+    # Positions are keyed by conid and SUMMED: a snapshot can legitimately carry
+    # more than one row per contract, and taking the last one (the old
+    # behaviour) silently drops the rest.
     by_conid: dict[int, float] = {}
     for p in ibkr_positions:
         cid = int(p.get("conid") or 0)
         if cid:
-            by_conid[cid] = float(p.get("qty") or 0)
+            by_conid[cid] = by_conid.get(cid, 0.0) + float(p.get("qty") or 0)
     async with db_session() as s:
         rows = (await s.execute(
             select(TradeIntent)
@@ -571,7 +601,32 @@ async def _reconcile_leap_qty(ibkr_positions: list[dict]) -> None:
                 continue           # phantom (no broker pos) handled in _evaluate_pmcc
             broker_qty = by_conid[conid]
             cur = float(i.qty or 0)
-            if broker_qty > 0 and broker_qty < cur - 1e-6:
+            if broker_qty < 0:
+                # Mandate breach. Do NOT sync, do NOT close, do NOT reconcile to
+                # closed — every one of those actions makes the position harder
+                # to see. Flag it, page, and leave the intent exactly where it
+                # is so it stays in every managed-position view the operator has.
+                s.add(TradeAuditLog(
+                    intent_id=i.id, action="long_only_breach_detected", outcome="critical",
+                    payload={"symbol": i.symbol, "conid": conid, "intent_qty": cur,
+                             "broker_qty": broker_qty,
+                             "note": "broker holds a SHORT option position against a "
+                                     "long-only intent — order fired against a position "
+                                     "that was already gone"}))
+                logger.critical("maint loop: LONG-ONLY BREACH — %s conid %s is SHORT %g "
+                                "(intent believes +%g)", i.symbol, conid, broker_qty, cur)
+                await alert(
+                    level="critical",
+                    title=f"LONG-ONLY BREACH — short position: {i.symbol}",
+                    body=(f"Broker holds {broker_qty:g} on conid {conid} while intent {i.id} "
+                          f"believes it is long {cur:g}. Not auto-closed and not reconciled "
+                          f"away — flatten manually and review the close path."))
+                continue
+            if broker_qty == 0:
+                # Flat at the broker with a live intent: bookkeeping drift, and
+                # the phantom path in _evaluate_pmcc reconciles it to closed.
+                continue
+            if broker_qty < cur - 1e-6:
                 old = cur
                 i.qty = broker_qty
                 if i.leap_qty is not None:
@@ -1603,7 +1658,44 @@ async def _evaluate_pmcc(intent: TradeIntent, latest_decision: Optional[str], ib
     # (closed outside the system / expired / assigned / a late-exit fill). Only
     # the stock path used to handle this; leap_only phantoms lingered forever,
     # re-quoting a position that doesn't exist. Reconcile to closed and stop.
+    #
+    # ``pos`` is matched by SYMBOL, which is too coarse to write off a position
+    # on: it says nothing about the specific contract, and it cannot distinguish
+    # "flat" from "short". Before recording the terminal, irreversible
+    # phantom_closed, re-read the intent's own conid. FN (2026-08-18) was
+    # written off this way at 19:27 while a working sell order from the same
+    # intent was still at the broker; that order filled into a −3 short which
+    # then had no managing intent at all.
     if pos is None:
+        conid = int((intent.walking_config or {}).get("leap_conid") or 0)
+        if conid:
+            from .position_guard import live_position_qty
+            held = await live_position_qty(ib, conid=conid)
+            if held is None:
+                logger.warning("maint: %s looks phantom but the broker snapshot is "
+                               "unreadable — leaving the intent open", sym)
+                return
+            if held < 0:
+                logger.critical("maint: LONG-ONLY BREACH — %s conid %s is SHORT %g; "
+                                "refusing to record it as a phantom close", sym, conid, held)
+                async with db_session() as s:
+                    s.add(TradeAuditLog(
+                        intent_id=intent.id, action="long_only_breach_detected", outcome="critical",
+                        payload={"symbol": sym, "conid": conid, "broker_qty": held,
+                                 "note": "symbol lookup missed the position but the conid is "
+                                         "SHORT — not a phantom, a mandate breach"}))
+                await alert(
+                    level="critical",
+                    title=f"LONG-ONLY BREACH — short position: {sym}",
+                    body=(f"Broker holds {held:g} on conid {conid} for intent {intent.id}. "
+                          f"Not reconciled to closed. Flatten manually and review."))
+                return
+            if held > 0:
+                # Held under a conid the symbol map missed — manage it, don't
+                # bury it.
+                logger.warning("maint: %s conid %s holds %g but was absent from the "
+                               "symbol snapshot; skipping phantom close", sym, conid, held)
+                return
         async with db_session() as s:
             i = await s.get(TradeIntent, intent.id)
             if i and i.status == "filled":
@@ -1611,8 +1703,9 @@ async def _evaluate_pmcc(intent: TradeIntent, latest_decision: Optional[str], ib
                 i.position_state = "closed"
                 s.add(TradeAuditLog(
                     intent_id=i.id, action="phantom_leap_auto_closed", outcome="closed",
-                    payload={"symbol": sym, "note": "broker holds no matching position; "
-                             "reconciled to closed by maint loop"}))
+                    payload={"symbol": sym, "leap_conid": conid, "broker_qty": 0,
+                             "note": "broker holds no matching position (verified by conid); "
+                                     "reconciled to closed by maint loop"}))
         return
 
     # THEME thesis-break — reacts to a broken thesis WITHOUT a discrete event.
@@ -2284,17 +2377,70 @@ async def _flag_pmcc_close(*, intent: TradeIntent, reason: str, kind: str,
         return
 
     full_qty = int(intent.qty or 1)
-    qty = int(close_qty) if close_qty else full_qty
-    is_partial = close_qty is not None and 0 < qty < full_qty
-    if qty <= 0:
+    requested = int(close_qty) if close_qty else full_qty
+    is_partial = close_qty is not None and 0 < requested < full_qty
+    if requested <= 0:
         return
+
+    # A previous close on this intent may still be working at the broker. Firing
+    # another one against it is a double-sell, and on a long-only book a
+    # double-sell is a naked short.
+    _held_since = _CLOSE_ORDER_UNCONFIRMED.get(intent.id)
+    if _held_since is not None:
+        age_min = (datetime.now(timezone.utc) - _held_since).total_seconds() / 60.0
+        if age_min < _UNCONFIRMED_HOLD_MIN:
+            logger.warning("maint: holding close for %s — previous order's fill state "
+                           "unconfirmed %.1f min ago", intent.symbol, age_min)
+            return
+        _CLOSE_ORDER_UNCONFIRMED.pop(intent.id, None)
+
+    # Size the order from the LIVE position, never from intent.qty. The intent
+    # is a record of what we believe we bought; between that belief and now sit
+    # partial fills, late fills, manual trades and this very function's own
+    # earlier retries. On 2026-08-18 the FN close ran 28 times off intent.qty=3
+    # while two of its "abandoned" orders had actually filled — +3 became −3.
+    from .position_guard import resolve_close_qty
+    decision = await resolve_close_qty(
+        ib=ib, conid=leap_conid, symbol=intent.symbol, requested=requested,
+        long_only=True,
+    )
+    if not decision.ok:
+        async with db_session() as s:
+            s.add(TradeAuditLog(
+                intent_id=intent.id, action="close_refused_broker_truth", outcome="refused",
+                payload={"symbol": intent.symbol, "leap_conid": leap_conid,
+                         "requested": requested, "reason": reason, "kind": kind,
+                         **decision.to_dict()},
+            ))
+            await record_auto_action(
+                s, loop="maintenance", action_type="pmcc_close_refused",
+                gate_result=_synthetic_passed_gate(),
+                symbol=intent.symbol, intent_id=intent.id,
+                payload={"reason": reason, "kind": kind, "guard": decision.to_dict()},
+                outcome="refused",
+            )
+        logger.warning("maint: close refused for %s — %s", intent.symbol, decision.reason)
+        # A flat book with a live 'filled' intent is bookkeeping drift, not an
+        # exit problem; the phantom reconcile owns it. A short book is a breach
+        # and resolve_close_qty has already paged.
+        return
+    qty = decision.qty
+    if decision.disposition == "clamped":
+        logger.warning("maint: %s close clamped %d -> %d (%s)",
+                       intent.symbol, requested, qty, decision.reason)
+        # A clamp means the intent is carrying more contracts than the account.
+        # Say so loudly — every downstream risk number is sized off intent.qty.
+        await alert(level="warning", title=f"Close clamped to broker position: {intent.symbol}",
+                    body=decision.reason)
+        is_partial = qty < full_qty
 
     async with db_session() as s:
         s.add(TradeAuditLog(
             intent_id=intent.id,
             action="auto_leap_trim_attempt" if is_partial else "auto_pmcc_close_attempt",
             payload={"symbol": intent.symbol, "leap_conid": leap_conid, "qty": qty,
-                     "full_qty": full_qty, "partial": is_partial,
+                     "requested_qty": requested, "full_qty": full_qty,
+                     "broker_qty": decision.broker_qty, "partial": is_partial,
                      "reason": reason, "kind": kind},
         ))
 
@@ -2309,25 +2455,48 @@ async def _flag_pmcc_close(*, intent: TradeIntent, reason: str, kind: str,
         # Full closes (earnings/thesis break) exit decisively; a partial
         # de-risk trim walks the limit instead of paying up across the spread.
         adaptive_priority="Normal" if is_partial else "Urgent",
+        # An exit must be able to reach the bid. Capped at a fraction of the
+        # half-spread it cannot: the FN close offered $244 into a $240 bid,
+        # 28 times over 3h15m, and abandoned every time. A de-risk trim is
+        # discretionary and keeps the tighter cap; a real exit does not.
+        allow_touch=not is_partial,
     )
 
+    # What actually filled, not what we asked for. A cancel can race a PARTIAL
+    # fill; booking the intent closed against 1 of 3 contracts sold leaves two
+    # unmanaged. The executor reports filled_qty; fall back to the request only
+    # for older results that don't carry it.
+    sold = float(result.filled_qty if result.filled_qty is not None else qty)
+    if getattr(result, "order_still_live", False):
+        _CLOSE_ORDER_UNCONFIRMED[intent.id] = datetime.now(timezone.utc)
+        await alert(level="warning",
+                    title=f"Close order state UNCONFIRMED: {intent.symbol}",
+                    body=(f"{result.error or 'cancel/fill unconfirmed'}. Holding further "
+                          f"close attempts on this position for {_UNCONFIRMED_HOLD_MIN:.0f} "
+                          f"min so a live order cannot be double-filled."))
     async with db_session() as s:
         i = await s.get(TradeIntent, intent.id)
         if i:
             if result.status == "filled":
-                if is_partial:
-                    # Partial de-risk: reduce the held quantity, keep it open.
-                    i.qty = max(0.0, float(i.qty or 0) - qty)
-                    if i.leap_qty is not None:
-                        i.leap_qty = max(0, int(i.leap_qty) - qty)
-                    if i.qty <= 0:   # defensive — shouldn't happen given is_partial
-                        i.status = "closed"
-                        i.position_state = "closed"
-                else:
+                remaining = max(0.0, float(i.qty or 0) - sold)
+                if remaining <= 0:
                     i.status = "closed"
                     i.position_state = "closed"
+                else:
+                    # Partial de-risk, or a partial fill on an intended full
+                    # close — either way the position is still open.
+                    i.qty = remaining
+                    if i.leap_qty is not None:
+                        i.leap_qty = int(remaining)
             elif result.status not in ("abandoned", "rejected_pretrade"):
                 i.status = "error"
+        if result.status == "filled" and sold < qty:
+            s.add(TradeAuditLog(
+                intent_id=intent.id, action="close_partially_filled", outcome="partial",
+                payload={"symbol": intent.symbol, "requested": qty, "filled": sold,
+                         "remaining_qty": max(0.0, float(full_qty) - sold),
+                         "note": "order filled partially during cancel; intent left open "
+                                 "for the remainder"}))
         # action_type drives the daily-cap counter + trim dedup, so keep
         # 'leap_trim_*' and 'pmcc_close_*' distinct.
         prefix = "leap_trim" if is_partial else "pmcc_close"
@@ -2535,6 +2704,14 @@ async def _underlying_in_downtrend(symbol: str, ib: Any) -> bool:
 # A flag-only close re-evaluates true every tick; without this it would re-alert
 # + re-audit ~once per tick (the AVGO 46x pattern). Resets on restart.
 _CLOSE_FLAG_ALERTED: set[str] = set()
+
+# Intents whose last close order could not be proven dead (cancel unconfirmed,
+# or executions unreadable). Value is the UTC timestamp it was recorded.
+# Re-firing a close against a possibly-live order is how one 3-lot became a
+# 3-lot short; these are held until a later tick sees the broker position
+# settle, at which point resolve_close_qty sizes off the truth.
+_CLOSE_ORDER_UNCONFIRMED: dict[str, datetime] = {}
+_UNCONFIRMED_HOLD_MIN = 10.0
 
 
 async def _watch_8k_filings(pos_by_symbol: dict[str, dict]) -> dict[str, str]:

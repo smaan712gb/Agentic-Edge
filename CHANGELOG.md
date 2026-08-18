@@ -35,6 +35,61 @@ package and needs its own version-control trail.
   reachable, kill-switch/breaker state, position↔intent parity, margin
   cushion, signal freshness) that alert on drift.
 
+### Earnings-proximity gate was reading the whole world's calendar
+
+The crash exit is allowed to fire on a sharp drop only because it is gated
+on earnings proximity — that gate was inert. `_fetch_last_earnings` called
+FMP's `/stable/earnings-calendar?symbol=X`, a **market-wide date-range**
+endpoint that ignores `symbol` and returns the same 4,000-row global
+calendar (Shenzhen/Seoul/Hong Kong listings included) to every caller. So
+`days_since_last_earnings()` returned one constant for the entire
+universe. On 2026-08-18 that constant was 2 — derived from a **Sunday** —
+against `EARNINGS_BREAK_SESSIONS = 2`, leaving the gate open for every
+position in the book. Six names were auto-closed on one bad sector day;
+five had last reported between 6 and 78 days earlier. That is precisely
+the drawdown-dump the rule exists to prevent.
+
+- Both `_fetch_last_earnings` and `_fetch_next_earnings` now use the
+  symbol-scoped `/stable/earnings`, and **verify the response actually
+  belongs to the requested symbol** before deriving a date from it — so a
+  vendor quietly changing what an endpoint filters on fails closed instead
+  of handing every ticker somebody else's calendar.
+- `days_to_earnings` (entry/roll paths) was reading the same bad source
+  and is fixed by the same change.
+
+### Execution-path safety (post-FN incident, 2026-08-18)
+
+One earnings-break exit produced 28 close attempts in 3h15m, two
+undetected late fills, and a −3 short call in a long-only book. Fixes:
+
+- **Close quantity now comes from the live broker position**, read at
+  submit time, never from `intent.qty`. Under-held positions clamp;
+  a flat or short position refuses the order and alerts.
+- **Long-only invariant.** Any short option leg in a LEAPS-only book
+  latches the entry breaker, pages CRITICAL, and blocks new orders —
+  checked by the maintenance tick, the entry breaker and the health
+  monitor. `flatten-all` now buys shorts back instead of skipping them.
+- **Cancel/fill race closed.** After a cancel-on-timeout the executor
+  re-queries executions before recording a result, distinguishes
+  "confirmed no fill" from "unknown", reports partial fills, and flags
+  the order as possibly-live when it cannot prove otherwise. A close
+  whose fill state is unconfirmed is not retried for 10 minutes.
+- **Entry watchdog reads fill state** before abandoning a stuck intent —
+  a filled-but-unwritten intent resolves to `filled`, and a broker it
+  cannot read leaves the intent alone rather than abandoning blind.
+- **The walking limit now walks.** The single-leg executor placed one
+  Adaptive order at its cap and never repriced (`walk_steps: 0` on every
+  order it ever placed). It now steps the live order's limit toward the
+  cap, sizes the step to cover that distance within the timeout, and —
+  on exits — may walk to the far touch. The old cap sat strictly inside
+  the spread, so an exit could not reach the bid by construction.
+- **Position marks prefer the live book.** `last_price` was sourced from
+  `marketPrice()`/`last`/`close` ahead of `bid`, so an illiquid LEAP
+  carried a previous-session print as a live mark (FN marked $334 against
+  a 212/228 book, overstating the loss by ~$34k). The book now wins, and
+  non-book prices are reported `price_fresh: false` with a
+  `price_source` tag.
+
 ### Reliability fixes
 
 - Maintenance loop now manages `leap_open` positions (a stale state filter
