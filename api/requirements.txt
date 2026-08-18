@@ -39,5 +39,5 @@ ib_insync>=0.9.86
 #
 # When bumping: push the engine first, then update this SHA in the same commit
 # as any API-side change that depends on it, so the pair moves together.
-# 9c43d4a = macro-guardrail FMP fallback + 270-720d LEAP window + OI floor 10 (2026-08-17)
-tradingagents @ git+https://github.com/smaan712gb/TradingAgents.git@9c43d4aaf10fb3e78706bb1c8856ea0c8f716ef6
+# b69d0e7 = macro fallback + 270-720d LEAP window + OI floor 10 + OCC flow parse (2026-08-18)
+tradingagents @ git+https://github.com/smaan712gb/TradingAgents.git@b69d0e71c50c9f7778fbe274faf585936e0aec0d
