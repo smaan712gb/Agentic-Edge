@@ -215,6 +215,13 @@ async def _tick() -> None:
     except Exception as e:
         logger.exception("PMCC reconcile failed: %s", e)
 
+    # Runs AFTER adoption and reconcile — those are the two paths that can both
+    # claim one position, so this is the point where a duplicate would exist.
+    try:
+        await _dedupe_active_intents()
+    except Exception as e:
+        logger.exception("intent dedupe failed: %s", e)
+
     # Macro regime read once per tick — VIX + SPX overlay applied across
     # all per-position evaluations downstream. Best-effort fetch; on
     # failure we get a 'calm' default and the audit row records the
@@ -826,6 +833,82 @@ async def _execute_off_theme_close(*, sym: str, qty: float, pos: dict, ib: Any,
 # ---------------------------------------------------------------------------
 # Orphan PMCC reconciliation
 # ---------------------------------------------------------------------------
+
+
+async def _dedupe_active_intents() -> int:
+    """Retire duplicate ACTIVE intents that manage the same broker contract.
+
+    Two independent recovery paths can each claim one position, and both can
+    win. Observed with NBIS on 2026-08-17:
+
+      1. the entry loop filled the LEAP and created the real intent;
+      2. the walker never wrote its outcome, so the stuck-intent watchdog
+         marked that intent abandoned, removing it from the ACTIVE filter;
+      3. the orphan adopter then saw a live position with no active intent and
+         created a SECOND intent for the same contracts;
+      4. the reconciler later flipped the first one back to filled.
+
+    Both ended ACTIVE on the same 5 contracts. Nothing downstream noticed: the
+    health monitor counts distinct SYMBOLS, so it reported managed=1. The cost
+    only lands at exit — ``_evaluate_pmcc`` runs per intent, so a close would
+    have submitted two SELL orders for 5 contracts each against a 5-lot,
+    leaving the account short a contract it never owned.
+
+    Keeps the EARLIEST intent: it carries the genuine entry price, order id and
+    audit trail, while the later one is a synthetic reconstruction. The rest are
+    closed, not deleted, so the history stays auditable.
+    """
+    from sqlalchemy import or_ as _or
+
+    async with db_session() as s:
+        rows = (await s.execute(
+            select(TradeIntent)
+            .where(TradeIntent.status.in_(["filled", "submitting", "submitted", "closing"]))
+            .where(TradeIntent.position_state.in_(
+                ["pmcc_full", "leap_pending", "leap_open", "leap_open_naked", "closing"]))
+            .order_by(TradeIntent.created_at)
+        )).scalars().all()
+
+        # Group by the contract actually held. leap_conid is the precise key;
+        # fall back to (symbol, structure) so an intent that never recorded a
+        # conid still de-duplicates rather than silently pairing up.
+        groups: dict[Any, list[TradeIntent]] = {}
+        for i in rows:
+            cfg = i.walking_config or {}
+            conid = int(cfg.get("leap_conid") or 0)
+            key = conid if conid else (str(i.symbol or "").upper(), str(i.structure or ""))
+            groups.setdefault(key, []).append(i)
+
+        retired = 0
+        for key, members in groups.items():
+            if len(members) < 2:
+                continue
+            keep, *dupes = members          # ordered by created_at ascending
+            for d in dupes:
+                d.status = "closed"
+                d.position_state = "closed"
+                s.add(TradeAuditLog(
+                    intent_id=d.id, action="duplicate_intent_retired", outcome="closed",
+                    payload={
+                        "kept_intent": keep.id, "symbol": d.symbol, "key": str(key),
+                        "qty": d.qty, "entry_strategy": d.entry_strategy,
+                        "note": ("two active intents managed the same contract; an exit "
+                                 "would have sold both quantities against a single lot"),
+                    },
+                ))
+                retired += 1
+                logger.warning(
+                    "dedupe: retired duplicate intent %s (%s, %s) — %s already manages "
+                    "this contract", d.id[:8], d.symbol, d.entry_strategy, keep.id[:8],
+                )
+        if retired:
+            await alert(
+                level="warning",
+                title=f"Retired {retired} duplicate position intent(s)",
+                body=("Two intents managed the same broker contract; the later duplicate "
+                      "was closed so an exit cannot sell more than is held."),
+            )
+    return retired
 
 
 async def _reconcile_orphan_pmcc_intents(ibkr_positions: list[dict]) -> int:
