@@ -241,6 +241,51 @@ def evaluate_index(
     }
 
 
+def live_instruction(
+    decision: dict[str, Any], current_exposure: float, *, tolerance: float = 0.02,
+) -> dict[str, Any]:
+    """Re-derive add/hold/reduce from a stored band and a LIVE exposure reading.
+
+    The daily decision fixes two different kinds of thing, and only one of them
+    should stay fixed for a day.
+
+    The STATE and its target band are a weekly judgement — regime, breadth,
+    volatility, selling exhaustion, all read off completed bars. Re-deciding
+    that intraday is how a fund becomes a day trader, and the partial current
+    week would make it flicker, so it is correctly settled once a day.
+
+    The INSTRUCTION is not a judgement at all. It is arithmetic: where does
+    exposure sit relative to the band. And exposure moves continuously — a
+    long-call book gains delta as it goes up, so an overnight gap changes it
+    without a single order being placed. Freezing that number meant a book that
+    gapped from 61% into the middle of its 80-90% band still read 61% and kept
+    buying, because the loop was comparing yesterday's exposure against today's
+    band. Options only trade in RTH, so every stored instruction is acted on at
+    prices that did not exist when it was computed.
+
+    Splitting them keeps the weekly discipline where it belongs and makes the
+    part that must be current, current.
+    """
+    band = decision.get("target_band") or [None, None]
+    lo, hi = band[0], band[1]
+    if decision.get("instruction") == INSTRUCTION_NO_DECISION or lo is None or hi is None:
+        return {"instruction": decision.get("instruction", INSTRUCTION_NO_DECISION),
+                "exposure_pct": current_exposure, "target_band": band,
+                "state": decision.get("state"), "live": False}
+
+    if current_exposure < lo - tolerance:
+        action = "add"
+    elif current_exposure > hi + tolerance:
+        action = "reduce"
+    else:
+        action = "hold"
+    return {"instruction": action, "exposure_pct": current_exposure,
+            "target_band": [lo, hi], "state": decision.get("state"), "live": True,
+            "stored_instruction": decision.get("instruction"),
+            "stored_exposure_pct": (decision.get("exposure") or {}).get(
+                "delta_adjusted_pct")}
+
+
 async def compute_daily_decision(ib: Any) -> dict[str, Any]:
     """Build the whole picture and resolve it to one instruction."""
     from .basket_index import build_basket_index

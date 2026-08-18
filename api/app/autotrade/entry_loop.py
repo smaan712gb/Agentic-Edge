@@ -237,12 +237,41 @@ async def _tick() -> None:
     _portfolio_halt: Optional[dict[str, Any]] = None
     if get_settings().PORTFOLIO_LAYER_ENABLED:
         try:
-            from api.app.portfolio.daily import load_todays_decision
+            from api.app.portfolio.daily import live_instruction, load_todays_decision
             _pd = await load_todays_decision()
             if _pd:
-                _instr = str(_pd.get("instruction") or "hold")
-                _exp = float((_pd.get("exposure") or {}).get("delta_adjusted_pct") or 0)
-                _band = _pd.get("target_band") or [0, 1]
+                # The BAND is yesterday's weekly judgement and correctly fixed.
+                # The INSTRUCTION is arithmetic against live exposure, which
+                # moves on every mark — a long-call book gains delta as it
+                # rises, so an overnight gap re-sizes the book with no order
+                # placed. Re-derive it rather than trusting the snapshot.
+                try:
+                    from api.app.portfolio.exposure import compute_book_exposure
+                    from api.app.positions import _ibkr
+                    _book = await compute_book_exposure(await _ibkr())
+                    _live = live_instruction(_pd, _book.exposure_pct)
+                except Exception as e:  # noqa: BLE001
+                    # A broker hiccup must not silently revert to a stale
+                    # number that reads as current. Fall back to the stored
+                    # decision and say so.
+                    logger.warning("auto-entry: live exposure unavailable (%s) — "
+                                   "using stored decision", e)
+                    _live = {"instruction": str(_pd.get("instruction") or "hold"),
+                             "exposure_pct": float((_pd.get("exposure") or {}).get(
+                                 "delta_adjusted_pct") or 0),
+                             "target_band": _pd.get("target_band") or [0, 1],
+                             "live": False}
+                _instr = str(_live.get("instruction") or "hold")
+                _exp = float(_live.get("exposure_pct") or 0)
+                _band = _live.get("target_band") or [0, 1]
+                if _live.get("live") and _live.get("stored_instruction") != _instr:
+                    logger.info(
+                        "auto-entry: live exposure %.1f%% re-derives %s (stored was "
+                        "%s at %.1f%%) — band %.0f-%.0f%% unchanged",
+                        _exp * 100, _instr.upper(),
+                        str(_live.get("stored_instruction")).upper(),
+                        float(_live.get("stored_exposure_pct") or 0) * 100,
+                        _band[0] * 100, _band[1] * 100)
                 if _instr == "no_decision":
                     # The index could not be built. That is an absence of an
                     # opinion, not an opinion to stand down — fall back to the
