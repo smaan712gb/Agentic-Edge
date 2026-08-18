@@ -108,6 +108,15 @@ _OVERLAY_RECAL_JOB_ID = "quant_overlay_recalibrate"
 # prior toward measured predictiveness. Fully autonomous self-tuning.
 _OVERLAY_RECAL_CRON = "15 17 * * 1-5"
 
+_PORTFOLIO_JOB_ID = "portfolio_daily_decision"
+# 16:20 ET — after the close, before the 16:30 feature snapshot. Deliberately
+# ONCE a day and on closing data: re-deciding strategic exposure intraday is
+# how a fund becomes a day trader. The 2026-08-18 tape gate halting every entry
+# on a -4.8% session, while the weekly picture read mid-range, is the failure
+# this cadence exists to prevent. Intraday information informs the NEXT
+# scheduled decision rather than pre-empting this one.
+_PORTFOLIO_CRON = "20 16 * * 1-5"
+
 _MORNING_REPORT_JOB_ID = "morning_report_dispatch"
 # 08:45 ET weekdays — after the overnight EDGAR/stake/insider sweeps, before
 # the 09:00 theme run. The brief reads only persisted artifacts (yesterday's
@@ -233,6 +242,14 @@ async def start_scheduler() -> None:
         id=_HEALTH_JOB_ID, replace_existing=True,
         misfire_grace_time=300, max_instances=1, coalesce=True,
     )
+    # Portfolio-level exposure decision — one instruction per day, post-close.
+    if get_settings().PORTFOLIO_LAYER_ENABLED:
+        _SCHEDULER.add_job(
+            _run_portfolio_decision_job,
+            trigger=CronTrigger.from_crontab(_PORTFOLIO_CRON, timezone="America/New_York"),
+            id=_PORTFOLIO_JOB_ID, replace_existing=True,
+            misfire_grace_time=900, max_instances=1, coalesce=True,
+        )
     # Morning Report — daily CIO brief pushed through the alert fan-out.
     # Always-on decision-support; never trades.
     _SCHEDULER.add_job(
@@ -538,6 +555,17 @@ async def _run_edgar_sweep_job() -> None:
             )
     except Exception as e:
         logger.exception("EDGAR sweep tick failed: %s", e)
+
+
+async def _run_portfolio_decision_job() -> None:
+    """Post-close: one instruction for the whole book, persisted for the loops."""
+    try:
+        from .portfolio.daily import dispatch_daily_decision
+        from .positions import _ibkr
+        d = await dispatch_daily_decision(await _ibkr())
+        logger.info("portfolio decision tick: %s (%s)", d["instruction"], d["state"])
+    except Exception as e:
+        logger.exception("portfolio decision tick failed: %s", e)
 
 
 async def _run_morning_report_job() -> None:

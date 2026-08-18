@@ -221,6 +221,46 @@ async def _tick() -> None:
             )
         return
 
+    # ---- Portfolio-level exposure decision --------------------------------
+    # The book-level answer to "should we be adding at all", taken once a day
+    # on closing data and read here. This is what stops the loop deploying cash
+    # simply because cash exists: at 62% delta-adjusted exposure in a 60-75%
+    # target band, the correct action is HOLD even with $840k idle.
+    # Fail-open — no decision, or a stale one, leaves the per-name path intact.
+    if get_settings().PORTFOLIO_LAYER_ENABLED:
+        try:
+            from api.app.portfolio.daily import load_todays_decision
+            _pd = await load_todays_decision()
+            if _pd:
+                _instr = str(_pd.get("instruction") or "hold")
+                _exp = float((_pd.get("exposure") or {}).get("delta_adjusted_pct") or 0)
+                _band = _pd.get("target_band") or [0, 1]
+                if _instr in ("hold", "reduce"):
+                    logger.info(
+                        "auto-entry: portfolio says %s — exposure %.1f%% vs target "
+                        "%.0f-%.0f%% (state=%s). No new risk this tick.",
+                        _instr.upper(), _exp * 100, _band[0] * 100, _band[1] * 100,
+                        _pd.get("state"))
+                    today = datetime.now(timezone.utc).replace(
+                        hour=0, minute=0, second=0, microsecond=0)
+                    async with db_session() as s:
+                        already = (await s.execute(
+                            select(AutoAction.id)
+                            .where(AutoAction.action_type == "entry_blocked_portfolio")
+                            .where(AutoAction.timestamp >= today).limit(1))).first()
+                        if already is None:
+                            await record_auto_action(
+                                s, loop="entry", action_type="entry_blocked_portfolio",
+                                gate_result=None,
+                                payload={"instruction": _instr, "state": _pd.get("state"),
+                                         "exposure_pct": _exp, "target_band": _band},
+                                outcome="blocked")
+                    return
+                logger.info("auto-entry: portfolio says ADD — exposure %.1f%% vs "
+                            "target %.0f-%.0f%%", _exp * 100, _band[0] * 100, _band[1] * 100)
+        except Exception as e:
+            logger.debug("auto-entry: portfolio decision unavailable (%s) — continuing", e)
+
     # Live tape gate — the intraday pulse acting on the desk (NEW BUYING only;
     # exits are untouched by design). Distribution across OUR universe halts
     # this tick's entries; money rotating out of the complex halves size.
@@ -231,7 +271,21 @@ async def _tick() -> None:
             pulse = await build_intraday_pulse()
             day_type = pulse.get("day_type")
             semis_rot = pulse.get("semis_rotation")
-            if day_type == "distribution":
+            _advisory = bool(get_settings().PULSE_GATE_ADVISORY)
+            if day_type == "distribution" and _advisory:
+                # ADVISORY: a red intraday tape is not a strategic decision.
+                # This halted every entry on 2026-08-18 for a -4.8% session
+                # while the weekly picture read mid-range — neither extended
+                # nor washed out — and the book sat on $840k of cash through a
+                # dislocation the thesis said to accumulate into. Size down
+                # hard, but let the portfolio layer own add/hold/trim.
+                sizing_factor *= 0.5
+                logger.info(
+                    "auto-entry: tape gate ADVISORY — distribution day "
+                    "(%.0f%% up, avg %+.1f%%) — sizing x0.5, not halting; "
+                    "the daily portfolio decision owns exposure",
+                    pulse.get("breadth_up_pct", 0), pulse.get("avg_change_pct", 0))
+            elif day_type == "distribution":
                 logger.info("auto-entry: tape gate — distribution day "
                             "(%.0f%% up, avg %+.1f%%) — no new entries this tick",
                             pulse.get("breadth_up_pct", 0), pulse.get("avg_change_pct", 0))
@@ -251,7 +305,8 @@ async def _tick() -> None:
                                      "avg_change_pct": pulse.get("avg_change_pct")},
                             outcome="blocked",
                         )
-                return
+                if not _advisory:
+                    return
             if semis_rot == "out_of_semis":
                 factor = float(get_settings().PULSE_OUT_OF_SEMIS_SIZING)
                 sizing_factor *= factor

@@ -349,6 +349,26 @@ class Settings(BaseSettings):
     # 30h covers a normal overnight gap but never a weekend.
     MORNING_BRIEF_MAX_AGE_HOURS: float = 30.0
 
+    # ----- Portfolio-level exposure management ------------------------
+    # The layer that decides what the BOOK should be doing, as opposed to what
+    # any ticker should be doing. Exposure is measured DELTA-ADJUSTED, not by
+    # premium paid: on 2026-08-18 the book was 39.7% of NAV in premium and
+    # 62.6% in real exposure, so every gate keyed off premium was working
+    # against a denominator understating risk by 22 points of NAV.
+    PORTFOLIO_LAYER_ENABLED: bool = True
+    # ~3 years, so the weekly series carries a 50-week average and a stable ATR.
+    PORTFOLIO_INDEX_LOOKBACK_DAYS: int = 1100
+    # Staleness ceiling on the persisted daily decision, same discipline as the
+    # rotation flags and the morning brief: a decision taken against a market
+    # that has moved on is wrong evidence, not weak evidence. Past this the
+    # loops fall back to per-name behaviour rather than yesterday's target.
+    PORTFOLIO_DECISION_MAX_AGE_HOURS: float = 30.0
+    # The intraday pulse stops being a VETO on new buying and becomes a sizing
+    # input. It halted every entry on 2026-08-18 for a -4.8% session while the
+    # weekly picture read mid-range — an intraday signal overriding a strategic
+    # decision. False keeps the old hard-halt behaviour.
+    PULSE_GATE_ADVISORY: bool = True
+
     # ----- Quant Research Factory (decision-support, never a gate) -----
     # Point-in-time feature store + IC/alpha-decay research harness. The
     # nightly snapshot writes one feature row per theme symbol; the labeler
