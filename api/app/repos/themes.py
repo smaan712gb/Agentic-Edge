@@ -5,10 +5,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.app.db import Theme, ThemeSymbol
+from api.app.db import (
+    NewsMention, Run, RunEvent, Theme, ThemeReport, ThemeRotation, ThemeSymbol,
+    TickerScore, TradeIntent,
+)
 
 
 class ThemeRepo:
@@ -62,9 +65,65 @@ class ThemeRepo:
         return theme
 
     async def delete(self, theme_id: str) -> bool:
+        """Delete a theme and everything that hangs off it, in dependency order.
+
+        Deleting used to fail outright for any theme that had ever been run:
+
+            IntegrityError: NOT NULL constraint failed: runs.theme_id
+
+        The ``runs`` relationship carries no cascade, so SQLAlchemy tried to
+        ORPHAN the runs by nulling their ``theme_id`` — a column declared
+        NOT NULL. Only never-run themes could be deleted, which is exactly the
+        opposite of what an operator wants: the ones worth removing are the
+        ones with history.
+
+        The database cannot help here. SQLite enforces foreign keys only when
+        ``PRAGMA foreign_keys=ON``, which this app never sets, so the schema's
+        ON DELETE CASCADE clauses are decorative at runtime. Everything is
+        therefore removed explicitly, in order, with Core statements rather
+        than ORM cascades — a theme can own ~50 runs whose events number in the
+        thousands, and loading that graph to delete it row-by-row is needless.
+
+        TRADE INTENTS ARE NEVER DELETED. They reference runs and carry the
+        record of real positions, including open ones; their FK is SET NULL by
+        design. Cascading into them would destroy position history — and for a
+        live LEAP, the only row that knows the system owns it. Their run_id is
+        nulled instead, which is what the schema asks for.
+        """
         t = await self.s.get(Theme, theme_id)
         if not t:
             return False
+
+        run_ids = [
+            r[0] for r in (
+                await self.s.execute(select(Run.id).where(Run.theme_id == theme_id))
+            ).all()
+        ]
+
+        if run_ids:
+            # 1. Preserve position history: detach intents, never delete them.
+            await self.s.execute(
+                update(TradeIntent)
+                .where(TradeIntent.run_id.in_(run_ids))
+                .values(run_id=None)
+            )
+            # 2. Children of the runs.
+            for model in (RunEvent, TickerScore, ThemeReport):
+                await self.s.execute(delete(model).where(model.run_id.in_(run_ids)))
+            # 3. The runs themselves.
+            await self.s.execute(delete(Run).where(Run.id.in_(run_ids)))
+
+        # 4. Theme-scoped rows not reached via a run.
+        await self.s.execute(delete(ThemeReport).where(ThemeReport.theme_id == theme_id))
+        await self.s.execute(delete(ThemeRotation).where(ThemeRotation.theme_id == theme_id))
+        # News is shared research, not theme-owned — detach, matching its SET NULL FK.
+        await self.s.execute(
+            update(NewsMention)
+            .where(NewsMention.theme_id == theme_id)
+            .values(theme_id=None)
+        )
+
+        # 5. The theme. Its symbols go with it via the ORM cascade.
         await self.s.delete(t)
         return True
 
