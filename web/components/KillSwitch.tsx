@@ -99,34 +99,31 @@ export function KillSwitch() {
     }
   };
 
-  // Not yet loaded
-  if (enabled === null && !error) {
-    return (
-      <div className="text-xs text-[var(--color-fg-dim)] flex items-center gap-2 mt-2">
-        {token ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
-        {token ? "checking…" : (
-          <button onClick={() => promptForToken()} className="underline hover:text-[var(--color-fg)]">
-            Set admin token
-          </button>
-        )}
-      </div>
-    );
-  }
-
-  if (error && !enabled) {
-    return (
-      <div className="text-xs text-[var(--color-down)] mt-2 max-w-full truncate" title={error}>
-        Kill switch: API err
-        <button onClick={() => promptForToken()} className="underline ml-2 hover:text-[var(--color-fg)]">
-          token?
-        </button>
-      </div>
-    );
-  }
+  // The control must NEVER disappear.
+  //
+  // An emergency halt that is only visible once the operator has
+  // authenticated is not an emergency control. Two of the three states here
+  // rendered as ~12px dim text — "Set admin token" when localStorage held no
+  // token, "Kill switch: API err" when the status read failed — so on
+  // 2026-08-19 the sidebar looked like it simply had no kill switch. The
+  // token lives in per-origin localStorage, so merely reaching the dashboard
+  // on http://127.0.0.1:3001 instead of http://localhost:3001 is enough to
+  // lose it, and with it every visible trace of the halt.
+  //
+  // Now the block always renders, always names the state, and always keeps
+  // HALT one click away — the click prompts for the token if it needs one.
+  //
+  // When the state is UNKNOWN the primary action is HALT, never ARM. Halting
+  // is idempotent and is the safe direction to move blind; arming a system
+  // whose state you cannot read is the one action that must require knowing
+  // that state first.
+  const loading = enabled === null && !error && !!token;
+  const unknown = enabled === null;
+  const showHalt = enabled === true || unknown;
 
   return (
     <div className="mt-2">
-      {enabled ? (
+      {showHalt ? (
         <button
           onClick={onHalt}
           disabled={busy}
@@ -155,20 +152,33 @@ export function KillSwitch() {
           {busy ? "Arming…" : "Re-arm autotrade"}
         </button>
       )}
-      <div className={cn(
-        "text-[10px] mt-1.5 flex items-center gap-1.5",
-        enabled ? "text-[var(--color-up)]" : "text-[var(--color-fg-dim)]",
-      )}>
-        {enabled ? (
-          <>
-            <ShieldCheck className="h-3 w-3" /> Auto-trade armed
-          </>
-        ) : (
-          <>
-            <ShieldOff className="h-3 w-3" /> Auto-trade halted
-          </>
+
+      <div
+        className={cn(
+          "text-[10px] mt-1.5 flex items-center gap-1.5",
+          enabled === true && "text-[var(--color-up)]",
+          enabled === false && "text-[var(--color-fg-dim)]",
+          unknown && "text-[var(--color-down)]",
+        )}
+        title={error || undefined}
+      >
+        {enabled === true && (<><ShieldCheck className="h-3 w-3" /> Auto-trade armed</>)}
+        {enabled === false && (<><ShieldOff className="h-3 w-3" /> Auto-trade halted</>)}
+        {unknown && (
+          loading
+            ? (<><Loader2 className="h-3 w-3 animate-spin" /> checking state…</>)
+            : (<><OctagonAlert className="h-3 w-3" /> State unknown — {error ? "API error" : "admin token needed"}</>)
         )}
       </div>
+
+      {unknown && !loading && (
+        <button
+          onClick={() => promptForToken()}
+          className="text-[10px] underline mt-1 text-[var(--color-fg-dim)] hover:text-[var(--color-fg)]"
+        >
+          {token ? "re-enter admin token" : "set admin token"}
+        </button>
+      )}
     </div>
   );
 }
