@@ -55,6 +55,11 @@ export type Run = {
   best_positioned: string[];
 };
 
+// What GET /api/runs actually returns. The list endpoint deliberately omits
+// `events` and `scores`: scores alone were 91% of that payload and the list
+// renders none of them. Open a run to get the full `Run` from /api/runs/{id}.
+export type RunListItem = Omit<Run, "events" | "scores">;
+
 export type EquityPoint = { date: string; equity: number };
 export type Position = {
   symbol: string;
@@ -605,7 +610,7 @@ export const api = {
     regime: (id: string) => jfetch<ThemeRegime>(`/api/themes/${id}/regime`),
   },
   runs: {
-    list: () => jfetch<Run[]>("/api/runs"),
+    list: () => jfetch<RunListItem[]>("/api/runs"),
     get: (id: string) => jfetch<Run>(`/api/runs/${id}`),
     start: (themeId: string) =>
       jfetch<Run>("/api/runs", { method: "POST", body: JSON.stringify({ theme_id: themeId }) }),

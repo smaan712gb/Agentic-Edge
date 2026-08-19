@@ -263,9 +263,14 @@ class Settings(BaseSettings):
     # where money is moving NOW, so a stale flag is wrong evidence, not weak
     # evidence — after downtime it halts entries on conditions that already
     # reversed (2026-08-17: 9-day-old flags blocked 17 candidates on an
-    # accumulation day). Older rows are ignored (fail-open); the sweep runs
-    # every 30 min during RTH, so a real rotation is re-flagged within a tick.
-    # Sized to cover an intraday gap but NOT an overnight/weekend one.
+    # accumulation day). Older rows are ignored (fail-open). The sweep runs
+    # 4x/day at 10:05/12:05/14:05/16:05 ET (see _ROTATION_CRON), so within the
+    # session the 2h spacing sits well inside this ceiling and a real rotation
+    # is re-flagged on the next sweep. Sized to cover an intraday gap but NOT
+    # an overnight/weekend one: a flag from yesterday's close describes a book
+    # that has since traded a full overnight session, and re-reading it at
+    # 10:05 is cheaper than acting on it at 09:30. Expiring overnight is the
+    # intended behaviour, not a gap to be closed by widening this value.
     ROTATION_MAX_AGE_HOURS: float = 6.0
 
     # --- Feed integrity -------------------------------------------------

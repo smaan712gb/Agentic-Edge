@@ -4,10 +4,10 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { ArrowRight, CircleCheck, CircleDashed, CircleX, Activity } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
-import { api, type Run, type Theme } from "@/lib/api";
+import { api, type Run, type RunListItem, type Theme } from "@/lib/api";
 
 export default function RunsListPage() {
-  const [runs, setRuns] = useState<Run[] | null>(null);
+  const [runs, setRuns] = useState<RunListItem[] | null>(null);
   const [themes, setThemes] = useState<Record<string, Theme>>({});
 
   useEffect(() => {

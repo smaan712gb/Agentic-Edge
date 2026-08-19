@@ -627,7 +627,14 @@ async def start_run(
 async def list_runs() -> list[dict[str, Any]]:
     async with db_session() as s:
         runs = await RunRepo(s).list()
-        # The list view doesn't need full event log; trim DTOs.
+        # LIST view: identity + lifecycle only. No event log, no per-symbol
+        # scores. The scores block was 91% of this response (189KB of 208KB
+        # across 33 runs) and nothing in the list reads it — the scorecard is
+        # fetched per-run from /api/runs/{run_id}. Size is not cosmetic here:
+        # the runs page polls this every 3s, and at 200KB the dev proxy
+        # intermittently gave up mid-body while still returning 200, so the
+        # browser parsed a truncated document ("Unterminated string in JSON at
+        # position 195857"). It also grew with every run, without bound.
         out = []
         for r in runs:
             out.append({
@@ -639,16 +646,6 @@ async def list_runs() -> list[dict[str, Any]]:
                 "progress": r.progress,
                 "summary": r.summary,
                 "best_positioned": r.best_positioned or [],
-                "events": [],
-                "scores": [
-                    {
-                        "symbol": sc.symbol,
-                        "setup": sc.setup, "options": sc.options,
-                        "thesis_fit": sc.thesis_fit, "composite": sc.composite,
-                        "decision": sc.decision,
-                        "drivers": sc.drivers or [], "risks": sc.risks or [],
-                    } for sc in r.scores
-                ],
             })
         return out
 

@@ -80,7 +80,8 @@ async def is_theme_rotating(theme_id: Optional[str]) -> tuple[bool, float, list[
     Rows older than ROTATION_MAX_AGE_HOURS are therefore ignored rather than
     trusted. Fail-open matches this module's stated policy: not blocking is the
     low-regret direction, and a genuinely rotating theme is re-flagged by the
-    next sweep (every 30 min during RTH) within one entry tick.
+    next sweep (10:05/12:05/14:05/16:05 ET) — within the session that is well
+    inside the ceiling; overnight the flag expires on purpose.
     """
     if not theme_id:
         return False, 0.0, []
