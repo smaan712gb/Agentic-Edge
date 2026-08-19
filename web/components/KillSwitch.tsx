@@ -29,8 +29,12 @@ export function KillSwitch() {
     setToken(window.localStorage.getItem("agentic_edge_admin_token") || "");
   }, []);
 
+  // Attempted with or WITHOUT a stored token. When the stack is started by
+  // start-all.ps1 the dashboard is bound to loopback and the server-side
+  // admin proxy supplies the token, so the operator at the machine sees live
+  // state with no setup at all. Elsewhere this 401s and we fall back to
+  // asking for a token — the switch still renders either way.
   useEffect(() => {
-    if (!token) return;
     let alive = true;
     const refresh = async () => {
       try {
@@ -48,6 +52,19 @@ export function KillSwitch() {
     return () => { alive = false; clearInterval(id); };
   }, [token]);
 
+  /** Run an admin call; on 401/403 prompt for a token once and retry. */
+  const withToken = async <T,>(call: (tok: string) => Promise<T>): Promise<T> => {
+    try {
+      return await call(token);
+    } catch (e: any) {
+      const msg = String(e?.message || e);
+      if (!/(401|403)/.test(msg)) throw e;
+      const tok = promptForToken();
+      if (!tok) throw e;
+      return await call(tok);
+    }
+  };
+
   const promptForToken = (): string | null => {
     const v = window.prompt("Admin token (saved locally for this browser):");
     if (v) {
@@ -59,11 +76,9 @@ export function KillSwitch() {
   };
 
   const onHalt = async () => {
-    let tok = token;
-    if (!tok) {
-      tok = promptForToken() ?? "";
-      if (!tok) return;
-    }
+    // No token? Try anyway — the loopback proxy may supply one. Only ask the
+    // operator for a token if the attempt actually comes back unauthorised.
+    // Making them find a secret before they can halt is the wrong order.
     const reason = window.prompt(
       "Reason for emergency halt? (e.g. unusual fill, market event, user pause):",
       "operator emergency halt",
@@ -71,7 +86,7 @@ export function KillSwitch() {
     if (reason === null) return;
     setBusy(true); setError(null);
     try {
-      await api.admin.autotradeDisable(tok, { reason, actor: "ui-kill-switch" });
+      await withToken((t) => api.admin.autotradeDisable(t, { reason, actor: "ui-kill-switch" }));
       setEnabled(false);
     } catch (e: any) {
       setError(String(e?.message || e).slice(0, 100));
@@ -81,16 +96,11 @@ export function KillSwitch() {
   };
 
   const onArm = async () => {
-    let tok = token;
-    if (!tok) {
-      tok = promptForToken() ?? "";
-      if (!tok) return;
-    }
     const reason = window.prompt("Reason for re-arming?", "operator re-arm");
     if (reason === null) return;
     setBusy(true); setError(null);
     try {
-      await api.admin.autotradeEnable(tok, { reason, actor: "ui-kill-switch" });
+      await withToken((t) => api.admin.autotradeEnable(t, { reason, actor: "ui-kill-switch" }));
       setEnabled(true);
     } catch (e: any) {
       setError(String(e?.message || e).slice(0, 100));

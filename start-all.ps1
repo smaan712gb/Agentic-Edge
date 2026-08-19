@@ -90,15 +90,30 @@ function Start-Stack {
         "Set-Location '$root'; `$Host.UI.RawUI.WindowTitle = 'Agentic Edge - BACKEND (loops + scheduler + monitor)'; " +
         "`$env:PYTHONUTF8 = '1'; python -m uvicorn api.app.main:app --port 8000"
     )
-    # DASHBOARD — Next.js on :3001.
+    # DASHBOARD — Next.js on :3001, bound to LOOPBACK ONLY.
+    #
+    # -H 127.0.0.1 is a security boundary, not a preference. Next defaults to
+    # every interface, which put the whole dashboard — positions, P&L, runs,
+    # and the /api/* proxy in front of the backend — on the LAN, while the
+    # backend itself was correctly bound to 127.0.0.1.
+    #
+    # That bind is also what makes ADMIN_TOKEN_AUTOINJECT safe: a socket which
+    # only accepts local connections cannot be reached from the network, so
+    # the admin proxy (web/app/api/admin/[...path]/route.ts) can supply the
+    # operator's token and give the machine a kill switch that needs no setup.
+    # The two are set together, here, on purpose — auto-injecting a token on a
+    # dashboard exposed to the network would hand the halt to anyone on it.
+    $adminToken = Get-AdminToken
     Start-Process pwsh -ArgumentList @(
         '-NoExit', '-Command',
-        "Set-Location '$root\web'; `$Host.UI.RawUI.WindowTitle = 'Agentic Edge - DASHBOARD'; npm run dev -- -p 3001"
+        "Set-Location '$root\web'; `$Host.UI.RawUI.WindowTitle = 'Agentic Edge - DASHBOARD'; " +
+        "`$env:ADMIN_API_TOKEN = '$adminToken'; `$env:ADMIN_TOKEN_AUTOINJECT = '1'; " +
+        "npm run dev -- -p 3001 -H 127.0.0.1"
     )
 
     Write-Host ''
     Write-Host '  Backend   : http://127.0.0.1:8000   (trading loops, scheduler, 15-min health monitor)' -ForegroundColor Green
-    Write-Host '  Dashboard : http://localhost:3001' -ForegroundColor Green
+    Write-Host '  Dashboard : http://localhost:3001   (loopback only — not reachable from the network)' -ForegroundColor Green
     Write-Host ''
     Write-Host '  Control verbs: status | rearm | arm | disarm | run-themes | reconcile | positions | stop' -ForegroundColor Gray
     Write-Host '  e.g.  pwsh -ExecutionPolicy Bypass -File "start-all.ps1" status' -ForegroundColor DarkGray
