@@ -98,13 +98,24 @@ async def build_pmcc(run_id: str, symbol: str, body: BuildPmccIn,
     except Exception as e:
         raise HTTPException(503, f"IBKR not reachable: {e}")
 
+    # LEAPS_ONLY is a MANDATE, not an auto-loop preference. It was honoured in
+    # entry_loop and enforced after the fact by position_guard/health_monitor,
+    # but never checked here — so this operator endpoint would happily build a
+    # short call into a long-only book: exactly the undefined-risk leg the
+    # breaker now latches on. Two accidents were hiding it — the UI sends an
+    # empty admin token (401), and the auto-gate rejects while the kill switch
+    # is off. Both disappear the moment the operator sets a token and re-arms.
+    leaps_only = get_settings().LEAPS_ONLY
+
     elig = await select_pmcc_legs(
         symbol=sym, contracts=body.contracts, ibkr=ib,
         leap_delta_target=body.leap_delta_target,
         short_delta_target=body.short_delta_target,
+        require_short_call=not leaps_only,
     )
     if not elig.eligible or elig.candidate is None:
-        raise HTTPException(422, f"PMCC ineligible: {elig.reason}")
+        raise HTTPException(
+            422, f"{'LEAP' if leaps_only else 'PMCC'} ineligible: {elig.reason}")
     cand = elig.candidate
 
     # Persist as pending_review intent. Same conservative cap as the
@@ -117,22 +128,35 @@ async def build_pmcc(run_id: str, symbol: str, body: BuildPmccIn,
         "walk_interval_sec": 30, "max_offset_pct_of_spread": 0.30,
         "timeout_sec": 300,
     }
+    # Under LEAPS_ONLY select_pmcc_legs returns a zero-value PLACEHOLDER short
+    # leg (conid 0, never quoted), so cand.net_debit is simply the LEAP's mid.
+    # Those placeholders must not be persisted as if they were a real leg, or
+    # the row reads as a PMCC to everything downstream.
+    short_fields: dict[str, Any] = {} if leaps_only else {
+        "short_call_expiry": cand.short_call.expiry,
+        "short_call_strike": cand.short_call.strike,
+        "short_call_delta_target": body.short_delta_target,
+        "short_call_delta_actual": cand.short_call.delta,
+        "short_call_iv": cand.short_call.iv,
+        "short_call_open_interest": cand.short_call.open_interest,
+        "short_call_qty": body.contracts,
+    }
     async with db_session() as s:
         intent = TradeIntent(
             run_id=run_id, symbol=sym,
             side="BUY", qty=body.contracts, order_type="LMT",
             status="pending_review",
-            structure="pmcc", position_state="pending",
-            entry_strategy="combo",
+            # The same structure the auto-entry loop writes, so exits,
+            # reconciliation and the long-only guard read an operator-built
+            # position exactly as they read a machine-built one.
+            structure="leap_only" if leaps_only else "pmcc",
+            position_state="pending",
+            entry_strategy="single" if leaps_only else "combo",
             leap_expiry=cand.leap.expiry, leap_strike=cand.leap.strike,
             leap_delta_target=body.leap_delta_target, leap_delta_actual=cand.leap.delta,
             leap_iv=cand.leap.iv, leap_open_interest=cand.leap.open_interest,
             leap_qty=body.contracts,
-            short_call_expiry=cand.short_call.expiry, short_call_strike=cand.short_call.strike,
-            short_call_delta_target=body.short_delta_target,
-            short_call_delta_actual=cand.short_call.delta,
-            short_call_iv=cand.short_call.iv, short_call_open_interest=cand.short_call.open_interest,
-            short_call_qty=body.contracts,
+            **short_fields,
             net_debit_target=cand.net_debit,
             max_loss=cand.max_loss,
             walking_config=walking_cfg,
@@ -142,7 +166,8 @@ async def build_pmcc(run_id: str, symbol: str, body: BuildPmccIn,
         # Stash conids on the intent for the executor — packed in walking_config so
         # we don't add another column right now.
         walking_cfg["leap_conid"] = cand.leap.conid
-        walking_cfg["short_call_conid"] = cand.short_call.conid
+        if not leaps_only:
+            walking_cfg["short_call_conid"] = cand.short_call.conid
         walking_cfg["spot_at_build"] = cand.spot
         intent.walking_config = walking_cfg
         s.add(intent)
@@ -169,8 +194,10 @@ async def submit_intent(intent_id: str,
             raise HTTPException(404, "intent not found")
         if intent.status != "pending_review":
             raise HTTPException(400, f"intent in status {intent.status!r} cannot be submitted")
-        if intent.structure != "pmcc":
-            raise HTTPException(400, f"submit endpoint expects PMCC; got {intent.structure!r}")
+        if intent.structure not in ("pmcc", "leap_only"):
+            raise HTTPException(
+                400, f"submit endpoint expects PMCC or LEAP; got {intent.structure!r}")
+        is_leap_only = intent.structure == "leap_only"
 
         # Pull the snapshot we need; close the session before the long IBKR call.
         run = await s.get(Run, intent.run_id) if intent.run_id else None
@@ -180,19 +207,22 @@ async def submit_intent(intent_id: str,
         cfg = dict(intent.walking_config or {})
         leap_conid = int(cfg.pop("leap_conid", 0))
         short_conid = int(cfg.pop("short_call_conid", 0))
-        if not leap_conid or not short_conid:
-            raise HTTPException(500, "intent is missing leg conids; rebuild PMCC")
+        # A LEAP-only intent has no short leg by construction; demanding one
+        # here would make every LEAPS_ONLY build unsubmittable.
+        if not leap_conid or (not is_leap_only and not short_conid):
+            raise HTTPException(500, "intent is missing leg conids; rebuild the intent")
 
     # Auto-gate (kill switch + universe + budget + sector regime)
     async with db_session() as s:
+        action_type = "open_leap" if is_leap_only else "open_pmcc"
         gate = await check_auto_action(
-            s, loop="entry", action_type="open_pmcc",
+            s, loop="entry", action_type=action_type,
             symbol=symbol, theme_id=theme_id,
             estimated_capital_pct=0.0, is_new_entry=True, nav=0.0,
         )
         if not gate.passed:
             await record_auto_action(
-                s, loop="entry", action_type="open_pmcc",
+                s, loop="entry", action_type=action_type,
                 gate_result=gate, symbol=symbol, intent_id=intent_id,
             )
             first = gate.failures[0]
@@ -203,7 +233,7 @@ async def submit_intent(intent_id: str,
                 "detail": first.detail,
             }
         await record_auto_action(
-            s, loop="entry", action_type="open_pmcc_gate_passed",
+            s, loop="entry", action_type=f"{action_type}_gate_passed",
             gate_result=gate, symbol=symbol, intent_id=intent_id,
         )
 
@@ -225,7 +255,7 @@ async def submit_intent(intent_id: str,
     # Connect IBKR + run executor
     from .positions import _ibkr
     from tradingagents.strategies.execution import (
-        ExecutionConfig, submit_pmcc_combo,
+        ExecutionConfig, submit_pmcc_combo, submit_single_leg_option,
     )
     try:
         ib = await _ibkr()
@@ -254,9 +284,18 @@ async def submit_intent(intent_id: str,
         max_offset_pct_of_spread=cfg.get("max_offset_pct_of_spread", 0.30),
         timeout_sec=cfg.get("timeout_sec", 300),
     )
-    result = await submit_pmcc_combo(
-        ibkr=ib, symbol=symbol, legs=legs, contracts=contracts, config=exec_cfg,
-    )
+    if is_leap_only:
+        # Single long call — the same executor the auto-entry loop uses. No
+        # combo, no short leg, nothing that can leave a naked short behind.
+        result = await submit_single_leg_option(
+            ibkr=ib, conid=leap_conid, contracts=contracts, action="BUY",
+            config=exec_cfg,
+            adaptive_priority=settings.LEAP_ENTRY_ADAPTIVE_PRIORITY,
+        )
+    else:
+        result = await submit_pmcc_combo(
+            ibkr=ib, symbol=symbol, legs=legs, contracts=contracts, config=exec_cfg,
+        )
 
     # Persist result
     async with db_session() as s:
@@ -265,7 +304,7 @@ async def submit_intent(intent_id: str,
             return result.to_dict()
         if result.status == "filled":
             i.status = "filled"
-            i.position_state = "pmcc_full"
+            i.position_state = "leap_open" if is_leap_only else "pmcc_full"
             i.net_debit_filled = result.fill_price
             if result.fill_price and contracts:
                 i.max_loss = round(result.fill_price * contracts * 100, 2)

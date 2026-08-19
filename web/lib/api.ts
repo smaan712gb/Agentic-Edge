@@ -683,6 +683,12 @@ export const api = {
     personas: (symbol: string) =>
       jfetch<PersonaScores>(`/api/research/personas/${encodeURIComponent(symbol)}`),
   },
+  health: () =>
+    jfetch<{
+      status: string;
+      mode: { use_mock_run: boolean; mock_data: boolean; ibkr: string; leaps_only: boolean };
+      ibkr_connected: boolean;
+    }>("/api/health"),
   admin: {
     autotradeStatus: (token: string) =>
       jfetch<{

@@ -415,6 +415,12 @@ async def health() -> dict[str, Any]:
             "use_mock_run": settings.USE_MOCK_RUN,
             "mock_data": settings.MOCK_DATA,
             "ibkr": settings.IBKR_MODE,
+            # Surfaced so the UI can name what it is about to build. A button
+            # reading "Build PMCC" that constructs a long call with no short
+            # leg is how the strategy's own vocabulary drifts away from what
+            # it does — which is precisely what made the leg it *would* have
+            # built hard to notice.
+            "leaps_only": settings.LEAPS_ONLY,
         },
         "ibkr_connected": is_connected_snapshot(),
     }

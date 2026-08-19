@@ -1,12 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Loader2, Play, X, Layers, AlertTriangle, CheckCircle2 } from "lucide-react";
 import { api, type TradeIntent } from "@/lib/api";
 import { fmtMoney } from "@/lib/utils";
 
 /**
- * One-click PMCC builder that lives next to each Buy decision in the
+ * One-click position builder that lives next to each Buy decision in the
  * Run scorecard. Three states:
  *
  *   1. "Build" — initial; click probes the option chain, picks legs, returns intent.
@@ -28,6 +28,19 @@ export function PmccBuilder({
   const [error, setError] = useState<string | null>(null);
   const [submitResult, setSubmitResult] = useState<{ status: string; reason?: string; gate?: string; execution?: any } | null>(null);
   const [contracts, setContracts] = useState(1);
+  // Name the thing it actually builds. Under LEAPS_ONLY the backend selects a
+  // long call and no short leg, so a button reading "Build PMCC" would be
+  // describing a strategy this book retired — the same vocabulary drift that
+  // made the short leg it used to build easy to miss.
+  const [leapsOnly, setLeapsOnly] = useState<boolean | null>(null);
+  useEffect(() => {
+    let alive = true;
+    api.health()
+      .then((h) => { if (alive) setLeapsOnly(!!h.mode?.leaps_only); })
+      .catch(() => { if (alive) setLeapsOnly(null); });
+    return () => { alive = false; };
+  }, []);
+  const structureLabel = leapsOnly === null ? "position" : leapsOnly ? "LEAP" : "PMCC";
 
   const onBuild = async () => {
     setError(null);
@@ -96,10 +109,10 @@ export function PmccBuilder({
           className="btn btn-primary"
           disabled={building}
           onClick={onBuild}
-          title="Probe the option chain and pick PMCC legs"
+          title={`Probe the option chain and pick ${structureLabel} legs`}
         >
           {building ? <Loader2 className="h-4 w-4 animate-spin" /> : <Layers className="h-4 w-4" />}
-          {building ? "Probing chain…" : "Build PMCC"}
+          {building ? "Probing chain…" : `Build ${structureLabel}`}
         </button>
         {error && <span className="chip border-[var(--color-down)]/40 text-[var(--color-down)] text-[10px]"><AlertTriangle className="h-3 w-3" /> {error.slice(0, 80)}</span>}
       </div>
