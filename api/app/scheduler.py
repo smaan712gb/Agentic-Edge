@@ -33,10 +33,10 @@ from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from .config import get_settings
-from .db import SystemState, Theme, Run, get_session as db_session
+from .db import SystemState, Theme, Run, TickerScore, get_session as db_session
 from .repos import RunRepo, ThemeRepo
 
 logger = logging.getLogger("agentic_edge.scheduler")
@@ -770,13 +770,36 @@ async def _run_all_themes_job() -> None:
             async with db_session() as s:
                 repo = RunRepo(s)
                 existing = await repo.find_by_idempotency_key(user_id=None, key=idempotency_key)
-                if existing is not None and existing.status in ("running", "done"):
+                # Only a run that actually PRODUCED something blocks a retry.
+                # The old test was `status in ("running", "done")`, which on
+                # 2026-08-19 let nine zero-score runs — every scoring call
+                # refused by a local socket filter — latch the day's slot:
+                # the cron, the watchdog and a hand-fired `run-themes` all
+                # skipped them and reported ok, so the signals could not be
+                # regenerated until midnight. A run still in flight blocks
+                # (don't double-fire); a finished one blocks only on evidence.
+                blocking = False
+                if existing is not None:
+                    if existing.status == "running":
+                        blocking = True
+                    elif existing.status == "done":
+                        blocking = bool(await s.scalar(
+                            select(func.count()).select_from(TickerScore)
+                            .where(TickerScore.run_id == existing.id)
+                        ))
+                if blocking:
                     logger.info(
                         "scheduled run: theme %s already has run %s today (status=%s) — skipping",
                         theme_id, existing.id, existing.status,
                     )
                     skipped += 1
                     continue
+                if existing is not None:
+                    logger.warning(
+                        "scheduled run: theme %s has run %s today (status=%s) but it produced "
+                        "no scores — re-running rather than treating it as today's signal",
+                        theme_id, existing.id, existing.status,
+                    )
                 run = await repo.create(
                     theme_id=theme_id,
                     idempotency_key=idempotency_key,
@@ -807,7 +830,16 @@ async def _run_all_themes_job() -> None:
             logger.exception("scheduled run: theme %s failed: %s", theme_id, e)
 
     finished = datetime.now(timezone.utc)
-    status = "ok" if failed == 0 else ("partial" if success > 0 else "error")
+    # "ok" must mean work happened. A batch where every theme was skipped did
+    # nothing at all, and reporting that as ok is how a hand-fired recovery
+    # ("0 ok, 9 skipped, 0 failed (status=ok)") reads as success to the
+    # operator who fired it precisely because the signals were missing.
+    if failed:
+        status = "partial" if success > 0 else "error"
+    elif success:
+        status = "ok"
+    else:
+        status = "noop"
     elapsed_min = (finished - started).total_seconds() / 60
 
     async with db_session() as s:

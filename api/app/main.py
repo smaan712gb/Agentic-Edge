@@ -73,6 +73,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .config import get_settings
 from .db import init_db, get_session as db_session
 from .repos import EventRepo, RunRepo, ThemeRepo
+from .timefmt import iso_utc
 
 logger = logging.getLogger(__name__)
 
@@ -640,8 +641,8 @@ async def list_runs() -> list[dict[str, Any]]:
             out.append({
                 "id": r.id,
                 "theme_id": r.theme_id,
-                "started_at": r.started_at.isoformat() if r.started_at else None,
-                "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+                "started_at": iso_utc(r.started_at),
+                "finished_at": iso_utc(r.finished_at),
                 "status": r.status,
                 "progress": r.progress,
                 "summary": r.summary,

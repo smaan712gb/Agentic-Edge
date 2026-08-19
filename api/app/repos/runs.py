@@ -15,11 +15,12 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from api.app.db import Run, RunEvent, ThemeReport, TickerScore
+from api.app.timefmt import iso_utc
 
 
 class RunRepo:
@@ -69,11 +70,31 @@ class RunRepo:
         r = await self.s.get(Run, run_id)
         if r is None:
             return
-        r.status = "done"
         r.progress = 1.0
         r.finished_at = datetime.now(timezone.utc)
         r.summary = summary
-        r.best_positioned = best_positioned
+        r.best_positioned = best_positioned or []
+
+        # A run that scored NOTHING did not succeed. On 2026-08-19 a local
+        # socket filter refused every outbound call; all nine themes stored
+        # zero ticker_scores, were written "done", and the scheduler reported
+        # status=ok — so the dashboard showed a completed batch whose results
+        # were empty, and no operator control would regenerate them for the
+        # rest of the day. An empty scorecard is the one output that cannot be
+        # a real answer: a theme with no symbols is rejected long before it
+        # reaches here, so zero scores always means every scorer failed.
+        n_scores = await self.s.scalar(
+            select(func.count()).select_from(TickerScore)
+            .where(TickerScore.run_id == run_id)
+        )
+        if not n_scores:
+            r.status = "error"
+            r.error = (
+                "scored 0 of the theme's symbols — every scoring call failed. "
+                "Recorded as error, not done, so the run can be retried."
+            )
+            return
+        r.status = "done"
 
     async def mark_error(self, run_id: str, error: str) -> None:
         r = await self.s.get(Run, run_id)
@@ -178,8 +199,8 @@ class RunRepo:
         return {
             "id": run.id,
             "theme_id": run.theme_id,
-            "started_at": run.started_at.isoformat() if run.started_at else None,
-            "finished_at": run.finished_at.isoformat() if run.finished_at else None,
+            "started_at": iso_utc(run.started_at),
+            "finished_at": iso_utc(run.finished_at),
             "status": run.status,
             "progress": run.progress,
             "summary": run.summary,
@@ -190,7 +211,7 @@ class RunRepo:
                     "symbol": e.symbol,
                     "status": e.status,
                     "summary": e.summary,
-                    "timestamp": e.timestamp.isoformat() if e.timestamp else None,
+                    "timestamp": iso_utc(e.timestamp),
                 }
                 for e in run.events
             ],

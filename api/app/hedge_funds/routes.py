@@ -12,6 +12,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from ..db import get_session as db_session
+from ..timefmt import iso_utc
 from .overlap import cross_fund_overlap
 from .repo import HedgeFundRepo
 
@@ -101,7 +102,7 @@ async def rotation_status() -> list[dict[str, Any]]:
     return [{
         "theme_id": r.theme_id, "flagged": r.flagged, "score": r.score,
         "signals_tripped": r.signals_tripped or [], "evidence": r.evidence or {},
-        "computed_at": r.computed_at.isoformat() if r.computed_at else None,
+        "computed_at": iso_utc(r.computed_at),
     } for r in rows]
 
 

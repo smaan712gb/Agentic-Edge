@@ -99,7 +99,10 @@ export type SchedulerStatus = {
   cron: string | null;
   next_run_at: string | null;
   last_run_at: string | null;
-  last_status: "ok" | "partial" | "error" | null;
+  // "noop" = the job ran but every theme was skipped, so nothing was
+  // produced. Distinct from "ok" on purpose: a recovery fired by hand
+  // must not report success when it did no work.
+  last_status: "ok" | "partial" | "error" | "noop" | null;
 };
 
 export type Regime = "uptrend" | "pullback" | "range" | "downtrend" | "unknown";
