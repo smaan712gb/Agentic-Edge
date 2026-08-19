@@ -14,6 +14,7 @@ Each test below fails on the pre-fix code.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -340,3 +341,114 @@ async def test_unreadable_executions_flag_the_order_as_possibly_live():
     assert r.status == "abandoned"
     assert r.order_still_live is True
     assert "unconfirmed" in (r.error or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# The health monitor must LATCH the breaker, not merely describe one
+# ---------------------------------------------------------------------------
+#
+# Second half of the FN incident. The guards above stop a short from being
+# CREATED; these cover what happens once one exists. On 2026-08-18 a short FN
+# call sat open for 5h30m while the monitor raised
+#
+#     "LONG-ONLY BREACH ... entries are halted by the breaker"
+#
+# every 15 minutes with ``entry_breaker_tripped = False`` the entire time. Two
+# things combined: the monitor called ``short_option_positions`` (detect-only)
+# rather than ``halt_on_short_options`` (which latches), and the entry loop
+# returns on the DB kill switch BEFORE it reaches ``check_entry_breaker`` — so
+# while the book is disarmed the monitor is the only component that looks at
+# the invariant at all. The book was safe only because a human had thrown the
+# kill switch by hand; the alert credited a protection that was never armed.
+
+_SHORT_FN = {
+    "symbol": "FN", "sec_type": "OPT", "qty": -3.0, "conid": 909924757,
+    "expiry": "20271217", "strike": 350.0, "right": "C", "multiplier": "100",
+}
+_LONG_NVDA = {
+    "symbol": "NVDA", "sec_type": "OPT", "qty": 10.0, "conid": 868220021,
+    "expiry": "20280616", "strike": 150.0, "right": "C", "multiplier": "100",
+}
+
+
+class _PositionsOnlyProvider:
+    def __init__(self, positions):
+        self._positions = positions
+
+    async def get_positions(self):
+        return list(self._positions)
+
+    async def get_account_summary(self):
+        return {"NetLiquidation": "1000000", "MaintMarginReq": "0",
+                "ExcessLiquidity": "1000000"}
+
+
+class _NoDbSession:
+    """DB is out of scope here — every caller in run_health_check guards it."""
+
+    async def __aenter__(self):
+        raise RuntimeError("DB disabled in test")
+
+    async def __aexit__(self, *_a):
+        return False
+
+
+def _offline_monitor(monkeypatch, positions):
+    """run_health_check with no broker, no DB and no network. -> (module, calls)"""
+    import api.app.autotrade.health_monitor as hm
+    import api.app.autotrade.position_guard as pg
+    from api.app.config import get_settings
+
+    calls: dict[str, list] = {"halt": []}
+
+    async def _fake_ibkr():
+        return _PositionsOnlyProvider(positions)
+
+    async def _fake_halt(_positions, *, source):
+        calls["halt"].append(source)
+        return "latched"
+
+    async def _fake_alert(**_kw):
+        return None
+
+    monkeypatch.setattr(get_settings(), "LEAPS_ONLY", True)
+    monkeypatch.setattr("api.app.positions._ibkr", _fake_ibkr)
+    monkeypatch.setattr(pg, "halt_on_short_options", _fake_halt)
+    monkeypatch.setattr(hm, "alert", _fake_alert)
+    monkeypatch.setattr(hm, "db_session", lambda *_a, **_k: _NoDbSession())
+    return hm, calls
+
+
+def test_monitor_latches_the_breaker_on_a_short_option(monkeypatch):
+    """Detecting the breach is not enough — this is the only always-on check."""
+    hm, calls = _offline_monitor(monkeypatch, [_LONG_NVDA, _SHORT_FN])
+    out = asyncio.run(hm.run_health_check())
+
+    assert calls["halt"] == ["health_monitor"], (
+        "the monitor must latch the entry breaker itself; while the kill switch "
+        "is off the entry loop never reaches check_entry_breaker"
+    )
+    assert out["metrics"]["short_options"] == 1
+    assert out["status"] == "critical"
+    assert any("LONG-ONLY BREACH" in f["title"] for f in out["findings"])
+
+
+def test_monitor_does_not_latch_on_a_clean_long_book(monkeypatch):
+    hm, calls = _offline_monitor(monkeypatch, [_LONG_NVDA])
+    out = asyncio.run(hm.run_health_check())
+
+    assert calls["halt"] == [], "a long-only book must never latch the breaker"
+    assert out["metrics"]["short_options"] == 0
+
+
+def test_breach_alert_no_longer_claims_a_halt_it_never_performed(monkeypatch):
+    """The exact wording that misled the operator for 5h30m on 2026-08-18."""
+    hm, calls = _offline_monitor(monkeypatch, [_SHORT_FN])
+    out = asyncio.run(hm.run_health_check())
+
+    breach = [f for f in out["findings"] if "LONG-ONLY BREACH" in f["title"]]
+    assert breach, "the breach must still be reported"
+    assert calls["halt"], "and the halt it claims must actually have happened"
+    assert "halted by the breaker" not in breach[0]["detail"], (
+        "old wording asserted a latch that had not been performed"
+    )

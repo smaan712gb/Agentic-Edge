@@ -107,13 +107,28 @@ async def run_health_check() -> dict[str, Any]:
     # those it can never be explained by market conditions.
     if ib_ok and settings.LEAPS_ONLY:
         try:
-            from .position_guard import short_option_positions, describe_short_options
+            from .position_guard import (
+                short_option_positions, describe_short_options, halt_on_short_options,
+            )
             shorts = short_option_positions(live)
             metrics["short_options"] = len(shorts)
             if shorts:
+                # LATCH here, don't merely report. This monitor is the only
+                # always-on detector of the breach: the entry loop returns on
+                # the DB kill switch before it ever reaches check_entry_breaker,
+                # so while the book is disarmed nothing else evaluates the
+                # invariant. On 2026-08-18 a short FN call sat open 5h30m
+                # raising this CRITICAL every 15 min with entry_breaker_tripped
+                # = False throughout — the alert told the operator entries were
+                # halted by the breaker when the only thing halting them was a
+                # hand-thrown kill switch. Latching makes the message true and
+                # makes the breach outlive a re-arm, which is the whole point:
+                # a mandate breach should need a human to look at the book.
+                await halt_on_short_options(live, source="health_monitor")
+                metrics["short_options_latched"] = True
                 add("critical", f"LONG-ONLY BREACH — {len(shorts)} short option position(s)",
                     f"{describe_short_options(shorts)}. Undefined risk in a long-call-only "
-                    f"book; entries are halted by the breaker. Flatten manually, then re-arm.")
+                    f"book; entry breaker LATCHED. Flatten manually, then re-arm.")
         except Exception as e:
             add("warning", "Long-only invariant check failed", str(e))
 
