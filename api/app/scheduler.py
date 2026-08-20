@@ -63,7 +63,24 @@ _ROTATION_JOB_ID = "theme_rotation_sweep"
 # Pairs with ROTATION_CONFIRM_SWEEPS: a theme must look like it's rotating on
 # consecutive sweeps before entries are halted, so confirmation takes hours (as
 # a multi-day signal should) instead of one noisy reading.
-_ROTATION_CRON = "5 10,12,14,16 * * 1-5"
+# Rotation ticks — every one inside RTH, because the book is LEAPS and
+# LEAPS only trade in RTH. A premarket pass would read thin premarket
+# quotes and prior-day closes, then stamp a fresh computed_at: the
+# staleness warning clears while the signal knows nothing the previous
+# close did not. Fresh timestamps on stale information are worse than an
+# honest stale flag.
+#
+# 09:31 is the load-bearing tick. gate_rth blocks entries before 09:30 and
+# gate_open_auction_block blocks the first two minutes, so the earliest
+# possible entry is 09:32:00 — a 09:31 sweep (~7s) lands before it with
+# real opening liquidity behind it. Previously the first tick was 10:05,
+# which left the book un-gated for the first 35 minutes of every session,
+# exactly when overnight rotation shows itself.
+#
+# Then every two hours to 15:31, all pre-close. With
+# ROTATION_MAX_AGE_HOURS=6 the 09:31 pass alone covers through 15:31, so
+# any single failed tick still leaves the session gated.
+_ROTATION_CRON = "31 9,11,13,15 * * 1-5"
 
 _NEWS_JOB_ID = "chokepoint_news_sweep"
 # Hourly during US RTH + an hour either side, Mon-Fri. News flows during the
@@ -898,12 +915,76 @@ async def _ensure_todays_run(reason: str) -> bool:
         return False
 
 
+async def _ensure_fresh_rotation(trigger: str) -> None:
+    """Sweep now if rotation state is stale; no-op if it is current.
+
+    The cron alone is not enough. The entry and exit loops ignore rotation
+    rows older than ROTATION_MAX_AGE_HOURS, so any gap in the tick sequence
+    silently un-gates the book — and the two ways a gap happens are exactly
+    the ways a real deployment behaves:
+
+      * the server was down at a tick (2026-08-19 missed 16:05 that way);
+      * the server boots between ticks, so the next one is hours out.
+
+    Both leave the book with no rotation protection and nothing to say so
+    until the 15-minute health monitor notices. Recovering on boot and on
+    the watchdog tick closes the gap the same way _ensure_todays_run does
+    for the daily signal run.
+    """
+    settings = get_settings()
+    if not getattr(settings, "ROTATION_DETECTOR_ENABLED", True):
+        return
+
+    # Only sweep inside RTH. Outside it the inputs are prior-day closes and
+    # thin premarket quotes, and a sweep would clear the staleness flag
+    # without learning anything — while entries are blocked by gate_rth
+    # anyway, so a stale flag outside RTH gates nothing that could trade.
+    from .autotrade.market_conditions import is_rth
+    if not is_rth():
+        logger.debug("rotation catch-up skipped (%s): outside RTH", trigger)
+        return
+
+    max_age_h = float(getattr(settings, "ROTATION_MAX_AGE_HOURS", 6.0))
+    try:
+        from .db import ThemeRotation
+        async with db_session() as s:
+            newest = (
+                await s.execute(select(func.max(ThemeRotation.computed_at)))
+            ).scalar_one_or_none()
+    except Exception as e:
+        logger.warning("rotation freshness check failed (%s): %s", trigger, e)
+        return
+
+    if newest is not None:
+        age_h = (datetime.now(timezone.utc) - _as_aware(newest)).total_seconds() / 3600.0
+        if age_h <= max_age_h:
+            return
+        logger.info(
+            "rotation state is %.1fh old (max %.0fh) — sweeping now (%s)",
+            age_h, max_age_h, trigger,
+        )
+    else:
+        logger.info("no rotation state exists — sweeping now (%s)", trigger)
+
+    await _run_rotation_sweep_job()
+
+
+def _as_aware(dt: datetime) -> datetime:
+    """Treat naive timestamps as UTC — that is how they are written."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+
+
 async def _startup_catchup_job() -> None:
-    """One-shot on boot: recover today's run if missing (see _ensure_todays_run)."""
+    """One-shot on boot: recover today's run if missing (see _ensure_todays_run),
+    and re-gate the book if rotation went stale while the server was down."""
     await _ensure_todays_run("startup")
+    await _ensure_fresh_rotation("startup")
 
 
 async def _run_missed_run_watchdog() -> None:
     """Recurring safety net (every 30 min, 09:00-15:30 ET): recover the daily
-    run if it was missed — the gap that left 2026-06-29 with zero signals."""
+    run if it was missed — the gap that left 2026-06-29 with zero signals —
+    and recover rotation freshness, so a single failed tick cannot leave the
+    book un-gated for the rest of the session."""
     await _ensure_todays_run("watchdog")
+    await _ensure_fresh_rotation("watchdog")

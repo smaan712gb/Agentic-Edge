@@ -261,8 +261,8 @@ async def run_health_check() -> dict[str, Any]:
     # catches it: during RTH the loop writes a heartbeat auto_action each ~5-min
     # tick; a newest heartbeat older than ~15 min means the loop is not running.
     try:
-        from api.app.autotrade.market_conditions import gate_rth
-        if gate_rth() is None:   # only meaningful during RTH
+        from api.app.autotrade.market_conditions import gate_rth, is_first_15_min
+        if gate_rth() is None and not is_first_15_min():   # only meaningful during RTH
             async with db_session() as s:
                 last_hb = (
                     await s.execute(
@@ -273,6 +273,17 @@ async def run_health_check() -> dict[str, Any]:
                 ).scalar_one_or_none()
             age_min = None if last_hb is None else (_utcnow() - _aware(last_hb)).total_seconds() / 60.0
             metrics["maint_heartbeat_age_min"] = None if age_min is None else round(age_min, 1)
+            # Boot grace covers "this process is young". It does NOT cover the
+            # case that actually fires every morning: the server boots premarket,
+            # so by 09:30 it is well past _BOOT_GRACE_MIN, but the maintenance
+            # loop is RTH-gated and cannot have written a heartbeat yet — the
+            # newest one is still yesterday's. On 2026-08-20 that produced a
+            # CRITICAL "loop STALLED" at 09:30:00 for a loop that was healthy and
+            # heartbeated normally at 09:34:24. Suppressing the first 15 minutes
+            # of RTH (the loop polls every 300s, so its first tick can legitimately
+            # be a full interval after the bell) is handled by the is_first_15_min
+            # guard above. A CRITICAL that is routinely wrong is one the operator
+            # learns to skip past, which costs more than the alarm is worth.
             uptime_min = (_utcnow() - _BOOT_TS).total_seconds() / 60.0
             metrics["uptime_min"] = round(uptime_min, 1)
             if uptime_min < _BOOT_GRACE_MIN:
